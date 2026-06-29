@@ -1,0 +1,53 @@
+{
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": [
+      "src/**/*.{js,jsx,ts,tsx,css,scss}",
+      "tailwind.config.js"
+    ]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noUndeclaredDependencies": "error",
+        "useExhaustiveDependencies": "warn"
+      },
+      "suspicious": {
+        "noRedeclare": "error"
+      },
+      "style": {
+        "noCommonJs": "error",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "echarts-for-taro": "The package echarts-for-taro does not exist. Please remove it and update the code referencing it. Also remove it from package.json.",
+              "file-saver": "file-saver causes build errors in weapp. Use Taro APIs instead (e.g., Taro.getFileSystemManager() or Taro.downloadFile()). Also remove it from package.json."
+            }
+          }
+        }
+      }
+    }
+  },
+  "formatter": {
+    "enabled": false
+  },
+  "overrides": [
+    {
+      "includes": ["tailwind.config.js", "src/libs/**/*.js"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noCommonJs": "off"
+          }
+        }
+      }
+    }
+  ]
+}
