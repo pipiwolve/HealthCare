@@ -76,7 +76,6 @@ flowchart TD
 | `wechat_miniapp_login` | 用微信小程序 code 换 openid，创建或复用 Supabase 用户，并生成 magiclink token |
 | `ws-sign` | 读取百度 BRTC/实时网关密钥，生成 WebSocket URL，并返回 License 配置 |
 | `upload-food-image` | 接收 base64 图片，用 service role 上传到 `chat-images` Storage bucket |
-| `tts-minimax` | 名称保留为旧接口，实际调用百度 TTS 并将生成音频上传到 `generated-audio` bucket |
 
 Edge Functions 当前更接近轻量 BFF 和密钥代理，没有承载完整业务服务编排。
 
@@ -288,7 +287,6 @@ AI prompt 会通过 `buildHealthContext` 携带当前成员健康档案。过敏
 | 文本问答 | `chat`、`home`、`recipe` | `aiWebSocket.requestResponse` | 百度实时 WebSocket 网关、千帆 LLM |
 | 图片识别/图片问答 | `home`、`chat` | `aiWebSocket.requestImageResponse` | 百度实时 WebSocket 网关、Supabase Storage |
 | 语音输入/语音通话 | `home`、`chat` | `aiWebSocket.sendAudio` | 百度 ASR/LLM/TTS |
-| TTS 文件生成 | 当前函数保留 | `tts-minimax` | 百度 TTS、Supabase Storage |
 
 ## 5. 关键链路
 

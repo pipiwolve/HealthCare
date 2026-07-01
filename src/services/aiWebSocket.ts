@@ -1,7 +1,7 @@
 import Taro from '@tarojs/taro'
 import {supabase} from '../client/supabase'
 
-type MessageType = 'asr-interim' | 'asr-final' | 'llm-interim' | 'llm-final' | 'audio' | 'event'
+type MessageType = 'asr-interim' | 'asr-final' | 'llm-interim' | 'llm-final' | 'audio' | 'tts-start' | 'tts-end' | 'event'
 type Listener = (data: string | ArrayBuffer) => void
 type ConnectMode = 'cfg' | 'default'
 type RequestKind = 'text' | 'image'
@@ -22,21 +22,13 @@ type AiWebSocketMetrics = {
   status?: 'connected' | 'final' | 'timeout' | 'error'
 }
 
-interface WsCfg {
-  llm: string
-  llm_url: string
-  llm_token: string
-  llm_cfg: string
-  tts?: string
-  asr?: string
-  role?: string
-  tts_sayhi?: string
-}
+type WsCfg = Record<string, unknown>
 
 interface ConnectOptions {
   mode?: ConnectMode
   cfg?: WsCfg
   ac?: string
+  userId?: string
 }
 
 interface ImageRequestOptions {
@@ -47,6 +39,16 @@ interface ImageRequestOptions {
   uploadTimeoutMs?: number
   responseTimeoutMs?: number
   onInterim?: (text: string) => void
+}
+
+interface RequestResponseOptions {
+  image?: string
+  fileName?: string
+  timeoutMs?: number
+  onInterim?: (text: string) => void
+  onAudio?: (buffer: ArrayBuffer) => void
+  onTtsStart?: () => void
+  onTtsEnd?: () => void
 }
 
 interface SignResponse {
@@ -67,9 +69,11 @@ class AiWebSocketService {
   private licensePassed = false
   private licenseKey = ''
   private licenseDeviceId = ''
+  private userId = ''
   private metrics: AiWebSocketMetrics | null = null
   private socketStartedAt = 0
   private requestStartedAt = 0
+  private licenseWaitTimer: ReturnType<typeof setTimeout> | null = null
 
   get isConnected() { return this.state === 'connected' }
 
@@ -139,6 +143,7 @@ class AiWebSocketService {
     console.log('[AiWebSocket] ws-sign OK, url prefix=', data.url.substring(0, 80))
     this.licenseKey = data.licenseKey || ''
     this.licenseDeviceId = data.licenseDeviceId || Taro.getStorageSync('brtc_license_device_id') || ''
+    this.userId = options.userId || ''
 
     return new Promise((resolve, reject) => {
       this.readyResolve = resolve
@@ -240,6 +245,8 @@ class AiWebSocketService {
     this.metrics = null
     this.socketStartedAt = 0
     this.requestStartedAt = 0
+    if (this.licenseWaitTimer) clearTimeout(this.licenseWaitTimer)
+    this.licenseWaitTimer = null
   }
 
   private closeSocketTask() {
@@ -291,13 +298,24 @@ class AiWebSocketService {
     })
   }
 
+  sendDeviceInfo(userId?: string) {
+    const uid = userId || this.userId
+    if (!uid) return
+    void this.sendSocketData(`[SET]:[DEVICE_INFO]:${JSON.stringify({
+      user_id: uid,
+      userId: uid,
+    })}`).catch((err) => {
+      console.warn('[AiWebSocket] sendDeviceInfo failed:', err?.message || err)
+    })
+  }
+
   onMessage(type: MessageType, cb: Listener): () => void {
     if (!this.listeners.has(type)) this.listeners.set(type, new Set())
     this.listeners.get(type)!.add(cb)
     return () => { this.listeners.get(type)?.delete(cb) }
   }
 
-  async requestResponse(text: string, opts?: {image?: string; fileName?: string; timeoutMs?: number; onInterim?: (text: string) => void}): Promise<string> {
+  async requestResponse(text: string, opts?: RequestResponseOptions): Promise<string> {
     if (opts?.image) {
       return this.requestImageResponse({
         triggerText: text,
@@ -311,7 +329,20 @@ class AiWebSocketService {
     this.beginRequest('text', text.length)
     return new Promise((resolve, reject) => {
       let interimText = ''
+      let finalText = ''
+      let ttsStarted = false
+      let settled = false
+      let ttsWaitTimer: ReturnType<typeof setTimeout> | null = null
+      let audioIdleTimer: ReturnType<typeof setTimeout> | null = null
+      let audioCompletionNotified = false
+      let audioChunkCount = 0
+      let audioByteCount = 0
+      const ttsNoAudioGraceMs = 15000
+      const ttsNotStartedGraceMs = 1200
+      const audioIdleMs = 1200
       const timeout = setTimeout(() => {
+        if (settled) return
+        settled = true
         cleanup()
         if (interimText.trim()) {
           console.warn('[AiWebSocket] AI response timeout, using interim reply')
@@ -325,20 +356,91 @@ class AiWebSocketService {
 
       const cleanup = () => {
         clearTimeout(timeout)
+        if (ttsWaitTimer) clearTimeout(ttsWaitTimer)
+        if (audioIdleTimer) clearTimeout(audioIdleTimer)
         unsubFinal()
         unsubInterim()
+        unsubAudio()
+        unsubTtsStart()
+        unsubTtsEnd()
+      }
+
+      const notifyAudioComplete = () => {
+        if (audioCompletionNotified) return
+        audioCompletionNotified = true
+        opts?.onTtsEnd?.()
+      }
+
+      const finish = (textToResolve: string) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        this.markFinalResponse('final')
+        resolve(textToResolve)
+      }
+
+      const scheduleFinishAfterFinal = () => {
+        if (!finalText || settled) return
+        if (!opts?.onAudio && !opts?.onTtsEnd) {
+          finish(finalText)
+          return
+        }
+        if (audioChunkCount > 0) {
+          if (audioIdleTimer) clearTimeout(audioIdleTimer)
+          audioIdleTimer = setTimeout(() => {
+            console.info('[AiWebSocket] RTC TTS audio idle, finishing response', {
+              audioChunkCount,
+              audioByteCount,
+            })
+            notifyAudioComplete()
+            finish(finalText)
+          }, audioIdleMs)
+          return
+        }
+        if (ttsWaitTimer) clearTimeout(ttsWaitTimer)
+        ttsWaitTimer = setTimeout(() => {
+          console.warn('[AiWebSocket] RTC TTS audio not received before grace timeout', {
+            ttsStarted,
+            waitedMs: ttsStarted ? ttsNoAudioGraceMs : ttsNotStartedGraceMs,
+          })
+          finish(finalText)
+        }, ttsStarted ? ttsNoAudioGraceMs : ttsNotStartedGraceMs)
       }
 
       const unsubFinal = this.onMessage('llm-final', (data) => {
-        cleanup()
-        this.markFinalResponse('final')
-        resolve(data as string)
+        finalText = data as string
+        clearTimeout(timeout)
+        scheduleFinishAfterFinal()
       })
 
       const unsubInterim = this.onMessage('llm-interim', (data) => {
         this.markFirstInterim()
         interimText = this.mergeInterimText(interimText, data as string)
         if (interimText.trim()) opts?.onInterim?.(interimText.trim())
+      })
+
+      const unsubAudio = this.onMessage('audio', (data) => {
+        if (!(data instanceof ArrayBuffer)) return
+        audioChunkCount += 1
+        audioByteCount += data.byteLength
+        console.log('[AiWebSocket] audio chunk received', {
+          size: data.byteLength,
+          audioChunkCount,
+          audioByteCount,
+        })
+        opts?.onAudio?.(data)
+        scheduleFinishAfterFinal()
+      })
+
+      const unsubTtsStart = this.onMessage('tts-start', () => {
+        ttsStarted = true
+        opts?.onTtsStart?.()
+        scheduleFinishAfterFinal()
+      })
+
+      const unsubTtsEnd = this.onMessage('tts-end', () => {
+        notifyAudioComplete()
+        if (finalText) finish(finalText)
       })
 
       void this.sendSocketData(`[T]:${text}`).catch((err) => {
@@ -505,6 +607,12 @@ class AiWebSocketService {
       this.licensePassed = true
       this.tryResolveReady()
       this.emit('event', msg)
+    } else if (msg.startsWith('[E]:[TTS_BEGIN_SPEAKING]')) {
+      this.emit('tts-start', msg)
+      this.emit('event', msg)
+    } else if (msg.startsWith('[E]:[TTS_END_SPEAKING]')) {
+      this.emit('tts-end', msg)
+      this.emit('event', msg)
     } else if (msg.startsWith('[Q]:[M]:')) {
       this.emit('asr-interim', msg.slice(8))
     } else if (msg.startsWith('[Q]:')) {
@@ -530,19 +638,40 @@ class AiWebSocketService {
     Taro.setStorageSync('brtc_license_device_id', devId)
     void this.sendSocketData(`[E]:[LIC]:[ACTIVE]:${JSON.stringify({
       devId,
-      uId: devId,
+      uId: this.userId || devId,
       licKey: this.licenseKey
-    })}`)
+    })}`).catch((err) => {
+      console.warn('[AiWebSocket] activateLicense failed:', err?.message || err)
+      this.licensePassed = true
+      this.tryResolveReady()
+    })
   }
 
   private tryResolveReady() {
     if (!this.mediaReady) return
     if (this.licenseRequired && !this.licensePassed) return
+    if (!this.licenseRequired && this.licenseKey && !this.licenseWaitTimer) {
+      this.licenseWaitTimer = setTimeout(() => {
+        this.licenseWaitTimer = null
+        if (this.state === 'connecting' && this.mediaReady && !this.licenseRequired) {
+          this.resolveReady()
+        }
+      }, 800)
+      return
+    }
+    this.resolveReady()
+  }
+
+  private resolveReady() {
+    if (this.state === 'connected') return
+    if (this.licenseWaitTimer) clearTimeout(this.licenseWaitTimer)
+    this.licenseWaitTimer = null
     this.state = 'connected'
     if (this.metrics) {
       this.metrics.connectReadyMs = Date.now() - this.metrics.startedAt
     }
     this.logMetrics('connected')
+    this.sendDeviceInfo()
     this.readyResolve?.()
     this.readyResolve = null
     this.readyReject = null

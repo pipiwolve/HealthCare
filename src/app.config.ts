@@ -16,6 +16,7 @@ export default defineAppConfig({
     'pages/privacy/index',
   ],
   lazyCodeLoading: 'requiredComponents',
+  __usePrivacyCheck__: true,
   tabBar: {
     color: '#6b7280',
     selectedColor: '#2d6a3f',

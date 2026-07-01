@@ -59,3 +59,14 @@ export function buildHealthContext(member: FamilyMember | null): string {
   if (parts.length === 0) return ''
   return `【用户健康档案】\n${parts.join('\n')}`
 }
+
+export function buildFamilyHealthContext(members: FamilyMember[]): string {
+  if (members.length === 0) return ''
+  const memberContexts = members
+    .map(member => {
+      const context = buildHealthContext(member).replace(/^【用户健康档案】\n?/, '').trim()
+      if (!context) return `【${member.nickname}】\n健康档案未完善`
+      return `【${member.nickname}】\n${context}`
+    })
+  return `【本餐用餐成员健康档案】\n${memberContexts.join('\n\n')}`
+}

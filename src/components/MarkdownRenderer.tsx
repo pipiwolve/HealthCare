@@ -99,7 +99,25 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
       elements.push(<div key={key++} className="h-px bg-border my-2" />)
     } else if (line.trim() === '') {
       elements.push(<div key={key++} className="h-1" />)
+    } else if (/^[^：:\n]{1,32}[：:]\s*$/.test(line.trim())) {
+      const label = line.trim().replace(/[：:]\s*$/, '')
+      elements.push(
+        <p key={key++} className="text-base font-bold text-foreground mt-2 mb-0.5 leading-snug">
+          {renderInline(label, key)}：
+        </p>
+      )
     } else {
+      const keyValueMatch = line.match(/^([^：:\n]{1,28})[：:]\s*(.+)$/)
+      if (keyValueMatch) {
+        elements.push(
+          <p key={key++} className="text-sm text-foreground leading-snug py-px">
+            <span className="font-semibold text-foreground">{renderInline(keyValueMatch[1].trim(), key)}：</span>
+            {renderInline(keyValueMatch[2].trim(), key)}
+          </p>
+        )
+        i++
+        continue
+      }
       elements.push(
         <p key={key++} className="text-sm text-foreground leading-snug py-px">
           {renderInline(line, key)}

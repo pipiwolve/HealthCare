@@ -18,6 +18,7 @@
 //
 // 重量计算：weight = weightRaw / 10^decimals，负数取反
 import Taro from '@tarojs/taro'
+import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from './wechatPrivacy'
 
 // ─── 重量单位 ─────────────────────────────────────────────────────────────────
 export type WeightUnit = 'g' | 'lb' | 'oz' | 'ml'
@@ -93,6 +94,14 @@ class BLEService {
             this.isInitialized = true
             this.initPromise = null
             resolve(true)
+            return
+          }
+          if (isPrivacyScopeError(err)) {
+            console.warn('[BLE] 隐私协议未声明蓝牙接口:', err)
+            showPrivacyScopeDeclarationTip('蓝牙')
+            this.isInitialized = false
+            this.initPromise = null
+            resolve(false)
             return
           }
           console.warn('[BLE] 适配器初始化失败:', err)

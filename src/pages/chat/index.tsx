@@ -7,36 +7,37 @@ import {supabase} from '@/client/supabase'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
-import {createChatMessage, createChatSession, deleteChatSession, deleteMultipleChatSessions,
-  getChatMessages, 
-  getChatSessions, updateChatSession 
-} from '@/db/api'
-import type {ChatMessage, ChatSession } from '@/db/types'
+import {createChatMessage, createChatSession, getRtcHistoryGroups, updateChatSession } from '@/db/api'
+import type {ChatMessage, ChatSession, RtcHistoryGroup } from '@/db/types'
 import {getAiWebSocket} from '@/services/aiWebSocket'
 import {useAppStore} from '@/store/appStore'
-import {buildHealthContext} from '@/utils/allergenUtils'
+import {buildFamilyHealthContext} from '@/utils/allergenUtils'
 import {buildChatPrompt} from '@/utils/aiPromptHelpers'
-import {CHAT_CFG, VOICE_CFG} from '@/utils/brtcConfig'
+import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
 
 function ChatPage() {
   const {user} = useAuth()
-  const {activeMember, isOnline, ingredients} = useAppStore()
+  const {activeMember, familyMembers, selectedMealMemberIds, isOnline, ingredients} = useAppStore()
 
   const routeParams = useMemo(() => Taro.getCurrentInstance().router?.params || {}, [])
 
-  const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSession, setActiveSession] = useState<ChatSession | null>(null)
+  const [activeRtcGroupId, setActiveRtcGroupId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputText, setInputText] = useState('')
   const [inputHeight, setInputHeight] = useState(32)
   const [isLoading, setIsLoading] = useState(false)
   const [showDrawer, setShowDrawer] = useState(false)
-  const [editMode, setEditMode] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [rtcHistoryGroups, setRtcHistoryGroups] = useState<RtcHistoryGroup[]>([])
+  const [rtcHistoryLoading, setRtcHistoryLoading] = useState(false)
+  const [rtcHistoryError, setRtcHistoryError] = useState('')
+  const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
   const [isRecording, setIsRecording] = useState(false)
   const [useProfile, setUseProfile] = useState(true)
   const [useIngredients, setUseIngredients] = useState(false)
   const recorderManager = useRef<Taro.RecorderManager | null>(null)
+  const audioContextRef = useRef<Taro.InnerAudioContext | null>(null)
+  const audioMessageIdRef = useRef<string | null>(null)
   const [pendingImage, setPendingImage] = useState<{localPath: string; base64: string; ext: string} | null>(null)
   const [isUploadingImage, setIsUploadingImage] = useState(false)
 
@@ -47,19 +48,38 @@ function ChatPage() {
   const voiceTempAiMsgId = useRef<string | null>(null)
   const voiceSessionRef = useRef<ChatSession | null>(null)
 
-  const loadSessions = useCallback(async () => {
+  const loadRtcHistory = useCallback(async () => {
     if (!user) return
-    const data = await getChatSessions(user.id)
-    setSessions(data)
+    setRtcHistoryLoading(true)
+    setRtcHistoryError('')
+    try {
+      const data = await getRtcHistoryGroups()
+      setRtcHistoryGroups(data)
+    } catch (err: any) {
+      console.error('加载云端历史失败:', err?.message || err)
+      setRtcHistoryError(err?.message || '云端历史加载失败')
+    } finally {
+      setRtcHistoryLoading(false)
+    }
   }, [user])
 
-  useEffect(() => { loadSessions() }, [loadSessions])
-  useDidShow(() => { loadSessions() })
+  useDidShow(() => {
+    if (showDrawer) void loadRtcHistory()
+  })
   useDidHide(() => {
     setShowDrawer(false)
-    setEditMode(false)
-    setSelectedIds(new Set())
   })
+
+  useEffect(() => {
+    if (showDrawer) void loadRtcHistory()
+  }, [loadRtcHistory, showDrawer])
+
+  useEffect(() => {
+    return () => {
+      audioContextRef.current?.destroy()
+      audioContextRef.current = null
+    }
+  }, [])
 
   useEffect(() => {
     const handler = (res: any) => {
@@ -103,84 +123,29 @@ function ChatPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user])
 
-  const loadMessages = useCallback(async (sessionId: string) => {
-    const data = await getChatMessages(sessionId)
-    setMessages(data)
-  }, [])
-
   const handleNewSession = async (contextData?: object) => {
     if (!user) return
-    const session = await createChatSession({
-      user_id: user.id,
-      member_id: activeMember?.id || null,
-      title: '新对话',
-      context_data: contextData || {}
-    })
-    if (session) {
-      await loadSessions()
-      setActiveSession(session)
-      setMessages([])
-    }
+    setActiveSession(null)
+    setActiveRtcGroupId(null)
+    setMessages([])
+    setInputText('')
+    setInputHeight(32)
+    if (contextData) setUseIngredients(true)
   }
 
-  const handleSelectSession = (session: ChatSession) => {
-    setActiveSession(session)
-    loadMessages(session.id)
+  const handleSelectRtcHistory = (group: RtcHistoryGroup) => {
+    setActiveSession(null)
+    setActiveRtcGroupId(group.id)
+    setMessages(group.messages.map((message, index) => ({
+      id: `${group.id}-${index}`,
+      session_id: group.id,
+      role: message.role,
+      content: message.content,
+      image_url: null,
+      audio_url: null,
+      created_at: new Date(message.timestamp * 1000).toISOString(),
+    })))
     setShowDrawer(false)
-  }
-
-  const handleBatchDelete = async () => {
-    if (selectedIds.size === 0) return
-    const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
-      Taro.showModal({
-        title: '批量删除',
-        content: `确认删除选中的 ${selectedIds.size} 条对话？`,
-        success: (res) => resolve({confirm: res.confirm})
-      })
-    })
-    if (!confirm) return
-    const ids = Array.from(selectedIds)
-    await deleteMultipleChatSessions(ids)
-    if (activeSession && ids.includes(activeSession.id)) {
-      setActiveSession(null)
-      setMessages([])
-    }
-    setSelectedIds(new Set())
-    setEditMode(false)
-    loadSessions()
-  }
-
-  const toggleSelect = (id: string) => {
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
-    })
-  }
-
-  const toggleSelectAll = () => {
-    if (selectedIds.size === sessions.length) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(sessions.map(s => s.id)))
-    }
-  }
-
-  const handleDeleteSession = async (sessionId: string) => {
-    const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
-      Taro.showModal({
-        title: '删除对话',
-        content: '确认删除该对话？此操作不可撤销。',
-        success: (res) => resolve({confirm: res.confirm})
-      })
-    })
-    if (!confirm) return
-    await deleteChatSession(sessionId)
-    if (activeSession?.id === sessionId) {
-      setActiveSession(null)
-      setMessages([])
-    }
-    loadSessions()
   }
 
   const sendMessage = async (content: string, imageUrl?: string, imageBase64?: string, imageExt = 'jpg') => {
@@ -199,8 +164,8 @@ function ChatPage() {
         context_data: {}
       }) as ChatSession
       setActiveSession(session)
-      loadSessions()
     }
+    setActiveRtcGroupId(null)
 
     const optimisticId = `optimistic-${Date.now()}`
     const optimisticMsg: ChatMessage = {
@@ -229,12 +194,19 @@ function ChatPage() {
 
     try {
       let healthContext = ''
-      if (useProfile && activeMember) {
-        healthContext = buildHealthContext(activeMember)
+      if (useProfile) {
+        const selectedMembers = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
+        const contextMembers = selectedMembers.length > 0 ? selectedMembers : (activeMember ? [activeMember] : [])
+        healthContext = buildFamilyHealthContext(contextMembers)
       }
       let ingredientContext = ''
       if (useIngredients && ingredients.length > 0) {
-        ingredientContext = `当前称重食材：${ingredients.map(i => `${i.name}${i.weight}${i.unit}`).join('、')}`
+        const selectedMembers = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
+        const contextMembers = selectedMembers.length > 0 ? selectedMembers : (activeMember ? [activeMember] : [])
+        const memberText = contextMembers.length > 0
+          ? `本餐用餐成员：${contextMembers.map(member => member.nickname).join('、')}；`
+          : ''
+        ingredientContext = `${memberText}当前称重食材：${ingredients.map(i => `${i.name}${i.weight}${i.unit}`).join('、')}`
       }
 
       const fullPrompt = buildChatPrompt({
@@ -246,6 +218,10 @@ function ChatPage() {
       const ws = getAiWebSocket()
       let aiReply = ''
       const streamingAiId = `streaming-ai-${Date.now()}`
+      const audioChunks: ArrayBuffer[] = []
+      let streamingAudioUrl: string | null = null
+      let audioWritePromise: Promise<string | null> | null = null
+      let ttsEnded = false
       const createStreamingAiMessage = () => {
         setMessages(prev => prev.some(m => m.id === streamingAiId) ? prev : [...prev, {
           id: streamingAiId,
@@ -253,15 +229,28 @@ function ChatPage() {
           role: 'assistant',
           content: '',
           image_url: null,
+          audio_url: null,
           created_at: new Date().toISOString(),
         }])
       }
       const updateStreamingAiMessage = (text: string) => {
         setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, content: text} : m))
       }
+      const attachAudioToStreamingMessage = async () => {
+        if (streamingAudioUrl) return streamingAudioUrl
+        if (audioWritePromise) return audioWritePromise
+        audioWritePromise = writeAudioChunksToTempFile(audioChunks).then((url) => {
+          streamingAudioUrl = url
+          if (url) {
+            setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, audio_url: url} : m))
+          }
+          return url
+        })
+        return audioWritePromise
+      }
       try {
         if (imageBase64) {
-          await ws.connect({mode: 'default'})
+          await ws.connect({mode: 'default', userId: user!.id})
           createStreamingAiMessage()
           aiReply = await ws.requestImageResponse({
             triggerText: '请先请求上传图片。收到图片后，结合图片和用户问题给出简洁回答。',
@@ -271,11 +260,19 @@ function ChatPage() {
             onInterim: updateStreamingAiMessage
           })
         } else {
-          await ws.connect({cfg: CHAT_CFG})
+          await ws.connect({mode: 'default', userId: user!.id})
           createStreamingAiMessage()
           aiReply = await ws.requestResponse(fullPrompt, {
-            onInterim: updateStreamingAiMessage
+            onInterim: updateStreamingAiMessage,
+            onAudio: (buffer) => audioChunks.push(buffer),
+            onTtsEnd: () => {
+              ttsEnded = true
+              void attachAudioToStreamingMessage()
+            }
           })
+          if (!streamingAudioUrl && (ttsEnded || audioChunks.length > 0)) {
+            streamingAudioUrl = await attachAudioToStreamingMessage()
+          }
         }
       } finally {
         ws.disconnect()
@@ -287,16 +284,16 @@ function ChatPage() {
         content: aiReply || '抱歉，我暂时无法回答您的问题，请稍后重试。'
       })
       if (aiMsg) {
+        const renderedAiMsg = streamingAudioUrl ? {...aiMsg, audio_url: streamingAudioUrl} : aiMsg
         setMessages(prev => {
           const hasStreamingMessage = prev.some(m => m.id === streamingAiId)
-          if (!hasStreamingMessage) return [...prev, aiMsg]
-          return prev.map(m => m.id === streamingAiId ? aiMsg : m)
+          if (!hasStreamingMessage) return [...prev, renderedAiMsg]
+          return prev.map(m => m.id === streamingAiId ? renderedAiMsg : m)
         })
       }
 
       if (messages.length === 0) {
         await updateChatSession(session.id, {title: content.slice(0, 20)})
-        loadSessions()
       }
     } catch (err: any) {
       console.error('AI回复失败详情:', err?.message || err, err)
@@ -341,6 +338,132 @@ function ChatPage() {
     })
   }
 
+  const writeAudioChunksToTempFile = async (chunks: ArrayBuffer[]): Promise<string | null> => {
+    if (chunks.length === 0) return null
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
+    if (totalLength < 256) return null
+    const bytes = new Uint8Array(totalLength)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(new Uint8Array(chunk), offset)
+      offset += chunk.byteLength
+    }
+    if (!Taro.env.USER_DATA_PATH) return null
+    const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    const isMp3 = (
+      (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) ||
+      (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)
+    )
+    const audioData = isWav || isMp3 ? bytes : wrapPcm16ToWav(bytes)
+    const ext = isMp3 ? 'mp3' : 'wav'
+    const filePath = `${Taro.env.USER_DATA_PATH}/rtc-tts-${Date.now()}.${ext}`
+    return new Promise((resolve) => {
+      Taro.getFileSystemManager().writeFile({
+        filePath,
+        data: audioData.buffer,
+        success: () => resolve(filePath),
+        fail: (err) => {
+          console.warn('写入 RTC TTS 音频失败:', err?.errMsg || err)
+          resolve(null)
+        }
+      })
+    })
+  }
+
+  const wrapPcm16ToWav = (pcm: Uint8Array) => {
+    const sampleRate = 16000
+    const channels = 1
+    const bitsPerSample = 16
+    const headerSize = 44
+    const wav = new Uint8Array(headerSize + pcm.byteLength)
+    const view = new DataView(wav.buffer)
+    const writeString = (offset: number, value: string) => {
+      for (let i = 0; i < value.length; i += 1) wav[offset + i] = value.charCodeAt(i)
+    }
+    writeString(0, 'RIFF')
+    view.setUint32(4, 36 + pcm.byteLength, true)
+    writeString(8, 'WAVE')
+    writeString(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, channels, true)
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, sampleRate * channels * bitsPerSample / 8, true)
+    view.setUint16(32, channels * bitsPerSample / 8, true)
+    view.setUint16(34, bitsPerSample, true)
+    writeString(36, 'data')
+    view.setUint32(40, pcm.byteLength, true)
+    wav.set(pcm, headerSize)
+    return wav
+  }
+
+  const stopCurrentAudio = useCallback(() => {
+    audioContextRef.current?.stop()
+    audioContextRef.current?.destroy()
+    audioContextRef.current = null
+    audioMessageIdRef.current = null
+    setPlayingAudioId(null)
+  }, [])
+
+  const handlePlayAudio = useCallback((msg: ChatMessage) => {
+    if (!msg.audio_url) return
+    try {
+      if (msg.audio_url.startsWith(Taro.env.USER_DATA_PATH || '')) {
+        const stat = Taro.getFileSystemManager().statSync(msg.audio_url) as Taro.Stats
+        if (!stat?.size || stat.size < 256) {
+          Taro.showToast({title: '朗读音频不可用', icon: 'none'})
+          return
+        }
+      }
+    } catch {
+      Taro.showToast({title: '朗读音频不可用', icon: 'none'})
+      return
+    }
+    if (audioMessageIdRef.current === msg.id && playingAudioId === msg.id) {
+      stopCurrentAudio()
+      return
+    }
+    stopCurrentAudio()
+    const ctx = Taro.createInnerAudioContext()
+    audioContextRef.current = ctx
+    audioMessageIdRef.current = msg.id
+    ctx.src = msg.audio_url
+    ctx.onEnded(() => {
+      if (audioMessageIdRef.current === msg.id) {
+        audioMessageIdRef.current = null
+        audioContextRef.current?.destroy()
+        audioContextRef.current = null
+        setPlayingAudioId(null)
+      }
+    })
+    ctx.onError((err) => {
+      console.warn('播放 RTC TTS 音频失败:', err?.errMsg || err)
+      if (audioMessageIdRef.current === msg.id) {
+        audioMessageIdRef.current = null
+        audioContextRef.current?.destroy()
+        audioContextRef.current = null
+        setPlayingAudioId(null)
+      }
+      Taro.showToast({title: '朗读播放失败', icon: 'none'})
+    })
+    setPlayingAudioId(msg.id)
+    ctx.play()
+  }, [playingAudioId, stopCurrentAudio])
+
+  const handleCopyMessage = useCallback((content: string) => {
+    Taro.setClipboardData({
+      data: content,
+      fail: (err) => {
+        if (isPrivacyScopeError(err)) {
+          console.warn('复制内容隐私配置缺失:', err)
+          showPrivacyScopeDeclarationTip('剪贴板')
+          return
+        }
+        Taro.showToast({title: '复制失败', icon: 'none'})
+      }
+    })
+  }, [])
+
   // ── WebSocket 语音通话逻辑 ──────────────────────────────────────────────
 
   const ensureSession = useCallback(async (title: string): Promise<ChatSession | null> => {
@@ -353,10 +476,10 @@ function ChatPage() {
       context_data: {}
     }) as ChatSession
     setActiveSession(s)
+    setActiveRtcGroupId(null)
     voiceSessionRef.current = s
-    loadSessions()
     return s
-  }, [activeSession, activeMember, loadSessions, user])
+  }, [activeSession, activeMember, user])
 
   const handleStartVoiceCall = useCallback(async () => {
     if (!isOnline) { Taro.showToast({title: '需要网络连接', icon: 'none'}); return }
@@ -367,7 +490,7 @@ function ChatPage() {
 
     try {
       const ws = getAiWebSocket()
-      await ws.connect({cfg: VOICE_CFG})
+      await ws.connect({mode: 'default', userId: user!.id})
       Taro.hideToast()
       setVoiceState('active')
       Taro.showToast({title: '语音通话已开始', icon: 'success', duration: 1500})
@@ -477,7 +600,7 @@ function ChatPage() {
           const {base64} = await readAudioAsBase64(res.tempFilePath)
           const buffer = Taro.base64ToArrayBuffer(base64)
           const ws = getAiWebSocket()
-          await ws.connect({cfg: VOICE_CFG})
+          await ws.connect({mode: 'default', userId: user!.id})
           ws.sendAudio(buffer)
           const text = await new Promise<string>((resolve, reject) => {
             const timeout = setTimeout(() => { unsub(); reject(new Error('timeout')) }, 15000)
@@ -542,7 +665,13 @@ function ChatPage() {
       const localPath = res.tempFiles[0].tempFilePath
       const image = await readImageAsBase64(localPath)
       setPendingImage({localPath, base64: image.base64, ext: image.ext})
-    } catch {
+    } catch (err) {
+      if (isUserCancelError(err)) return
+      if (isPrivacyScopeError(err)) {
+        console.warn('图片选择隐私配置缺失:', err)
+        showPrivacyScopeDeclarationTip('相册/摄像头')
+        return
+      }
       Taro.showToast({title: '选取图片失败', icon: 'none'})
     }
   }
@@ -554,7 +683,9 @@ function ChatPage() {
       return
     }
     setIsUploadingImage(true)
+    let loadingShown = false
     Taro.showLoading({title: '上传中...'})
+    loadingShown = true
     try {
       const {uploadToSupabase} = await import('@/utils/upload')
       const result = await uploadToSupabase(
@@ -562,6 +693,7 @@ function ChatPage() {
         {bucket: 'chat-images', userId: user!.id}
       )
       Taro.hideLoading()
+      loadingShown = false
       if (result.success && result.data) {
         const {data: urlData} = supabase.storage.from('chat-images').getPublicUrl(result.data.path)
         setPendingImage(null)
@@ -570,7 +702,7 @@ function ChatPage() {
         Taro.showToast({title: '图片上传失败', icon: 'none'})
       }
     } catch {
-      Taro.hideLoading()
+      if (loadingShown) Taro.hideLoading()
       Taro.showToast({title: '图片上传失败', icon: 'none'})
     } finally {
       setIsUploadingImage(false)
@@ -604,7 +736,9 @@ function ChatPage() {
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-xl font-semibold text-foreground">AI健康顾问</p>
-          {activeSession ? (
+          {activeRtcGroupId ? (
+            <p className="text-xl text-muted-foreground">云端历史</p>
+          ) : activeSession ? (
             <p className="text-xl text-muted-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
               {activeSession.title}
             </p>
@@ -736,15 +870,30 @@ function ChatPage() {
                     )}
                   </div>
                   {msg.role === 'assistant' && (
-                    <button
-                      type="button"
-                      className="flex items-center justify-center leading-none gap-1 mt-1 px-2 active:opacity-60"
-                      style={{height: '24px'}}
-                      onClick={() => Taro.setClipboardData({data: msg.content})}
-                    >
-                      <div className="i-mdi-content-copy text-xl text-muted-foreground" />
-                      <span className="text-muted-foreground" style={{fontSize: '11px'}}>复制</span>
-                    </button>
+                    <div className="flex items-center gap-2 mt-1">
+                      <button
+                        type="button"
+                        className="flex items-center justify-center leading-none gap-1 px-2 active:opacity-60"
+                        style={{height: '24px'}}
+                        onClick={() => handleCopyMessage(msg.content)}
+                      >
+                        <div className="i-mdi-content-copy text-xl text-muted-foreground" />
+                        <span className="text-muted-foreground" style={{fontSize: '11px'}}>复制</span>
+                      </button>
+                      {msg.audio_url && (
+                        <button
+                          type="button"
+                          className="flex items-center justify-center leading-none gap-1 px-2 active:opacity-60"
+                          style={{height: '24px'}}
+                          onClick={() => handlePlayAudio(msg)}
+                        >
+                          <div className={`${playingAudioId === msg.id ? 'i-mdi-pause-circle-outline' : 'i-mdi-volume-high'} text-xl text-muted-foreground`} />
+                          <span className="text-muted-foreground" style={{fontSize: '11px'}}>
+                            {playingAudioId === msg.id ? '暂停' : '朗读'}
+                          </span>
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -939,96 +1088,61 @@ function ChatPage() {
             <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
               <span className="text-2xl font-semibold text-foreground">对话历史</span>
               <div className="flex items-center gap-4">
-                {editMode ? (
-                  <>
-                    <button
-                      type="button"
-                      className="flex items-center justify-center leading-none text-xl font-medium text-foreground border border-border rounded-lg px-3 active:bg-muted transition"
-                      style={{height: '32px'}}
-                      onClick={toggleSelectAll}
-                    >
-                      {selectedIds.size === sessions.length ? '取消全选' : '全选'}
-                    </button>
-                    <button
-                      type="button"
-                      className="flex items-center justify-center leading-none gap-1 text-xl font-medium text-foreground border border-border rounded-lg px-3 active:bg-muted transition"
-                      style={{height: '32px'}}
-                      onClick={handleBatchDelete}
-                    >
-                      <div className="i-mdi-delete-outline text-xl" />
-                      <span>删除</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="flex items-center justify-center leading-none text-xl font-medium text-foreground border border-border rounded-lg px-3 active:bg-muted transition"
-                      style={{height: '32px'}}
-                      onClick={() => { setEditMode(false); setSelectedIds(new Set()) }}
-                    >
-                      取消
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      className="flex items-center justify-center leading-none text-xl font-medium text-primary border border-primary rounded-lg px-3 active:bg-primary/10 transition"
-                      style={{height: '32px'}}
-                      onClick={() => setEditMode(true)}
-                    >
-                      编辑
-                    </button>
-                    <div className="i-mdi-close text-2xl text-muted-foreground" onClick={() => setShowDrawer(false)} />
-                  </>
-                )}
+                <button
+                  type="button"
+                  className="flex items-center justify-center leading-none gap-1 text-xl font-medium text-primary border border-primary rounded-lg px-3 active:bg-primary/10 transition"
+                  style={{height: '32px'}}
+                  onClick={() => void loadRtcHistory()}
+                >
+                  <div className={`i-mdi-refresh text-xl ${rtcHistoryLoading ? 'animate-spin' : ''}`} />
+                  <span>刷新</span>
+                </button>
+                <div className="i-mdi-close text-2xl text-muted-foreground" onClick={() => setShowDrawer(false)} />
               </div>
             </div>
             <div className="flex-1 overflow-y-auto">
-              {sessions.length === 0 ? (
+              {rtcHistoryLoading ? (
+                <div className="flex flex-col items-center justify-center py-12 gap-2">
+                  <div className="i-mdi-loading text-5xl text-muted-foreground" style={{animation: 'spin 1s linear infinite'}} />
+                  <p className="text-xl text-muted-foreground">正在加载云端历史...</p>
+                </div>
+              ) : rtcHistoryError ? (
+                <div className="flex flex-col items-center justify-center py-12 gap-3 px-6">
+                  <div className="i-mdi-alert-circle-outline text-5xl text-muted-foreground" />
+                  <p className="text-xl text-muted-foreground text-center">{rtcHistoryError}</p>
+                  <button
+                    type="button"
+                    className="flex items-center justify-center leading-none text-xl font-medium text-primary border border-primary rounded-lg px-4 active:bg-primary/10 transition"
+                    style={{height: '36px'}}
+                    onClick={() => void loadRtcHistory()}
+                  >
+                    重试
+                  </button>
+                </div>
+              ) : rtcHistoryGroups.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-12 gap-2">
                   <div className="i-mdi-chat-outline text-5xl text-muted-foreground" />
-                  <p className="text-xl text-muted-foreground">暂无对话历史</p>
+                  <p className="text-xl text-muted-foreground">暂无云端对话历史</p>
                 </div>
-              ) : sessions.map(s => {
-                const isSelected = selectedIds.has(s.id)
-                return (
+              ) : rtcHistoryGroups.map(group => (
                   <div
-                    key={s.id}
-                    className={`flex items-center gap-3 px-4 border-b border-border ${activeSession?.id === s.id ? 'bg-primary/10' : ''}`}
+                    key={group.id}
+                    className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
                     style={{minHeight: '56px'}}
-                    onClick={() => editMode ? toggleSelect(s.id) : handleSelectSession(s)}
+                    onClick={() => handleSelectRtcHistory(group)}
                   >
-                    {editMode ? (
-                      <div
-                        className="flex items-center justify-center rounded-full flex-shrink-0"
-                        style={{
-                          width: '22px',
-                          height: '22px',
-                          border: '2px solid #E5E7EB',
-                          backgroundColor: '#FFFFFF',
-                        }}
-                      >
-                        {isSelected && <div className="i-mdi-check" style={{fontSize: '16px', color: '#111827'}} />}
-                      </div>
-                    ) : (
-                      <div className="i-mdi-chat-outline text-xl text-muted-foreground flex-shrink-0" />
-                    )}
+                    <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
                     <div className="flex-1 min-w-0">
                       <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                        {s.title}
+                        {group.title}
                       </p>
                       <p className="text-xl text-muted-foreground">
-                        {new Date(s.updated_at).toLocaleDateString('zh-CN')}
+                        {new Date(group.endTime * 1000).toLocaleDateString('zh-CN')}
                       </p>
                     </div>
-                    {!editMode && (
-                      <div
-                        className="i-mdi-delete-outline text-2xl text-muted-foreground flex-shrink-0"
-                        onClick={(e) => { e.stopPropagation(); handleDeleteSession(s.id) }}
-                      />
-                    )}
+                    <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
                   </div>
-                )
-              })}
+              ))}
             </div>
             <div className="px-4 pt-3 pb-tabbar flex-shrink-0">
               <button

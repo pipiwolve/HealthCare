@@ -97,6 +97,21 @@ export interface ChatMessage {
   content: string
   image_url: string | null
   created_at: string
+  audio_url?: string | null
+}
+
+export interface RtcHistoryMessage {
+  role: 'user' | 'assistant'
+  content: string
+  timestamp: number
+}
+
+export interface RtcHistoryGroup {
+  id: string
+  title: string
+  startTime: number
+  endTime: number
+  messages: RtcHistoryMessage[]
 }
 
 export interface ReminderSettings {

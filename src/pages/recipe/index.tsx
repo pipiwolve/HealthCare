@@ -9,7 +9,6 @@ import type {Ingredient} from '@/db/types'
 import {getAiWebSocket} from '@/services/aiWebSocket'
 import {useAppStore} from '@/store/appStore'
 import {buildHealthContext, enrichIngredientsWithAllergens} from '@/utils/allergenUtils'
-import {CHAT_CFG} from '@/utils/brtcConfig'
 
 function RecipePage() {
   const {activeMember, isOnline, ingredients: storeIngredients} = useAppStore()
@@ -56,16 +55,20 @@ function RecipePage() {
 ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
 
 要求：
-1. 给出菜名
-2. 列出所需食材及用量
-3. 分步骤说明烹饪方法
-4. 说明该菜肴的营养特点
-5. 不要使用含过敏原的食材
-用Markdown格式输出。`
+1. 不要使用含过敏原的食材
+2. 必须使用简单 Markdown 输出，不要输出纯文本
+3. 请严格按以下结构输出：
+# 菜名
+## 食材用量
+- 食材：用量
+## 烹饪步骤
+1. 步骤说明
+## 营养特点
+- **重点**：说明适合人群和注意事项`
 
     try {
       const ws = getAiWebSocket()
-      await ws.connect({cfg: CHAT_CFG})
+      await ws.connect({mode: 'default'})
       const result = await ws.requestResponse(prompt, {
         onInterim: (text) => setRecipeContent(text)
       })

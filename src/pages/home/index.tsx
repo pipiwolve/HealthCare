@@ -2,7 +2,7 @@
 
 import {Image} from '@tarojs/components'
 import Taro, {useDidShow} from '@tarojs/taro'
-import {useCallback, useEffect, useRef, useState } from 'react'
+import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {supabase} from '@/client/supabase'
 import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
 import {DisclaimerModal} from '@/components/DisclaimerModal'
@@ -13,22 +13,22 @@ import {createWeighingRecord, getDevices, getWeighingRecords, updateProfile } fr
 import type {Ingredient, WeighingRecord } from '@/db/types'
 import {getAiWebSocket} from '@/services/aiWebSocket'
 import {useAppStore} from '@/store/appStore'
-import {buildHealthContext, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
+import {buildFamilyHealthContext, checkAllergens, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
 import {buildFoodRecognitionPrompt, parseRecognizedFoods} from '@/utils/aiPromptHelpers'
+import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
 import {bleMockService} from '@/utils/bleMock'
 import type {WeightUnit} from '@/utils/bleService'
 import {bleService} from '@/utils/bleService'
-import {CHAT_CFG, VOICE_CFG} from '@/utils/brtcConfig'
 
 function HomePage() {
   const {user, profile, refreshProfile} = useAuth()
   const {
-    activeMember, refreshMembers,
+    activeMember, familyMembers, refreshMembers,
     bleStatus, setBLEStatus, batteryLevel, setBatteryLevel,
     currentWeight, setCurrentWeight, weightUnit, setWeightUnit,
     isWeightStable, setIsWeightStable,
     ingredients, addIngredient, removeIngredient, clearIngredients,
-    personCount, setPersonCount, isOnline
+    personCount, selectedMealMemberIds, setSelectedMealMemberIds, isOnline
   } = useAppStore()
 
   const [showDisclaimer, setShowDisclaimer] = useState(false)
@@ -48,7 +48,29 @@ function HomePage() {
   const [historyRefreshing, setHistoryRefreshing] = useState(false)
   const [connectedDeviceName, setConnectedDeviceName] = useState('')
   const [showAnalysisContent, setShowAnalysisContent] = useState(true)
+  const [showMealMemberSelector, setShowMealMemberSelector] = useState(false)
   const recorderManager = useRef<Taro.RecorderManager | null>(null)
+
+  const selectedMealMembers = useMemo(() => {
+    const selected = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
+    if (selected.length > 0) return selected
+    return activeMember ? [activeMember] : []
+  }, [activeMember, familyMembers, selectedMealMemberIds])
+
+  const selectedMealMemberNames = selectedMealMembers.map(member => member.nickname).join('、')
+  const mealAwareIngredients = useMemo(() => {
+    const members = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
+    if (members.length === 0) return ingredients
+    return ingredients.map(ingredient => {
+      const allergenNames = members.flatMap(member => checkAllergens(ingredient.name, member))
+      const uniqueAllergenNames = Array.from(new Set(allergenNames))
+      return {
+        ...ingredient,
+        hasAllergen: uniqueAllergenNames.length > 0,
+        allergenName: uniqueAllergenNames.join('、')
+      }
+    })
+  }, [activeMember, ingredients, selectedMealMembers])
 
   // 检查免责声明；已同意过的用户直接标记 confirmed 允许 BLE 初始化
   useEffect(() => {
@@ -146,11 +168,17 @@ function HomePage() {
 
   // 过敏源预警检查
   useEffect(() => {
-    const enriched = enrichIngredientsWithAllergens(ingredients, activeMember)
-    const warned = enriched.filter(i => i.hasAllergen).map(i => i.allergenName || '').filter(Boolean)
-    setAllergenWarning(warned.join('、'))
+    const members = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
+    const warned = members.flatMap(member => {
+      const enriched = enrichIngredientsWithAllergens(ingredients, member)
+      return enriched
+        .filter(i => i.hasAllergen)
+        .map(i => i.allergenName ? `${member.nickname}：${i.allergenName}` : '')
+        .filter(Boolean)
+    })
+    setAllergenWarning(Array.from(new Set(warned)).join('、'))
     setShowAllergenBanner(true)
-  }, [ingredients, activeMember])
+  }, [ingredients, activeMember, selectedMealMembers])
 
   const handleAddIngredient = () => {
     if (!foodName.trim()) {
@@ -165,9 +193,27 @@ function HomePage() {
     const base = {name: foodName.trim(), weight: w, unit: weightUnit, image_url: currentIngredientImageUrl ?? null}
     const enriched = enrichIngredientsWithAllergens([base], activeMember)
     addIngredient(enriched[0])
+    if (familyMembers.length > 0 && selectedMealMembers.length === 0 && activeMember) {
+      setSelectedMealMemberIds([activeMember.id])
+    }
     setFoodName('')
     setManualWeight('')
     setCurrentIngredientImageUrl(null)
+  }
+
+  const toggleMealMember = (memberId: string) => {
+    const selected = selectedMealMemberIds.length > 0
+      ? selectedMealMemberIds
+      : (activeMember ? [activeMember.id] : [])
+    if (selected.includes(memberId)) {
+      if (selected.length <= 1) {
+        Taro.showToast({title: '至少选择1位用餐成员', icon: 'none'})
+        return
+      }
+      setSelectedMealMemberIds(selected.filter(id => id !== memberId))
+      return
+    }
+    setSelectedMealMemberIds([...selected, memberId])
   }
 
   // 读取文件为base64（小程序专用）
@@ -222,7 +268,7 @@ function HomePage() {
       setRecognizing(true)
       const ws = getAiWebSocket()
       try {
-        await ws.connect({cfg: VOICE_CFG})
+        await ws.connect({mode: 'default'})
         const {base64} = await readFileAsBase64(res.tempFilePath)
         const buffer = Taro.base64ToArrayBuffer(base64)
         ws.sendAudio(buffer)
@@ -259,6 +305,7 @@ function HomePage() {
       Taro.showToast({title: '需要网络连接', icon: 'none'})
       return
     }
+    let loadingShown = false
     try {
       const res = await Taro.chooseMedia({count: 1, mediaType: ['image'], sourceType: ['album', 'camera']})
       if (!res.tempFiles?.[0]) return
@@ -266,6 +313,7 @@ function HomePage() {
 
       // Step 1: 压缩图片
       Taro.showLoading({title: '图片压缩中...'})
+      loadingShown = true
       let compressedPath = res.tempFiles[0].tempFilePath
       try {
         const compressRes = await Taro.compressImage({src: compressedPath, quality: 80})
@@ -298,6 +346,7 @@ function HomePage() {
       ])
 
       Taro.hideLoading()
+      loadingShown = false
 
       // 处理上传结果
       let uploadedImageUrl: string | null = null
@@ -320,8 +369,14 @@ function HomePage() {
         Taro.showToast({title: '未识别到食材，请光线充足正面拍摄', icon: 'none'})
       }
     } catch (err: any) {
-      Taro.hideLoading()
+      if (loadingShown) Taro.hideLoading()
       setCurrentIngredientImageUrl(null)
+      if (isUserCancelError(err)) return
+      if (isPrivacyScopeError(err)) {
+        console.warn('拍照识别隐私配置缺失:', err)
+        showPrivacyScopeDeclarationTip('相册/摄像头')
+        return
+      }
       console.error('拍照识别失败:', err?.message || err)
       Taro.showToast({title: '识别失败，请重新拍摄', icon: 'none'})
     } finally {
@@ -342,12 +397,17 @@ function HomePage() {
     setIsAnalyzing(true)
     setAnalysisResult('')
     setShowAnalysisContent(true)
-    const healthCtx = buildHealthContext(activeMember)
-    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${personCount}人食用）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":数值,"protein":数值,"fat":数值,"carbs":数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs单位为g。然后用Markdown格式输出详细分析。`
+    const analysisMembers = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
+    const analysisPersonCount = Math.max(1, analysisMembers.length || personCount)
+    const healthCtx = buildFamilyHealthContext(analysisMembers)
+    const mealMemberText = analysisMembers.length > 0
+      ? `用餐成员：${analysisMembers.map(member => member.nickname).join('、')}`
+      : `用餐人数：${analysisPersonCount}人`
+    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${analysisPersonCount}人食用，${mealMemberText}）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n请先估算整餐总营养，再按${analysisPersonCount}人平摊。综合建议需要结合每位已选成员的健康档案，分别提示过敏源、慢性病、用药或营养目标相关注意事项。\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":整餐总热量数值,"protein":整餐总蛋白质数值,"fat":整餐总脂肪数值,"carbs":整餐总碳水数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs单位为g。\n\nJSON代码块后必须输出 Markdown 正文，不要输出纯文本。请严格使用以下简单 Markdown 结构：\n## 营养总览\n| 项目 | 整餐总量 | 人均（${analysisPersonCount}人平摊） |\n| --- | --- | --- |\n| 热量 | 约 xx 千卡 | 约 xx 千卡 |\n| 蛋白质 | 约 xx 克 | 约 xx 克 |\n| 脂肪 | 约 xx 克 | 约 xx 克 |\n| 碳水 | 约 xx 克 | 约 xx 克 |\n\n## 综合建议\n- **成员名**：结合健康档案给出建议。\n- **注意事项**：提示过敏源、慢性病、用药或营养目标相关注意事项。`
 
     try {
       const ws = getAiWebSocket()
-      await ws.connect({cfg: CHAT_CFG})
+      await ws.connect({mode: 'default'})
       const result = await ws.requestResponse(prompt, {
         onInterim: (text) => {
           setAnalysisResult(text.replace(/```json[\s\S]*?```\s*/g, '').trimStart())
@@ -377,18 +437,27 @@ function HomePage() {
       const proteinMatch = !parsed.protein ? result.match(proteinRe) : null
       const fatMatch = !parsed.fat ? result.match(fatRe) : null
       const carbsMatch = !parsed.carbs ? result.match(carbsRe) : null
+      const totalCalories = parsed.calories ?? (caloriesMatch ? parseFloat(caloriesMatch[1]) : null)
+      const totalProtein = parsed.protein ?? (proteinMatch ? parseFloat(proteinMatch[1]) : null)
+      const totalFat = parsed.fat ?? (fatMatch ? parseFloat(fatMatch[1]) : null)
+      const totalCarbs = parsed.carbs ?? (carbsMatch ? parseFloat(carbsMatch[1]) : null)
+      const perPersonNutrition = {
+        total_calories: totalCalories == null ? null : totalCalories / analysisPersonCount,
+        protein: totalProtein == null ? null : totalProtein / analysisPersonCount,
+        fat: totalFat == null ? null : totalFat / analysisPersonCount,
+        carbs: totalCarbs == null ? null : totalCarbs / analysisPersonCount,
+      }
 
-      await createWeighingRecord({
-        user_id: user!.id,
-        member_id: activeMember?.id || null,
-        ingredients: list,
-        person_count: personCount,
-        analysis_result: cleanResult,
-        total_calories: parsed.calories ?? (caloriesMatch ? parseFloat(caloriesMatch[1]) : null),
-        protein: parsed.protein ?? (proteinMatch ? parseFloat(proteinMatch[1]) : null),
-        fat: parsed.fat ?? (fatMatch ? parseFloat(fatMatch[1]) : null),
-        carbs: parsed.carbs ?? (carbsMatch ? parseFloat(carbsMatch[1]) : null),
-      })
+      const recordMembers = analysisMembers.length > 0 ? analysisMembers : [null]
+      await Promise.all(recordMembers.map(member => createWeighingRecord({
+          user_id: user!.id,
+          member_id: member?.id || null,
+          ingredients: list,
+          person_count: analysisPersonCount,
+          analysis_result: cleanResult,
+          ...perPersonNutrition,
+        })
+      ))
 
       const records = await getWeighingRecords(user!.id, activeMember?.id)
       setHistory(records)
@@ -583,24 +652,67 @@ function HomePage() {
 
         {/* 用餐人数 */}
         {ingredients.length > 0 && (
-          <div className="bg-card rounded-2xl px-4 py-3 shadow-elegant flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="i-mdi-account-group text-2xl text-primary" />
-              <span className="text-xl text-foreground">用餐人数</span>
-            </div>
-            <div className="flex items-center gap-4">
+          <div className="bg-card rounded-2xl p-4 shadow-elegant">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="i-mdi-account-group text-2xl text-primary flex-shrink-0" />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl text-foreground">用餐人数</span>
+                    <span className="text-2xl font-bold text-foreground">{personCount}</span>
+                  </div>
+                  <p className="text-xl text-muted-foreground truncate" style={{maxWidth: '210px'}}>
+                    {selectedMealMemberNames || '请选择用餐成员'}
+                  </p>
+                </div>
+              </div>
               <button
                 type="button"
-                className={`flex items-center justify-center leading-none w-10 h-10 rounded-full border-2 text-2xl font-semibold transition ${personCount <= 1 ? 'border-border text-muted-foreground' : 'border-primary text-primary'}`}
-                onClick={() => personCount > 1 && setPersonCount(personCount - 1)}
-              >-</button>
-              <span className="text-2xl font-bold text-foreground w-8 text-center">{personCount}</span>
-              <button
-                type="button"
-                className={`flex items-center justify-center leading-none w-10 h-10 rounded-full border-2 text-2xl font-semibold transition ${personCount >= 20 ? 'border-border text-muted-foreground' : 'border-primary text-primary'}`}
-                onClick={() => personCount < 20 && setPersonCount(personCount + 1)}
-              >+</button>
+                className="flex items-center justify-center leading-none gap-1 text-xl font-medium border-2 border-primary text-primary rounded-xl px-3 flex-shrink-0"
+                style={{height: '36px'}}
+                onClick={() => setShowMealMemberSelector(v => !v)}
+              >
+                <div className={showMealMemberSelector ? 'i-mdi-chevron-up text-xl' : 'i-mdi-plus text-xl'} />
+                <span>{showMealMemberSelector ? '收起' : '添加用餐人数'}</span>
+              </button>
             </div>
+
+            {showMealMemberSelector && (
+              <div className="mt-3 pt-3 border-t border-border">
+                {familyMembers.length === 0 ? (
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xl text-muted-foreground">暂无家庭成员</span>
+                    <button
+                      type="button"
+                      className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
+                      style={{height: '34px'}}
+                      onClick={() => Taro.navigateTo({url: '/pages/family/index'})}
+                    >去管理</button>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {familyMembers.map(member => {
+                      const selectedIds = selectedMealMemberIds.length > 0
+                        ? selectedMealMemberIds
+                        : (activeMember ? [activeMember.id] : [])
+                      const isSelected = selectedIds.includes(member.id)
+                      return (
+                        <button
+                          key={member.id}
+                          type="button"
+                          className={`flex items-center justify-center leading-none gap-1 text-xl rounded-xl border-2 px-3 transition active:scale-95 ${isSelected ? 'border-primary' : 'bg-secondary border-border text-foreground'}`}
+                          style={{height: '36px', ...(isSelected ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                          onClick={() => toggleMealMember(member.id)}
+                        >
+                          <div className={isSelected ? 'i-mdi-checkbox-marked-circle text-xl' : 'i-mdi-checkbox-blank-circle-outline text-xl'} />
+                          <span>{member.nickname}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -616,7 +728,7 @@ function HomePage() {
               >清空</button>
             </div>
             <div className="flex flex-col gap-2">
-              {ingredients.map((ing, idx) => (
+              {mealAwareIngredients.map((ing, idx) => (
                 <div key={idx} className={`flex items-center gap-3 py-3 px-3 rounded-xl ${ing.hasAllergen ? 'bg-destructive/10 border border-destructive/30' : 'bg-secondary'}`}>
                   <div
                     className="flex-shrink-0 overflow-hidden"

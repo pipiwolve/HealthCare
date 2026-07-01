@@ -24,6 +24,7 @@ export interface AppState {
   // 当前食材列表
   ingredients: Ingredient[]
   personCount: number
+  selectedMealMemberIds: string[]
   // 网络状态
   isOnline: boolean
   // 加载状态
@@ -44,6 +45,7 @@ interface AppContextType extends AppState {
   removeIngredient: (index: number) => void
   clearIngredients: () => void
   setPersonCount: (count: number) => void
+  setSelectedMealMemberIds: (memberIds: string[]) => void
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
@@ -60,8 +62,13 @@ export function AppProvider({children, userId}: {children: ReactNode; userId?: s
   const [hasTare, setHasTare] = useState(false)
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
   const [personCount, setPersonCount] = useState(1)
+  const [selectedMealMemberIds, setSelectedMealMemberIdsState] = useState<string[]>([])
   const [isOnline, setIsOnline] = useState(true)
   const [loadingMembers, setLoadingMembers] = useState(false)
+
+  useEffect(() => {
+    setPersonCount(Math.max(1, selectedMealMemberIds.length))
+  }, [selectedMealMemberIds])
 
   // 监听网络状态
   useEffect(() => {
@@ -81,10 +88,19 @@ export function AppProvider({children, userId}: {children: ReactNode; userId?: s
       const activeId = await getActiveMemberId(uid)
       if (activeId) {
         const found = members.find(m => m.id === activeId)
-        setActiveMember2(found || members.find(m => m.is_primary) || members[0] || null)
+        const nextActive = found || members.find(m => m.is_primary) || members[0] || null
+        setActiveMember2(nextActive)
+        setSelectedMealMemberIdsState(prev => {
+          const valid = prev.filter(id => members.some(m => m.id === id))
+          return valid.length > 0 ? valid : (nextActive ? [nextActive.id] : [])
+        })
       } else {
         const primary = members.find(m => m.is_primary) || members[0]
         setActiveMember2(primary || null)
+        setSelectedMealMemberIdsState(prev => {
+          const valid = prev.filter(id => members.some(m => m.id === id))
+          return valid.length > 0 ? valid : (primary ? [primary.id] : [])
+        })
         if (primary) await setActiveMember(uid, primary.id)
       }
     } finally {
@@ -96,9 +112,19 @@ export function AppProvider({children, userId}: {children: ReactNode; userId?: s
     const member = familyMembers.find(m => m.id === memberId)
     if (member && userId) {
       setActiveMember2(member)
+      setSelectedMealMemberIdsState(prev => {
+        if (prev.length > 0) return prev
+        return [memberId]
+      })
       await setActiveMember(userId, memberId)
     }
   }, [familyMembers, userId])
+
+  const setSelectedMealMemberIds = useCallback((memberIds: string[]) => {
+    const validIds = new Set(familyMembers.map(m => m.id))
+    const next = Array.from(new Set(memberIds.filter(id => validIds.has(id))))
+    setSelectedMealMemberIdsState(next)
+  }, [familyMembers])
 
   const addIngredient = useCallback((ingredient: Ingredient) => {
     setIngredients(prev => [...prev, ingredient])
@@ -117,11 +143,11 @@ export function AppProvider({children, userId}: {children: ReactNode; userId?: s
       activeMember, familyMembers, bleStatus, connectedDevice,
       batteryLevel,
       currentWeight, weightUnit, isWeightStable, hasTare,
-      ingredients, personCount, isOnline, loadingMembers,
+      ingredients, personCount, selectedMealMemberIds, isOnline, loadingMembers,
       setActiveMemberById, refreshMembers,
       setBLEStatus, setConnectedDevice, setBatteryLevel,
       setCurrentWeight, setWeightUnit, setIsWeightStable, setHasTare,
-      addIngredient, removeIngredient, clearIngredients, setPersonCount
+      addIngredient, removeIngredient, clearIngredients, setPersonCount, setSelectedMealMemberIds
     }}>
       {children}
     </AppContext.Provider>
