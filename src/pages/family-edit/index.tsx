@@ -126,8 +126,8 @@ function FamilyEditPage() {
                 <button
                   key={g}
                   type="button"
-                  className={`flex items-center justify-center leading-none text-xl px-6 rounded-xl border-2 transition ${form.gender === g ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-secondary text-muted-foreground'}`}
-                  style={{height: '40px'}}
+                  className={`flex items-center justify-center leading-none text-xl px-6 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${form.gender === g ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+                  style={{height: '40px', ...(form.gender === g ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
                   onClick={() => setForm({...form, gender: g})}
                 >{label}</button>
               ))}
@@ -188,8 +188,8 @@ function FamilyEditPage() {
               <button
                 key={d}
                 type="button"
-                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition ${(form.chronic_diseases || []).includes(d) ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-secondary text-muted-foreground'}`}
-                style={{height: '36px'}}
+                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${(form.chronic_diseases || []).includes(d) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+                style={{height: '36px', ...((form.chronic_diseases || []).includes(d) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
                 onClick={() => toggleDisease(d)}
               >{d}</button>
             ))}
@@ -207,8 +207,8 @@ function FamilyEditPage() {
               <button
                 key={a}
                 type="button"
-                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition ${(form.allergens || []).includes(a) ? 'border-destructive bg-destructive/10 text-destructive' : 'border-border bg-secondary text-muted-foreground'}`}
-                style={{height: '36px'}}
+                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${(form.allergens || []).includes(a) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+                style={{height: '36px', ...((form.allergens || []).includes(a) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
                 onClick={() => toggleAllergen(a)}
               >{a}</button>
             ))}

@@ -3,7 +3,8 @@ import {supabase} from '@/client/supabase'
 import type {
   Profile, FamilyMember, Device,
   WeighingRecord, ChatSession, ChatMessage,
-  ReminderSettings, NutritionStats, Ingredient
+  ReminderSettings, NutritionStats, Ingredient,
+  RtcHistoryGroup
 } from './types'
 
 // ===== Profile API =====
@@ -264,6 +265,54 @@ export async function deleteAllChatMessages(userId: string): Promise<boolean> {
     .in('id', sessionIds)
   if (error) console.error('deleteAllChatMessages error:', error)
   return !error
+}
+
+// ===== RTC Cloud Chat History API =====
+function isRtcHistoryUnavailable(error: unknown): boolean {
+  const anyError = error as any
+  const status = anyError?.context?.status || anyError?.context?.statusCode
+  const name = anyError?.name || ''
+  const message = anyError?.message || ''
+  const details = `${name} ${message} ${anyError?.errMsg || ''}`
+  return (
+    status === 404 ||
+    status === 502 ||
+    status === 504 ||
+    details.includes('FunctionsFetchError') ||
+    details.includes('Failed to send a request') ||
+    details.includes('request:fail timeout') ||
+    details.toLowerCase().includes('timeout')
+  )
+}
+
+export async function getRtcHistoryGroups(options?: {
+  beginTime?: number
+  endTime?: number
+  pageNo?: number
+  pageSize?: number
+}): Promise<RtcHistoryGroup[]> {
+  const {data, error} = await supabase.functions.invoke<{
+    groups?: RtcHistoryGroup[]
+    error?: string
+  }>('brtc-history', {
+    body: options || {}
+  })
+  if (error) {
+    if (isRtcHistoryUnavailable(error)) {
+      console.warn('RTC cloud history is unavailable; showing empty history.', error)
+      return []
+    }
+    console.error('getRtcHistoryGroups error:', error)
+    throw new Error(error.message || 'RTC history request failed')
+  }
+  if (data?.error) {
+    if (data.error === 'BRTC_HISTORY_TIMEOUT' || data.error === 'AUTH_TIMEOUT') {
+      console.warn('RTC cloud history timed out; showing empty history.', data.error)
+      return []
+    }
+    throw new Error(data.error)
+  }
+  return Array.isArray(data?.groups) ? data.groups : []
 }
 
 // ===== Reminder Settings API =====
