@@ -7,6 +7,23 @@ const supabaseUrl: string = process.env.TARO_APP_SUPABASE_URL!
 const supabaseAnonKey: string = process.env.TARO_APP_SUPABASE_ANON_KEY || 'TOKEN'
 const appId: string = process.env.TARO_APP_APP_ID!
 
+const taroAuthStorage = {
+  getItem: async (key: string): Promise<string | null> => {
+    try {
+      const value = Taro.getStorageSync(key)
+      return typeof value === 'string' && value ? value : null
+    } catch {
+      return null
+    }
+  },
+  setItem: async (key: string, value: string): Promise<void> => {
+    Taro.setStorageSync(key, value)
+  },
+  removeItem: async (key: string): Promise<void> => {
+    Taro.removeStorageSync(key)
+  }
+}
+
 let noticed = false
 const normalizeRequestUrl = (input: RequestInfo | URL): string => {
   if (typeof input === 'string') return input
@@ -75,6 +92,10 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     fetch: customFetch
   },
   auth: {
-    storageKey: `${appId}-auth-token`
+    storageKey: `${appId}-auth-token`,
+    storage: taroAuthStorage,
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: false
   }
 })

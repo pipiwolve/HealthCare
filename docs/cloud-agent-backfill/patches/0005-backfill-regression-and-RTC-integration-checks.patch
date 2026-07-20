@@ -1,0 +1,781 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Backfill Generator <codex-backfill@local>
+Date: Tue, 14 Jul 2026 15:20:32 +0800
+Subject: [PATCH 5/6] backfill: regression and RTC integration checks
+
+---
+ scripts/checkAiPromptHelpers.mjs   |  63 ++++++
+ scripts/checkChatStreaming.mjs     | 324 +++++++++++++++++++++++++++++
+ scripts/checkRtcHistoryHelpers.mjs | 128 ++++++++++++
+ scripts/testRtcHistoryE2e.mjs      | 226 ++++++++++++++++++++
+ 4 files changed, 741 insertions(+)
+ create mode 100644 scripts/checkAiPromptHelpers.mjs
+ create mode 100644 scripts/checkChatStreaming.mjs
+ create mode 100644 scripts/checkRtcHistoryHelpers.mjs
+ create mode 100644 scripts/testRtcHistoryE2e.mjs
+
+diff --git a/scripts/checkAiPromptHelpers.mjs b/scripts/checkAiPromptHelpers.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6ca3e4b79f823b5fbb075794f573730fabdedd6
+--- /dev/null
++++ b/scripts/checkAiPromptHelpers.mjs
+@@ -0,0 +1,63 @@
++import { readFileSync } from 'node:fs'
++import { dirname, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import ts from 'typescript'
++
++const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
++const sourcePath = resolve(root, 'src/utils/aiPromptHelpers.ts')
++const source = readFileSync(sourcePath, 'utf8')
++const js = ts.transpileModule(source, {
++  compilerOptions: {
++    module: 99,
++    target: 99,
++  },
++}).outputText
++
++const moduleUrl = `data:text/javascript;base64,${Buffer.from(js).toString('base64')}`
++const helpers = await import(moduleUrl)
++
++function assertEqual(actual, expected, message) {
++  const actualJson = JSON.stringify(actual)
++  const expectedJson = JSON.stringify(expected)
++  if (actualJson !== expectedJson) {
++    throw new Error(`${message}\nExpected: ${expectedJson}\nActual:   ${actualJson}`)
++  }
++}
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message)
++}
++
++assertEqual(
++  helpers.parseRecognizedFoods('这个啊...草莓'),
++  ['草莓'],
++  'removes conversational image-recognition prefix'
++)
++
++assertEqual(
++  helpers.parseRecognizedFoods('让我看看.番茄'),
++  ['番茄'],
++  'removes observation filler before recognized food name'
++)
++
++assertEqual(
++  helpers.parseRecognizedFoods('图片中包括：草莓、蓝莓\\n2. 香蕉。'),
++  ['草莓', '蓝莓', '香蕉'],
++  'parses common delimiter and list formats'
++)
++
++const chatPrompt = helpers.buildChatPrompt({
++  userQuestion: '今天吃什么比较健康？',
++  healthContext: '【用户健康档案】\\n过敏源：花生',
++  ingredientContext: '当前称重食材：鸡胸肉100g',
++})
++
++assert(chatPrompt.includes('请用不超过400字回答'), 'chat prompt limits response length')
++assert(chatPrompt.includes('先给结论'), 'chat prompt asks for direct answer first')
++assert(chatPrompt.includes('请咨询专业医生'), 'chat prompt keeps medical disclaimer')
++
++const visionPrompt = helpers.buildFoodRecognitionPrompt('final')
++assert(visionPrompt.includes('只输出食材名'), 'vision prompt enforces names only')
++assert(visionPrompt.includes('不要输出“这个啊”'), 'vision prompt forbids filler phrase')
++
++console.log('ai prompt helper checks passed')
+diff --git a/scripts/checkChatStreaming.mjs b/scripts/checkChatStreaming.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..982073e2b6f13f015d665a12f1314dc08c87e187
+--- /dev/null
++++ b/scripts/checkChatStreaming.mjs
+@@ -0,0 +1,324 @@
++import { existsSync, readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++
++const root = resolve(import.meta.dirname, '..')
++const wsSource = readFileSync(resolve(root, 'src/services/aiWebSocket.ts'), 'utf8')
++const chatSource = readFileSync(resolve(root, 'src/pages/chat/index.tsx'), 'utf8')
++const homeSource = readFileSync(resolve(root, 'src/pages/home/index.tsx'), 'utf8')
++const recipeSource = readFileSync(resolve(root, 'src/pages/recipe/index.tsx'), 'utf8')
++const markdownSource = readFileSync(resolve(root, 'src/components/MarkdownRenderer.tsx'), 'utf8')
++const markdownTextSource = readFileSync(resolve(root, 'src/utils/markdownText.ts'), 'utf8')
++const appStyleSource = readFileSync(resolve(root, 'src/app.scss'), 'utf8')
++const configSource = readFileSync(resolve(root, 'config/index.ts'), 'utf8')
++const apiSource = readFileSync(resolve(root, 'src/db/api.ts'), 'utf8')
++const wsSignSource = readFileSync(resolve(root, 'supabase/functions/ws-sign/index.ts'), 'utf8')
++const brtcConfigPath = resolve(root, 'src/utils/brtcConfig.ts')
++const brtcConfigSource = existsSync(brtcConfigPath) ? readFileSync(brtcConfigPath, 'utf8') : ''
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message)
++}
++
++assert(
++  wsSource.includes('onInterim?: (text: string) => void'),
++  'requestResponse options should expose an onInterim callback'
++)
++
++assert(
++  wsSource.includes('opts?.onInterim?.(interimText.trim())'),
++  'requestResponse should publish merged interim LLM text'
++)
++
++assert(
++  wsSource.includes('onInterim?: (text: string) => void') &&
++    wsSource.includes('options.onInterim?.(interimText.trim())'),
++  'requestImageResponse should publish merged interim LLM text for image chat'
++)
++
++assert(
++  chatSource.includes('streamingAiId'),
++  'chat page should create a temporary assistant message for streaming output'
++)
++
++assert(
++  chatSource.includes('onInterim: updateStreamingAiMessage'),
++  'normal chat request should pass onInterim to requestResponse'
++)
++
++assert(
++  !configSource.includes('TARO_APP_QIANFAN_TOKEN') &&
++    !brtcConfigSource.includes('qianfan') &&
++    !brtcConfigSource.includes('llm_url') &&
++    !brtcConfigSource.includes('llm_token') &&
++    !brtcConfigSource.includes('llm_cfg'),
++  'RTC default agent mode should not keep Qianfan or third-party LLM config in the miniapp build'
++)
++
++assert(
++  chatSource.includes("await ws.connect({mode: 'default', agentProfile: 'chat', userId: user!.id})") &&
++    chatSource.includes("await ws.connect({mode: 'default', agentProfile: 'vision', userId: user!.id})") &&
++    chatSource.includes("await ws.connect({mode: 'default', agentProfile: 'voice-realtime', userId: user!.id})") &&
++    chatSource.includes("await ws.connect({mode: 'default', agentProfile: 'voice-ptt', userId: user!.id})") &&
++    !chatSource.includes('CHAT_TTS_CFG') &&
++    !chatSource.includes('VOICE_CFG'),
++  'chat page should connect through RTC default agent profiles for text, image, and voice flows'
++)
++
++assert(
++  homeSource.includes("await ws.connect({mode: 'default', agentProfile, userId: user?.id})") &&
++    !homeSource.includes('CHAT_CFG') &&
++    !homeSource.includes('VOICE_CFG') &&
++    recipeSource.includes("await ws.connect({mode: 'default', agentProfile: 'chat'})") &&
++    !recipeSource.includes('CHAT_CFG'),
++  'home and recipe AI flows should also use RTC default agent mode'
++)
++
++assert(
++  wsSignSource.includes('/api/v1/aiagent/generateAIAgentCall') &&
++    wsSignSource.includes('/auth/v1/user') &&
++    wsSignSource.includes('getCurrentUserId') &&
++    wsSignSource.includes("const {agentProfile = 'chat'}") &&
++    wsSignSource.includes('const userId = await getCurrentUserId') &&
++    wsSignSource.includes('buildDefaultAgentConfig') &&
++    wsSignSource.includes("audiocodec: 'raw16k'") &&
++    wsSignSource.includes('ai_agent_instance_id') &&
++    wsSignSource.includes('context?.token') &&
++    wsSignSource.includes('userId,') &&
++    !wsSignSource.includes("const {agentProfile = 'chat', userId}") &&
++    !wsSignSource.includes('&ak=${AK}&sk=${SK}'),
++  'ws-sign should resolve the RTC userId from Supabase Auth, create a Baidu RTC default agent instance server-side, and return an RTC id/token URL'
++)
++
++assert(
++  wsSource.includes('userId?: string') &&
++    wsSource.includes('this.userId = data.userId || options.userId ||') &&
++    !wsSource.includes('userId: options.userId ||'),
++  'aiWebSocket should use the server-resolved ws-sign userId for RTC device info'
++)
++
++assert(
++  chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_ENABLE_REALTIME]')") &&
++    chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
++    chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
++    chatSource.includes('createAiWebSocket()') &&
++    wsSource.includes('export function createAiWebSocket()') &&
++    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
++    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
++  'voice flows should use RTC ASR realtime and push-to-talk control commands without reusing the chat reply socket'
++)
++
++assert(
++  chatSource.includes('VOICE_MESSAGE_PREFIX') &&
++    chatSource.includes('getVoiceTranscript') &&
++    chatSource.includes('语音消息') &&
++    chatSource.includes('i-mdi-microphone'),
++  'chat page should render WeChat-style voice message bubbles'
++)
++
++assert(
++  chatSource.includes('VOICE_LONG_PRESS_MS') &&
++    chatSource.includes('VOICE_LONG_PRESS_MS = 120') &&
++    chatSource.includes('MIN_VOICE_RECORD_MS = 500') &&
++    chatSource.includes('voicePressTimerRef') &&
++    chatSource.includes('voicePressingRef') &&
++    chatSource.includes('setIsVoicePressing(true)') &&
++    chatSource.includes('startVoiceRecording') &&
++    chatSource.includes('interruptActiveChatResponse') &&
++    chatSource.includes('AI 回复已被用户语音输入打断') &&
++    !chatSource.includes('if (isLoading || isUploadingImage) return') &&
++    !chatSource.includes('handleVoiceMicToggle'),
++  'push-to-talk should start after a short hold and interrupt active AI/TTS output instead of being blocked by isLoading'
++)
++
++assert(
++    chatSource.includes('setIsLoading(true)\n    let requestWs: ReturnType<typeof getAiWebSocket> | null = null') &&
++    chatSource.includes('requestWs = ws') &&
++    chatSource.includes('interruptedChatWsRef.current.has(requestWs)') &&
++    !chatSource.includes(`setRtcHistoryError('')
++    let requestWs`),
++  'sendMessage should keep requestWs in scope so interrupted chat requests do not throw ReferenceError'
++)
++
++assert(
++  chatSource.includes("createLocalChatMessage(session.id, 'user', `${VOICE_MESSAGE_PREFIX}正在识别...`)") &&
++    chatSource.includes('writePcmVoiceToWavFile') &&
++    chatSource.includes('voice-message-${Date.now()}.wav') &&
++    chatSource.includes('onClick={() => handlePlayAudio(msg)}') &&
++    chatSource.includes("msg.audio_url ? (playingAudioId === msg.id ? '正在播放' : '点击播放') : '正在处理'") &&
++    !chatSource.includes("{getVoiceTranscript(msg.content) || '正在识别...'}"),
++  'user voice bubbles should wrap recorded PCM as playable WAV without showing the ASR transcript'
++)
++
++assert(
++  chatSource.includes('audioChunks.push(buffer)') &&
++    chatSource.includes('liveAudioPlayer?.append(buffer)') &&
++    chatSource.includes('onTtsEnd: () =>') &&
++    chatSource.includes('writeAudioChunksToTempFile'),
++  'normal chat should collect RTC TTS audio chunks, stream playable PCM, and write them to a temporary file'
++)
++
++assert(
++  wsSource.includes('audioIdleMs = 1200') &&
++    wsSource.includes('ttsNoAudioGraceMs = 15000') &&
++    wsSource.includes('RTC TTS audio idle') &&
++    wsSource.includes('audio chunk received'),
++  'requestResponse should wait for RTC TTS audio after final text and log binary audio chunks'
++)
++
++assert(
++  chatSource.includes('ttsEnded || audioChunks.length > 0'),
++  'chat page should persist RTC audio chunks even when the gateway omits TTS_END'
++)
++
++assert(
++  !chatSource.includes("'tts-minimax'") &&
++    !chatSource.includes('备用 TTS') &&
++    !chatSource.includes('synthesizeFallbackAudio'),
++  'normal chat should not call the removed MiniMax/Baidu fallback TTS function'
++)
++
++assert(
++  chatSource.includes('handlePlayAudio') &&
++    chatSource.includes('i-mdi-volume-high') &&
++    chatSource.includes('朗读'),
++  'assistant messages with RTC TTS audio should expose a read-aloud playback button'
++)
++
++assert(
++  chatSource.includes('createPcmStreamPlayer') &&
++    chatSource.includes('createWebAudioContext') &&
++    chatSource.includes('getSharedRtcAudioContext') &&
++    chatSource.includes("unlockRtcAudioPlayback('voice-touch')") &&
++    chatSource.includes("unlockRtcAudioPlayback('send-button-touch')") &&
++    chatSource.includes("unlockRtcAudioPlayback('suggestion-touch')") &&
++    chatSource.includes('rtcAudioKeepaliveSource') &&
++    chatSource.includes('keepaliveSeconds = 12') &&
++    chatSource.includes('RTC TTS 实时播放已调度首帧') &&
++    chatSource.includes('view.getInt16(i * 2, true)') &&
++    !chatSource.includes('context.close?.()'),
++  'normal chat should reuse an unlocked WebAudio context for low-latency PCM playback'
++)
++
++assert(
++  appStyleSource.includes('@keyframes voiceRipple') &&
++    chatSource.includes('voiceRipple') &&
++    chatSource.includes("backgroundColor: isVoiceButtonActive ? (isRecordingCanceling ? '#FFF7ED' : '#EF4444')"),
++  'recording UI should turn red immediately and show a ripple effect while the user is holding the button'
++)
++
++assert(
++  chatSource.includes('const isMp3 = bytes[0] === 0x49') &&
++    !chatSource.includes('(bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)'),
++  'RTC raw PCM chunks should not be misclassified as MP3 by a loose frame-sync check'
++)
++
++assert(
++  chatSource.includes('prev.map(m => m.id === streamingAiId'),
++  'chat page should update the temporary assistant bubble as chunks arrive'
++)
++
++assert(
++  chatSource.includes("const hasStreamingAiMessage = messages.some(msg => msg.id.startsWith('streaming-ai-'))") &&
++    chatSource.includes('isLoading && !hasStreamingAiMessage'),
++  'chat page should hide the loading placeholder while the streaming assistant bubble exists'
++)
++
++assert(
++  !chatSource.includes('target.style.height'),
++  'chat textarea should not mutate DOM target.style in the WeChat mini program runtime'
++)
++
++assert(
++  chatSource.includes('requestImageResponse({') &&
++    chatSource.includes('onInterim: updateStreamingAiMessage'),
++  'image chat should stream interim text into the assistant bubble'
++)
++
++assert(
++  chatSource.includes('getRtcHistoryGroups') &&
++    chatSource.includes('rtcHistoryGroups.map') &&
++    chatSource.includes('handleSelectRtcHistory') &&
++    chatSource.includes('最近 10 个历史对话') &&
++    chatSource.includes('RTC 云端记录，按 30 分钟自动分段'),
++  'chat history drawer should render the latest 10 grouped RTC cloud history conversations'
++)
++
++assert(
++  !chatSource.includes('getChatSessions') &&
++    !chatSource.includes('getChatMessages') &&
++    !chatSource.includes('createChatSession') &&
++    !chatSource.includes('createChatMessage') &&
++    !chatSource.includes('updateChatSession') &&
++    !chatSource.includes('handleSelectChatSession') &&
++    !chatSource.includes('应用会话历史'),
++  'chat page should not maintain locally persisted app chat sessions for history'
++)
++
++assert(
++  !chatSource.includes('deleteChatSession') &&
++    !chatSource.includes('deleteMultipleChatSessions'),
++  'chat history drawer should not delete local chat session history'
++)
++
++assert(
++  homeSource.includes('onInterim: (text) =>') &&
++    homeSource.includes('setAnalysisResult('),
++  'home nutrition analysis should render interim AI output'
++)
++
++assert(
++  recipeSource.includes('onInterim: (text) =>') &&
++    recipeSource.includes('setRecipeContent(normalizeAiMarkdown(text))'),
++  'recipe generation should render normalized interim AI output'
++)
++
++assert(
++  wsSource.includes('type AiWebSocketMetrics') &&
++    wsSource.includes("console.info('[AiWebSocket][metrics]'") &&
++    wsSource.includes('sendToFirstInterimMs') &&
++    wsSource.includes('sendToFinalMs') &&
++    wsSource.includes('sendToTtsStartMs') &&
++    wsSource.includes('sendToFirstAudioMs') &&
++    wsSource.includes('audioChunkCount'),
++  'aiWebSocket should log structured latency metrics for connect, text, and RTC TTS phases'
++)
++
++assert(
++  wsSource.includes('wsSignMs') &&
++    wsSource.includes('socketOpenMs') &&
++    wsSource.includes('mediaReadyMs') &&
++    wsSource.includes('connectReadyMs'),
++  'aiWebSocket metrics should include ws-sign, socket open, media ready, and connect ready timings'
++)
++
++assert(
++  wsSource.includes('licenseWaitTimer') &&
++    wsSource.includes('this.resolveReady()') &&
++    wsSource.includes('}, 800)'),
++  'aiWebSocket should briefly wait for license negotiation after MEDIA READY before resolving connect'
++)
++
++assert(
++  apiSource.includes('status === 404') &&
++    apiSource.includes('return []'),
++  'RTC history should degrade to an empty list when the brtc-history edge function is not deployed'
++)
++
++assert(
++  markdownSource.includes('markdown-compact') &&
++    markdownSource.includes('text-xl text-foreground leading-snug') &&
++    markdownSource.includes("fontSize: '16px'"),
++  'MarkdownRenderer should keep assistant markdown readable at the same text scale as chat input'
++)
++
++assert(
++  markdownTextSource.includes('normalizeMarkdownStructure') &&
++    markdownTextSource.includes("replace(/^(\\s*)>\\s?/, '$1')") &&
++    markdownTextSource.includes("trimmed === '：' || trimmed === ':'") &&
++    markdownTextSource.includes('isMarkdownListLine') &&
++    markdownSource.includes("/^ {1,4}\\S/") &&
++    markdownSource.includes('pushPlainText'),
++  'AI markdown normalization should strip blockquote markers, drop orphan colons, indent colon-prefixed continuations, and hide stray markdown markers'
++)
++
++console.log('chat streaming checks passed')
+diff --git a/scripts/checkRtcHistoryHelpers.mjs b/scripts/checkRtcHistoryHelpers.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea6a5b1b536bf1e9a3910a45bd901a3ca30c1d89
+--- /dev/null
++++ b/scripts/checkRtcHistoryHelpers.mjs
+@@ -0,0 +1,128 @@
++import { readFileSync } from 'node:fs'
++import { dirname, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import ts from 'typescript'
++
++const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
++const sourcePath = resolve(root, 'src/utils/rtcHistory.ts')
++const source = readFileSync(sourcePath, 'utf8')
++const edgeSource = readFileSync(resolve(root, 'supabase/functions/brtc-history/index.ts'), 'utf8')
++const apiSource = readFileSync(resolve(root, 'src/db/api.ts'), 'utf8')
++const js = ts.transpileModule(source, {
++  compilerOptions: {
++    module: 99,
++    target: 99,
++  },
++}).outputText
++
++const moduleUrl = `data:text/javascript;base64,${Buffer.from(js).toString('base64')}`
++const helpers = await import(moduleUrl)
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message)
++}
++
++const rows = [
++  {type: 'QUESTION', timestamp: 1000, text: '你是专业健康饮食顾问。请直接、简洁、可执行。\\n\\n用户问题：早餐怎么吃比较健康？'},
++  {type: 'ANSWER', timestamp: 1010, text: '优先选择全谷物、鸡蛋和蔬菜。'},
++  {type: 'QUESTION', timestamp: 1700, text: '午餐呢？'},
++  {type: 'ANSWER', timestamp: 1710, text: '保证蛋白质和蔬菜。'},
++  {type: 'QUESTION', timestamp: 3600, text: '晚餐怎么控制热量？'},
++]
++
++const groups = helpers.groupRtcDialogueRows(rows, 30 * 60)
++assert(groups.length === 2, 'messages more than 30 minutes apart should start a new group')
++assert(groups[0].title === '早餐怎么吃比较健康？', 'group title should use first question text')
++assert(groups[0].messages.length === 4, 'nearby question/answer rows should stay in one group')
++assert(groups[0].messages[0].role === 'user', 'QUESTION rows map to user messages')
++assert(groups[0].messages[0].content === '早餐怎么吃比较健康？', 'RTC history should strip system prompt before 用户问题 marker')
++assert(groups[0].messages[1].role === 'assistant', 'ANSWER rows map to assistant messages')
++assert(groups[1].id === 'rtc-3600-3600', 'group id should be stable from start and end timestamps')
++
++const halfWidthMarker = helpers.groupRtcDialogueRows([
++  {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。\\n\\n用户问题: 今天适合吃什么水果？'}
++])
++assert(halfWidthMarker[0].messages[0].content === '今天适合吃什么水果？', 'RTC history should also strip prompts before half-width 用户问题 marker')
++
++const hiddenPromptOnly = helpers.groupRtcDialogueRows([
++  {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。请直接、简洁、可执行。'},
++  {type: 'ANSWER', timestamp: 2, text: '你好'}
++])
++assert(hiddenPromptOnly.length === 0, 'prompt-only QUESTION rows and their paired answers should not be shown in RTC history')
++
++const nutritionAnalysisPrompt = helpers.groupRtcDialogueRows([
++  {type: 'QUESTION', timestamp: 1, text: '【本餐用餐成员健康档案】\\n【jaden】\\n慢性病：糖尿病\\n\\n请分析以下食材的营养成分'},
++  {type: 'ANSWER', timestamp: 2, text: '```json\\n{\"calories\": 4}\\n```'},
++  {type: 'QUESTION', timestamp: 3, text: '用户问题：今天吃什么比较健康？'},
++  {type: 'ANSWER', timestamp: 4, text: '优先吃蔬菜。'}
++])
++assert(nutritionAnalysisPrompt[0].messages.length === 2, 'nutrition analysis system prompts and paired answers should be removed from chat history')
++assert(nutritionAnalysisPrompt[0].messages[0].content === '今天吃什么比较健康？', 'visible chat questions should remain after hidden nutrition prompts')
++
++const fallback = helpers.groupRtcDialogueRows([
++  {type: 'ANSWER', timestamp: 1, text: '你好'}
++])
++assert(fallback[0].title === 'AI 回复', 'answer-only group should use a readable fallback title')
++
++assert(
++  edgeSource.includes('/api/v1/dialogues') &&
++    edgeSource.includes('rtc-aiagent.baidubce.com'),
++  'brtc-history edge function should call the Baidu RTC dialogues endpoint'
++)
++
++assert(
++  edgeSource.includes('hmacSha256Hex(signingKey, canonicalRequest)') &&
++    !edgeSource.includes('hmacSha256Hex(signingKey, await sha256Hex(canonicalRequest))'),
++  'BCE signature should HMAC the canonical request directly'
++)
++
++assert(
++    !edgeSource.includes("jsr:@supabase/supabase-js") &&
++    !edgeSource.includes('createClient(') &&
++    edgeSource.includes('/auth/v1/user') &&
++    edgeSource.includes('getCurrentUserId(authHeader, traceId)') &&
++    edgeSource.includes('userId'),
++  'brtc-history edge function should resolve userId from Supabase Auth without bundling Supabase JS'
++)
++
++assert(
++  !edgeSource.includes('body.userId') &&
++    !edgeSource.includes('body.user_id'),
++  'brtc-history edge function must not trust a client-supplied userId'
++)
++
++assert(
++  edgeSource.includes('DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60') &&
++    edgeSource.includes('DEFAULT_PAGE_SIZE = 100') &&
++    edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60') &&
++    edgeSource.includes('MAX_HISTORY_GROUPS = 10') &&
++    edgeSource.includes('normalizeQuestionText') &&
++    edgeSource.includes('skipAnswerForHiddenQuestion') &&
++    edgeSource.includes('请分析以下食材的营养成分') &&
++    edgeSource.includes('用户问题[:：]') &&
++    edgeSource.includes('groupRows(rows)') &&
++    edgeSource.includes('.slice(0, MAX_HISTORY_GROUPS)'),
++  'brtc-history edge function should default to 30 days, page size 100, 30-minute grouping, prompt filtering, and the latest 10 groups'
++)
++
++assert(
++  edgeSource.includes('fetchWithTimeout') &&
++    edgeSource.includes('AbortController') &&
++    edgeSource.includes('AUTH_TIMEOUT_MS') &&
++    edgeSource.includes('BRTC_HISTORY_TIMEOUT_MS') &&
++    edgeSource.includes('jsonResponse({error:') &&
++    edgeSource.includes(', 504)') &&
++    edgeSource.includes('[brtc-history] baidu dialogues failed'),
++  'brtc-history edge function should timeout and log Auth/Baidu upstream calls instead of hanging'
++)
++
++assert(
++  apiSource.includes('isRtcHistoryUnavailable') &&
++    apiSource.includes('status === 504') &&
++    apiSource.includes('FunctionsFetchError') &&
++    apiSource.includes('request:fail timeout') &&
++    apiSource.includes('return []'),
++  'miniapp RTC history API should degrade timeout and unavailable errors to an empty history list'
++)
++
++console.log('rtc history helper checks passed')
+diff --git a/scripts/testRtcHistoryE2e.mjs b/scripts/testRtcHistoryE2e.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f4e89726b324331cc8420dce13286f37b7388e1
+--- /dev/null
++++ b/scripts/testRtcHistoryE2e.mjs
+@@ -0,0 +1,226 @@
++import { readFileSync } from 'node:fs'
++import { resolve } from 'node:path'
++import { createClient } from '@supabase/supabase-js'
++
++const root = resolve(import.meta.dirname, '..')
++const envText = readFileSync(resolve(root, '.env'), 'utf8')
++
++function readEnv(name) {
++  const match = envText.match(new RegExp(`^${name}=(.*)$`, 'm'))
++  return match?.[1]?.trim().replace(/^"|"$/g, '') || process.env[name] || ''
++}
++
++const supabaseUrl = readEnv('TARO_APP_SUPABASE_URL')
++const supabaseAnonKey = readEnv('TARO_APP_SUPABASE_ANON_KEY')
++const questions = [
++  '端到端测试一：请用一句话回答，苹果适合作为早餐水果吗？',
++  '端到端测试二：请用一句话回答，鸡蛋主要提供什么营养？',
++  '端到端测试三：请用一句话回答，晚餐如何简单控制热量？',
++]
++const historyGapSeconds = Number(process.env.RTC_HISTORY_TEST_GAP_SECONDS || 30 * 60)
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message)
++}
++
++function wait(ms) {
++  return new Promise(resolve => setTimeout(resolve, ms))
++}
++
++async function makeSession() {
++  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
++    auth: {
++      persistSession: false,
++      autoRefreshToken: false,
++      detectSessionInUrl: false,
++    },
++  })
++  const stamp = Date.now()
++  const email = `codex-rtc-history-${stamp}@miaoda.com`
++  const password = `CodexRtc${stamp}!`
++  const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
++    email,
++    password,
++    options: { data: { username: `codex_rtc_${stamp}` } },
++  })
++  if (signUpError) throw signUpError
++  if (signUpData.session?.access_token) {
++    return {
++      supabase,
++      email,
++      userId: signUpData.session.user.id,
++      accessToken: signUpData.session.access_token,
++    }
++  }
++
++  const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({ email, password })
++  if (signInError) throw signInError
++  assert(signInData.session?.access_token, 'Supabase Auth did not return a session for the test user')
++  return {
++    supabase,
++    email,
++    userId: signInData.session.user.id,
++    accessToken: signInData.session.access_token,
++  }
++}
++
++async function invokeFunction(name, accessToken, body) {
++  const response = await fetch(`${supabaseUrl}/functions/v1/${name}`, {
++    method: 'POST',
++    headers: {
++      apikey: supabaseAnonKey,
++      authorization: `Bearer ${accessToken}`,
++      'content-type': 'application/json',
++    },
++    body: JSON.stringify(body || {}),
++  })
++  const text = await response.text()
++  let payload = null
++  try {
++    payload = text ? JSON.parse(text) : null
++  } catch {
++    payload = { raw: text }
++  }
++  if (!response.ok) {
++    throw new Error(`${name} failed: ${response.status} ${text}`)
++  }
++  return payload
++}
++
++async function invokeFunctionWithRetry(name, accessToken, body, attempts = 3) {
++  let lastError = null
++  for (let attempt = 1; attempt <= attempts; attempt += 1) {
++    try {
++      return await invokeFunction(name, accessToken, body)
++    } catch (error) {
++      lastError = error
++      if (attempt === attempts) break
++      console.warn(`[retry] ${name} attempt ${attempt} failed: ${error.message}`)
++      await wait(2000 * attempt)
++    }
++  }
++  throw lastError
++}
++
++function waitForSocketOpen(ws) {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 15000)
++    ws.addEventListener('open', () => {
++      clearTimeout(timer)
++      resolve()
++    }, { once: true })
++    ws.addEventListener('error', () => {
++      clearTimeout(timer)
++      reject(new Error('WebSocket open error'))
++    }, { once: true })
++  })
++}
++
++async function sendRtcQuestion(accessToken, question, index) {
++  const sign = await invokeFunctionWithRetry('ws-sign', accessToken, { agentProfile: 'chat' })
++  assert(sign.url, 'ws-sign returned no url')
++  assert(sign.userId, 'ws-sign returned no server-resolved userId')
++
++  const ws = new WebSocket(sign.url)
++  let ready = false
++  let final = ''
++  let interim = ''
++  let licenseRequired = false
++
++  const completed = new Promise((resolve, reject) => {
++    const timeout = setTimeout(() => reject(new Error(`RTC answer timeout for question ${index}`)), 90000)
++    ws.addEventListener('message', (event) => {
++      if (typeof event.data !== 'string') return
++      const msg = event.data
++      console.log(`[rtc:${index}] ${msg.slice(0, 100)}`)
++      if (msg.startsWith('[E]:[LIC]:[MUST]')) {
++        licenseRequired = true
++        if (sign.licenseKey) {
++          ws.send(`[E]:[LIC]:[ACTIVE]:${JSON.stringify({
++            devId: sign.licenseDeviceId || `codex-rtc-history-${Date.now()}`,
++            uId: sign.userId,
++            licKey: sign.licenseKey,
++          })}`)
++        }
++      } else if (msg.startsWith('[E]:[MEDIA]:[READY]') && !licenseRequired) {
++        setTimeout(() => {
++          if (ready) return
++          ready = true
++          ws.send(`[SET]:[DEVICE_INFO]:${JSON.stringify({ user_id: sign.userId, userId: sign.userId })}`)
++          ws.send(`[T]:${question}`)
++        }, sign.licenseKey ? 900 : 0)
++      } else if (msg.startsWith('[E]:[LIC]:[RES]:')) {
++        if (ready) return
++        ready = true
++        ws.send(`[SET]:[DEVICE_INFO]:${JSON.stringify({ user_id: sign.userId, userId: sign.userId })}`)
++        ws.send(`[T]:${question}`)
++      } else if (msg.startsWith('[A]:[M]:')) {
++        interim = msg.slice(8)
++      } else if (msg.startsWith('[A]:')) {
++        final = msg.slice(4)
++        clearTimeout(timeout)
++        resolve(final || interim)
++      }
++    })
++    ws.addEventListener('error', () => {
++      clearTimeout(timeout)
++      reject(new Error(`RTC socket error for question ${index}`))
++    }, { once: true })
++  })
++
++  await waitForSocketOpen(ws)
++  const answer = await completed
++  ws.close()
++  return { answer, userId: sign.userId }
++}
++
++const beginTime = Math.floor(Date.now() / 1000) - 120
++const session = await makeSession()
++console.log('[auth] test user created', { email: session.email, userId: session.userId })
++
++let rtcUserId = ''
++for (let i = 0; i < questions.length; i += 1) {
++  const result = await sendRtcQuestion(session.accessToken, questions[i], i + 1)
++  rtcUserId = result.userId
++  console.log(`[answer:${i + 1}]`, result.answer.slice(0, 160))
++  if (i < questions.length - 1) {
++    const waitMs = (historyGapSeconds + 5) * 1000
++    console.log(`[wait] waiting ${Math.round(waitMs / 1000)}s so the next question is split by the history window`)
++    await wait(waitMs)
++  }
++}
++
++console.log('[wait] waiting 20s for RTC history persistence')
++await wait(20000)
++
++const history = await invokeFunctionWithRetry('brtc-history', session.accessToken, {
++  beginTime,
++  endTime: Math.floor(Date.now() / 1000) + 60,
++  pageNo: 1,
++  pageSize: 100,
++})
++
++console.log('[history]', JSON.stringify({
++  source: history.source,
++  groupGapSeconds: history.groupGapSeconds,
++  historyLimit: history.historyLimit,
++  pageNo: history.pageNo,
++  pageSize: history.pageSize,
++  groupCount: history.groups?.length || 0,
++  rtcUserId,
++}, null, 2))
++
++for (const [index, group] of (history.groups || []).entries()) {
++  console.log(`[group:${index + 1}]`, JSON.stringify({
++    id: group.id,
++    title: group.title,
++    startTime: group.startTime,
++    endTime: group.endTime,
++    messageCount: group.messages?.length || 0,
++    firstMessage: group.messages?.[0]?.content?.slice(0, 80),
++  }, null, 2))
++}
++
++assert(history.groupGapSeconds === historyGapSeconds, `brtc-history did not report a ${historyGapSeconds} second grouping window`)
++assert((history.groups?.length || 0) >= 2, 'expected at least 2 RTC history groups after spaced questions')
++console.log('rtc history e2e checks passed')

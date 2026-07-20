@@ -1,0 +1,2952 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Backfill Generator <codex-backfill@local>
+Date: Tue, 14 Jul 2026 15:20:31 +0800
+Subject: [PATCH 2/6] backfill: pages chat rendering and nutrition flows
+
+---
+ src/components/MarkdownRenderer.tsx   |  241 ++++-
+ src/pages/chat/index.tsx              | 1256 +++++++++++++++++++------
+ src/pages/family-edit/index.tsx       |   12 +-
+ src/pages/home/index.tsx              |  445 ++++++---
+ src/pages/privacy/index.tsx           |   13 +-
+ src/pages/recipe/index.tsx            |   43 +-
+ src/pages/reminder-settings/index.tsx |   22 +-
+ src/pages/stats/index.tsx             |   23 +-
+ 8 files changed, 1529 insertions(+), 526 deletions(-)
+
+diff --git a/src/components/MarkdownRenderer.tsx b/src/components/MarkdownRenderer.tsx
+index 199f07a173de4cdaeaa543e642e3d5a0d7f5e6f9..91413ae8a7de0f07fbb3010a66f52f56a0196c40 100644
+--- a/src/components/MarkdownRenderer.tsx
++++ b/src/components/MarkdownRenderer.tsx
+@@ -1,5 +1,6 @@
+ // Markdown渲染组件（微信小程序兼容版）— 支持表格/多级标题/加粗/斜体/行内代码/列表/缩进列表/分隔线
+ import type React from 'react'
++import {normalizeAiMarkdown} from '@/utils/markdownText'
+ interface MarkdownProps {
+   content: string
+   className?: string
+@@ -9,14 +10,13 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
+   const elements: JSX.Element[] = []
+   let key = 0
+ 
+-  // 预处理：将孤立冒号行（整行仅为 "：" 或 ":"）合并到前一行末尾
+-  const rawLines = content.split('\n')
++  const normalizedContent = normalizeMarkdownContent(content)
++
++  const rawLines = normalizedContent.split('\n')
+   const merged: string[] = []
+   for (let j = 0; j < rawLines.length; j++) {
+     const trimmed = rawLines[j].trim()
+-    if ((trimmed === '：' || trimmed === ':') && merged.length > 0) {
+-      merged[merged.length - 1] = merged[merged.length - 1] + trimmed
+-    } else {
++    if (trimmed !== '：' && trimmed !== ':') {
+       merged.push(rawLines[j])
+     }
+   }
+@@ -27,10 +27,31 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
+   while (i < lines.length) {
+     const line = lines[i]
+ 
++    if (line.trim().startsWith('```')) {
++      const codeLines: string[] = []
++      i++
++      while (i < lines.length && !lines[i].trim().startsWith('```')) {
++        codeLines.push(lines[i])
++        i++
++      }
++      elements.push(
++        <div
++          key={key++}
++          className="my-2 overflow-x-auto rounded-md border border-border bg-secondary px-3 py-2"
++        >
++          <pre className="text-xl leading-snug text-foreground whitespace-pre-wrap font-mono">
++            {codeLines.join('\n')}
++          </pre>
++        </div>
++      )
++      i++
++      continue
++    }
++
+     // ——— 检测表格块（连续 |...| 行，第二行为分隔行 |---|---| ）———
+-    if (line.trim().startsWith('|') && i + 1 < lines.length && /^\s*\|[\s\-|:]+\|\s*$/.test(lines[i + 1])) {
++    if (isTableRowLine(line) && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+       const tableLines: string[] = []
+-      while (i < lines.length && lines[i].trim().startsWith('|')) {
++      while (i < lines.length && isTableRowLine(lines[i])) {
+         tableLines.push(lines[i])
+         i++
+       }
+@@ -38,34 +59,46 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
+       continue
+     }
+ 
++    // ——— 检测营养总览的非标准表格（模型有时会漏掉列分隔符）———
++    if (isNutritionOverviewHeaderLine(line) && i + 1 < lines.length && isLooseTableSeparatorLine(lines[i + 1])) {
++      const tableLines: string[] = [line]
++      i += 2
++      while (i < lines.length && isNutritionValueLine(lines[i])) {
++        tableLines.push(lines[i])
++        i++
++      }
++      elements.push(renderNutritionOverviewTable(tableLines, key++))
++      continue
++    }
++
+     // ——— 标题层级（长前缀优先匹配）———
+     if (line.startsWith('##### ')) {
+       elements.push(
+-        <p key={key++} className="text-xl font-semibold text-foreground mt-2 mb-1">
++        <p key={key++} className="text-xl font-semibold text-foreground mt-1.5 mb-0.5 leading-snug">
+           {renderInline(line.slice(6), key)}
+         </p>
+       )
+     } else if (line.startsWith('#### ')) {
+       elements.push(
+-        <p key={key++} className="text-xl font-bold text-foreground mt-3 mb-1">
++        <p key={key++} className="text-xl font-bold text-foreground mt-2 mb-0.5 leading-snug">
+           {renderInline(line.slice(5), key)}
+         </p>
+       )
+     } else if (line.startsWith('### ')) {
+       elements.push(
+-        <p key={key++} className="text-xl font-bold text-foreground mt-4 mb-2">
++        <p key={key++} className="text-xl font-bold text-foreground mt-2 mb-1 leading-snug">
+           {renderInline(line.slice(4), key)}
+         </p>
+       )
+     } else if (line.startsWith('## ')) {
+       elements.push(
+-        <p key={key++} className="text-2xl font-bold text-foreground mt-4 mb-2">
++        <p key={key++} className="text-xl font-bold text-foreground mt-2.5 mb-1 leading-snug">
+           {renderInline(line.slice(3), key)}
+         </p>
+       )
+     } else if (line.startsWith('# ')) {
+       elements.push(
+-        <p key={key++} className="text-2xl font-extrabold text-foreground mt-4 mb-3">
++        <p key={key++} className="text-xl font-extrabold text-foreground mt-2.5 mb-1.5 leading-snug">
+           {renderInline(line.slice(2), key)}
+         </p>
+       )
+@@ -73,35 +106,59 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
+     } else if (/^ {1,4}[*-] /.test(line)) {
+       const text = line.replace(/^ {1,4}[*-] /, '')
+       elements.push(
+-        <div key={key++} className="flex items-start gap-2 py-0.5 pl-6">
++        <div key={key++} className="flex items-start gap-1.5 py-px pl-5">
+           <span className="text-muted-foreground text-xl mt-0.5 flex-shrink-0">◦</span>
+-          <p className="text-xl text-foreground flex-1 leading-relaxed">{renderInline(text, key)}</p>
++          <p className="text-xl text-foreground flex-1 leading-snug">{renderInline(text, key)}</p>
++        </div>
++      )
++    } else if (/^ {1,4}\S/.test(line)) {
++      elements.push(
++        <div key={key++} className="py-px pl-5">
++          <p className="text-xl text-foreground leading-snug">{renderInline(line.trim(), key)}</p>
+         </div>
+       )
+     } else if (line.startsWith('- ') || line.startsWith('* ')) {
+       elements.push(
+-        <div key={key++} className="flex items-start gap-2 py-1">
++        <div key={key++} className="flex items-start gap-1.5 py-px">
+           <span className="text-primary text-xl mt-0.5 flex-shrink-0">•</span>
+-          <p className="text-xl text-foreground flex-1 leading-relaxed">{renderInline(line.slice(2), key)}</p>
++          <p className="text-xl text-foreground flex-1 leading-snug">{renderInline(line.slice(2), key)}</p>
+         </div>
+       )
+     } else if (/^\d+\.\s/.test(line)) {
+       const match = line.match(/^(\d+)\.\s(.*)/)
+       if (match) {
+         elements.push(
+-          <div key={key++} className="flex items-start gap-2 py-1">
+-            <span className="text-primary text-xl font-semibold flex-shrink-0">{match[1]}.</span>
+-            <p className="text-xl text-foreground flex-1 leading-relaxed">{renderInline(match[2], key)}</p>
++          <div key={key++} className="flex items-start gap-1.5 py-px">
++            <span className="text-primary text-xl font-semibold flex-shrink-0 leading-snug">{match[1]}.</span>
++            <p className="text-xl text-foreground flex-1 leading-snug">{renderInline(match[2], key)}</p>
+           </div>
+         )
+       }
+     } else if (line.startsWith('---') || line.startsWith('***')) {
+-      elements.push(<div key={key++} className="h-px bg-border my-3" />)
++      elements.push(<div key={key++} className="h-px bg-border my-2" />)
+     } else if (line.trim() === '') {
+-      elements.push(<div key={key++} className="h-2" />)
++      elements.push(<div key={key++} className="h-1" />)
++    } else if (/^[^：:\n]{1,32}[：:]\s*$/.test(line.trim())) {
++      const label = line.trim().replace(/[：:]\s*$/, '')
++      elements.push(
++        <p key={key++} className="text-xl font-bold text-foreground mt-2 mb-0.5 leading-snug">
++          {renderInline(label, key)}：
++        </p>
++      )
+     } else {
++      const keyValueMatch = line.match(/^([^：:\n]{1,28})[：:]\s*(.+)$/)
++      if (keyValueMatch) {
++        elements.push(
++          <p key={key++} className="text-xl text-foreground leading-snug py-px">
++            <span className="font-semibold text-foreground">{renderInline(keyValueMatch[1].trim(), key)}：</span>
++            {renderInline(keyValueMatch[2].trim(), key)}
++          </p>
++        )
++        i++
++        continue
++      }
+       elements.push(
+-        <p key={key++} className="text-xl text-foreground leading-relaxed py-0.5">
++        <p key={key++} className="text-xl text-foreground leading-snug py-px">
+           {renderInline(line, key)}
+         </p>
+       )
+@@ -109,24 +166,28 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
+     i++
+   }
+ 
+-  return <div className={className}>{elements}</div>
++  return <div className={`markdown-compact ${className}`.trim()}>{elements}</div>
++}
++
++export function normalizeMarkdownContent(content: string): string {
++  return normalizeAiMarkdown(content)
+ }
+ 
+ // 渲染 Markdown 表格块（含表头、分隔行、数据行）
+ function renderTable(tableLines: string[], baseKey: number): JSX.Element {
+-  // 解析单行 cells（去掉首尾 |，按 | 分割，trim）
+-  const parseCells = (row: string) =>
+-    row.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
+-
+   const headerCells = parseCells(tableLines[0])
+   // tableLines[1] 是分隔行，跳过
+-  const bodyRows = tableLines.slice(2).map(parseCells)
++  const bodyRows = tableLines.slice(2).map(row => normalizeCellCount(parseCells(row), headerCells.length))
++  const columnCount = Math.max(1, headerCells.length)
+ 
+   const cellStyle: React.CSSProperties = {
+     border: '1px solid #E5E5E5',
+-    padding: '8px',
++    padding: '5px 6px',
+     textAlign: 'left',
+-    fontSize: '18px',
++    fontSize: '16px',
++    flex: 1,
++    lineHeight: 1.45,
++    minWidth: '72px',
+     color: '#333333',
+     verticalAlign: 'top',
+   }
+@@ -136,31 +197,104 @@ function renderTable(tableLines: string[], baseKey: number): JSX.Element {
+     fontWeight: 700,
+     color: '#111111',
+   }
++  const rowStyle: React.CSSProperties = {
++    display: 'flex',
++    minWidth: `${columnCount * 82}px`,
++  }
+ 
+   return (
+-    <div key={baseKey} className="w-full overflow-x-auto my-3" style={{borderRadius: '6px', border: '1px solid #E5E5E5'}}>
+-      <table style={{width: '100%', borderCollapse: 'collapse', tableLayout: 'auto'}}>
+-        <thead>
+-          <tr>
+-            {headerCells.map((cell, ci) => (
+-              <th key={ci} style={headerCellStyle}>{renderInline(cell, baseKey * 100 + ci)}</th>
+-            ))}
+-          </tr>
+-        </thead>
+-        <tbody>
+-          {bodyRows.map((row, ri) => (
+-            <tr key={ri} style={{backgroundColor: ri % 2 === 1 ? '#FAFAFA' : '#FFFFFF'}}>
+-              {row.map((cell, ci) => (
+-                <td key={ci} style={cellStyle}>{renderInline(cell, baseKey * 100 + ri * 20 + ci)}</td>
+-              ))}
+-            </tr>
++    <div key={baseKey} className="w-full overflow-x-auto my-2" style={{borderRadius: '6px', border: '1px solid #E5E5E5'}}>
++      <div style={rowStyle}>
++        {normalizeCellCount(headerCells, columnCount).map((cell, ci) => (
++          <div key={ci} style={headerCellStyle}>{renderInline(cell, baseKey * 100 + ci)}</div>
++        ))}
++      </div>
++      {bodyRows.map((row, ri) => (
++        <div key={ri} style={{...rowStyle, backgroundColor: ri % 2 === 1 ? '#FAFAFA' : '#FFFFFF'}}>
++          {row.map((cell, ci) => (
++            <div key={ci} style={cellStyle}>{renderInline(cell, baseKey * 100 + ri * 20 + ci)}</div>
+           ))}
+-        </tbody>
+-      </table>
++        </div>
++      ))}
+     </div>
+   )
+ }
+ 
++function renderNutritionOverviewTable(lines: string[], baseKey: number): JSX.Element {
++  const header = parseNutritionOverviewHeader(lines[0])
++  const rows = lines.slice(1).map(parseNutritionValueRow).filter((row): row is string[] => !!row)
++  const tableLines = [
++    `| ${header.join(' | ')} |`,
++    '| --- | --- | --- |',
++    ...rows.map(row => `| ${row.join(' | ')} |`),
++  ]
++  return renderTable(tableLines, baseKey)
++}
++
++function isNutritionOverviewHeaderLine(line: string): boolean {
++  const normalized = line.replace(/\|/g, ' ').replace(/\s+/g, ' ').trim()
++  return normalized.includes('项目') && normalized.includes('整餐总量') && normalized.includes('人均')
++}
++
++function isLooseTableSeparatorLine(line: string): boolean {
++  return /^[\s\-|]+$/.test(line.trim()) && line.includes('-')
++}
++
++function isNutritionValueLine(line: string): boolean {
++  return /^(热量|蛋白质|脂肪|碳水化合物|碳水)(?:\s|[：:]|$)/.test(stripEdgePipes(line))
++}
++
++function parseNutritionOverviewHeader(line: string): string[] {
++  const normalized = line.replace(/\|/g, ' ').replace(/\s+/g, ' ').trim()
++  const averageMatch = normalized.match(/人均(?:（[^）]+）|\([^)]*\))?/)
++  return ['项目', '整餐总量', averageMatch?.[0] || '人均']
++}
++
++function parseNutritionValueRow(line: string): string[] | null {
++  const normalized = stripEdgePipes(line).replace(/\|/g, ' ').replace(/\s+/g, ' ').trim()
++  const labelMatch = normalized.match(/^(热量|蛋白质|脂肪|碳水化合物|碳水)\s+(.+)$/)
++  if (!labelMatch) return null
++
++  const label = labelMatch[1] === '碳水化合物' ? '碳水' : labelMatch[1]
++  const rest = labelMatch[2]
++  const numberMatches = [...rest.matchAll(/[0-9]+(?:\.[0-9]+)?/g)].map(match => match[0])
++  if (numberMatches.length < 2) return null
++  const unit = label === '热量'
++    ? (rest.match(/kcal|千卡|大卡|cal/i)?.[0] || '千卡')
++    : (rest.match(/g|克/i)?.[0] || '克')
++
++  return [
++    label,
++    `约 ${numberMatches[0]} ${unit}`,
++    `约 ${numberMatches[1]} ${unit}`,
++  ]
++}
++
++function stripEdgePipes(line: string): string {
++  return line.trim().replace(/^\|/, '').replace(/\|$/, '').trim()
++}
++
++function isTableRowLine(line: string): boolean {
++  return parseCells(line).length >= 2
++}
++
++function isTableSeparatorLine(line: string): boolean {
++  const cells = parseCells(line)
++  return cells.length >= 2 && cells.every(cell => /^:?-{3,}:?$/.test(cell.replace(/\s/g, '')))
++}
++
++function parseCells(row: string): string[] {
++  const normalized = row.trim().replace(/^\|/, '').replace(/\|$/, '')
++  if (!normalized.includes('|')) return []
++  return normalized.split('|').map(c => c.trim()).filter((cell, index, cells) => cell || index < cells.length - 1)
++}
++
++function normalizeCellCount(cells: string[], count: number): string[] {
++  if (cells.length === count) return cells
++  if (cells.length > count) return cells.slice(0, count - 1).concat(cells.slice(count - 1).join(' '))
++  return cells.concat(Array.from({length: count - cells.length}, () => ''))
++}
++
+ // 解析行内加粗/斜体/行内代码，返回 JSX 节点数组
+ function renderInline(text: string, baseKey: number): (string | JSX.Element)[] {
+   const parts: (string | JSX.Element)[] = []
+@@ -171,7 +305,7 @@ function renderInline(text: string, baseKey: number): (string | JSX.Element)[] {
+   let idx = 0
+   while ((match = pattern.exec(text)) !== null) {
+     if (match.index > lastIndex) {
+-      parts.push(text.slice(lastIndex, match.index))
++      pushPlainText(parts, text.slice(lastIndex, match.index))
+     }
+     if (match[0].startsWith('`')) {
+       // 行内代码
+@@ -200,7 +334,12 @@ function renderInline(text: string, baseKey: number): (string | JSX.Element)[] {
+     lastIndex = match.index + match[0].length
+   }
+   if (lastIndex < text.length) {
+-    parts.push(text.slice(lastIndex))
++    pushPlainText(parts, text.slice(lastIndex))
+   }
+-  return parts.length > 0 ? parts : [text]
++  return parts.length > 0 ? parts : [text.replace(/\*\*/g, '').replace(/(^|\s)>\s?/g, '$1')]
++}
++
++function pushPlainText(parts: (string | JSX.Element)[], text: string) {
++  const cleaned = text.replace(/\*\*/g, '').replace(/(^|\s)>\s?/g, '$1')
++  if (cleaned) parts.push(cleaned)
+ }
+diff --git a/src/pages/chat/index.tsx b/src/pages/chat/index.tsx
+index b87fd55db601fd265c0f968e9e424cb01fc538dc..8e07337570a3821c8637d48ea6507c82d23e9274 100644
+--- a/src/pages/chat/index.tsx
++++ b/src/pages/chat/index.tsx
+@@ -1,38 +1,152 @@
+ // @title AI健康顾问
+ 
+-import {Image} from '@tarojs/components'
++import {Image, Textarea} from '@tarojs/components'
+ import Taro, {useDidHide, useDidShow } from '@tarojs/taro'
+ import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import {supabase} from '@/client/supabase'
+ import {MarkdownRenderer} from '@/components/MarkdownRenderer'
+ import {withRouteGuard} from '@/components/RouteGuard'
+ import {useAuth} from '@/contexts/AuthContext'
+-import {createChatMessage, createChatSession, deleteChatSession,
+-  getChatMessages, 
+-  getChatSessions, updateChatSession 
+-} from '@/db/api'
+-import type {ChatMessage, ChatSession } from '@/db/types'
+-import {getAiWebSocket} from '@/services/aiWebSocket'
++import {getRtcHistoryGroups } from '@/db/api'
++import type {ChatMessage, ChatSession, RtcHistoryGroup } from '@/db/types'
++import {createAiWebSocket, getAiWebSocket} from '@/services/aiWebSocket'
+ import {useAppStore} from '@/store/appStore'
+-import {buildHealthContext} from '@/utils/allergenUtils'
+-import {CHAT_CFG, VOICE_CFG} from '@/utils/brtcConfig'
++import {buildFamilyHealthContext} from '@/utils/allergenUtils'
++import {buildChatPrompt} from '@/utils/aiPromptHelpers'
++import {normalizeAiMarkdown} from '@/utils/markdownText'
++import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
++
++const VOICE_MESSAGE_PREFIX = '🎙 '
++const VOICE_LONG_PRESS_MS = 120
++const MIN_VOICE_RECORD_MS = 500
++
++let sharedRtcAudioContext: any = null
++let sharedRtcAudioUnlocked = false
++let sharedRtcAudioUnlockLogged = false
++let rtcAudioKeepaliveSource: any = null
++let rtcAudioKeepaliveUntil = 0
++
++function isVoiceMessage(content: string): boolean {
++  return content.startsWith(VOICE_MESSAGE_PREFIX)
++}
++
++function getVoiceTranscript(content: string): string {
++  return isVoiceMessage(content) ? content.slice(VOICE_MESSAGE_PREFIX.length).trim() : content
++}
++
++function createLocalChatSession(userId: string, memberId: string | null, title: string): ChatSession {
++  const now = new Date().toISOString()
++  return {
++    id: `local-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
++    user_id: userId,
++    member_id: memberId,
++    title: title || '新对话',
++    context_data: {},
++    created_at: now,
++    updated_at: now,
++  }
++}
++
++function createLocalChatMessage(
++  sessionId: string,
++  role: ChatMessage['role'],
++  content: string,
++  imageUrl: string | null = null,
++  audioUrl: string | null = null,
++): ChatMessage {
++  return {
++    id: `local-message-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
++    session_id: sessionId,
++    role,
++    content,
++    image_url: imageUrl,
++    audio_url: audioUrl,
++    created_at: new Date().toISOString(),
++  }
++}
++
++type SendMessageOptions = {
++  skipUserBubble?: boolean
++  session?: ChatSession
++}
++
++function getSharedRtcAudioContext(): any | null {
++  const wxApi = (globalThis as any).wx || (Taro as any)
++  if (!sharedRtcAudioContext) {
++    sharedRtcAudioContext = wxApi?.createWebAudioContext?.() || null
++  }
++  return sharedRtcAudioContext
++}
++
++function unlockRtcAudioPlayback(reason = 'interaction'): boolean {
++  const context = getSharedRtcAudioContext()
++  if (!context?.createBuffer || !context?.createBufferSource || !context?.destination) return false
++  try {
++    context.resume?.()
++    const now = Date.now()
++    if (!rtcAudioKeepaliveSource || now > rtcAudioKeepaliveUntil - 2000) {
++      try {
++        rtcAudioKeepaliveSource?.stop?.()
++      } catch {}
++      rtcAudioKeepaliveSource = null
++      const keepaliveSeconds = 12
++      const silentBuffer = context.createBuffer(1, 16000 * keepaliveSeconds, 16000)
++      const silentSource = context.createBufferSource()
++      silentSource.buffer = silentBuffer
++      silentSource.connect(context.destination)
++      silentSource.onended = () => {
++        if (rtcAudioKeepaliveSource === silentSource) rtcAudioKeepaliveSource = null
++      }
++      silentSource.start(0)
++      rtcAudioKeepaliveSource = silentSource
++      rtcAudioKeepaliveUntil = now + keepaliveSeconds * 1000
++    }
++    sharedRtcAudioUnlocked = true
++    if (!sharedRtcAudioUnlockLogged) {
++      sharedRtcAudioUnlockLogged = true
++      console.info('RTC TTS 播放上下文已通过用户手势解锁', {reason})
++    }
++    return true
++  } catch (err: any) {
++    console.warn('RTC TTS 播放上下文解锁失败:', err?.message || err)
++    return false
++  }
++}
+ 
+ function ChatPage() {
+   const {user} = useAuth()
+-  const {activeMember, isOnline, ingredients} = useAppStore()
++  const {activeMember, familyMembers, selectedMealMemberIds, isOnline, ingredients} = useAppStore()
+ 
+   const routeParams = useMemo(() => Taro.getCurrentInstance().router?.params || {}, [])
+ 
+-  const [sessions, setSessions] = useState<ChatSession[]>([])
+   const [activeSession, setActiveSession] = useState<ChatSession | null>(null)
++  const [activeRtcGroupId, setActiveRtcGroupId] = useState<string | null>(null)
+   const [messages, setMessages] = useState<ChatMessage[]>([])
+   const [inputText, setInputText] = useState('')
++  const [inputHeight, setInputHeight] = useState(32)
+   const [isLoading, setIsLoading] = useState(false)
+   const [showDrawer, setShowDrawer] = useState(false)
++  const [rtcHistoryGroups, setRtcHistoryGroups] = useState<RtcHistoryGroup[]>([])
++  const [rtcHistoryLoading, setRtcHistoryLoading] = useState(false)
++  const [rtcHistoryError, setRtcHistoryError] = useState('')
++  const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
+   const [isRecording, setIsRecording] = useState(false)
++  const [isVoicePressing, setIsVoicePressing] = useState(false)
++  const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
+   const [useProfile, setUseProfile] = useState(true)
+   const [useIngredients, setUseIngredients] = useState(false)
+   const recorderManager = useRef<Taro.RecorderManager | null>(null)
++  const audioContextRef = useRef<Taro.InnerAudioContext | null>(null)
++  const audioMessageIdRef = useRef<string | null>(null)
++  const liveAudioPlayerRef = useRef<PcmStreamPlayer | null>(null)
++  const activeChatWsRef = useRef<ReturnType<typeof getAiWebSocket> | null>(null)
++  const interruptedChatWsRef = useRef<Set<ReturnType<typeof getAiWebSocket>>>(new Set())
++  const voiceTouchStartYRef = useRef(0)
++  const voiceCancelRef = useRef(false)
++  const voicePressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
++  const voicePressingRef = useRef(false)
++  const voiceRecordStartingRef = useRef(false)
++  const voiceRecordStartedAtRef = useRef(0)
+   const [pendingImage, setPendingImage] = useState<{localPath: string; base64: string; ext: string} | null>(null)
+   const [isUploadingImage, setIsUploadingImage] = useState(false)
+ 
+@@ -43,166 +157,265 @@ function ChatPage() {
+   const voiceTempAiMsgId = useRef<string | null>(null)
+   const voiceSessionRef = useRef<ChatSession | null>(null)
+ 
+-  const loadSessions = useCallback(async () => {
++  const loadRtcHistory = useCallback(async () => {
+     if (!user) return
+-    const data = await getChatSessions(user.id)
+-    setSessions(data)
++    setRtcHistoryLoading(true)
++    setRtcHistoryError('')
++
++    try {
++      const data = await getRtcHistoryGroups()
++      setRtcHistoryGroups(data)
++    } catch (err: any) {
++      console.error('加载 RTC 云端历史失败:', err?.message || err)
++      setRtcHistoryError(err?.message || 'RTC 云端历史加载失败')
++    } finally {
++      setRtcHistoryLoading(false)
++    }
+   }, [user])
+ 
+-  useEffect(() => { loadSessions() }, [loadSessions])
+-  useDidShow(() => { loadSessions() })
+-  useDidHide(() => { setShowDrawer(false) })
++  useDidShow(() => {
++    if (showDrawer) void loadRtcHistory()
++  })
++  useDidHide(() => {
++    setShowDrawer(false)
++  })
+ 
+-  // 处理从外部跳转传入的上下文
+   useEffect(() => {
+-    if (routeParams.context) {
++    if (showDrawer) void loadRtcHistory()
++  }, [loadRtcHistory, showDrawer])
++
++  useEffect(() => {
++    return () => {
++      if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
++      audioContextRef.current?.destroy()
++      audioContextRef.current = null
++      liveAudioPlayerRef.current?.stop()
++      liveAudioPlayerRef.current = null
++    }
++  }, [])
++
++  useEffect(() => {
++    const handler = (res: any) => {
++      if ((res?.height || 0) <= 0) return
++      setTimeout(() => {
++        const el = scrollContainerRef.current as any
++        try { if (el) el.scrollTop = el.scrollHeight } catch {}
++      }, 80)
++    }
++    Taro.onKeyboardHeightChange?.(handler)
++    return () => {
++      Taro.offKeyboardHeightChange?.(handler)
++    }
++  }, [])
++
++  const contextConsumedRef = useRef(false)
++
++  // 处理从外部跳转传入的上下文；storage 方式避免 URL 超长，并防止重复消费。
++  useEffect(() => {
++    if (!user || contextConsumedRef.current) return
++    const from = routeParams.from as string | undefined
++    if (from === 'recipe' || from === 'analysis') {
++      contextConsumedRef.current = true
++      try {
++        const raw = Taro.getStorageSync('_chatContext')
++        Taro.removeStorageSync('_chatContext')
++        if (raw) {
++          const ctx = JSON.parse(raw)
++          setUseIngredients(true)
++          handleNewSession(ctx)
++        }
++      } catch {}
++    } else if (routeParams.context) {
++      contextConsumedRef.current = true
+       try {
+         const ctx = JSON.parse(decodeURIComponent(routeParams.context as string))
+         setUseIngredients(true)
+         handleNewSession(ctx)
+       } catch {}
+     }
+-  }, [])
+-
+-  const loadMessages = useCallback(async (sessionId: string) => {
+-    const data = await getChatMessages(sessionId)
+-    setMessages(data)
+-  }, [])
++  // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [user])
+ 
+   const handleNewSession = async (contextData?: object) => {
+     if (!user) return
+-    const session = await createChatSession({
+-      user_id: user.id,
+-      member_id: activeMember?.id || null,
+-      title: '新对话',
+-      context_data: contextData || {}
+-    })
+-    if (session) {
+-      await loadSessions()
+-      setActiveSession(session)
+-      setMessages([])
+-    }
++    setActiveSession(null)
++    setActiveRtcGroupId(null)
++    setMessages([])
++    setInputText('')
++    setInputHeight(32)
++    if (contextData) setUseIngredients(true)
+   }
+ 
+-  const handleSelectSession = (session: ChatSession) => {
+-    setActiveSession(session)
+-    loadMessages(session.id)
++  const handleSelectRtcHistory = (group: RtcHistoryGroup) => {
++    setActiveSession(null)
++    setActiveRtcGroupId(group.id)
++    setMessages(group.messages.map((message, index) => ({
++      id: `${group.id}-${index}`,
++      session_id: group.id,
++      role: message.role,
++      content: message.content,
++      image_url: null,
++      audio_url: null,
++      created_at: new Date(message.timestamp * 1000).toISOString(),
++    })))
+     setShowDrawer(false)
+   }
+ 
+-  const handleDeleteSession = async (sessionId: string) => {
+-    const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
+-      Taro.showModal({
+-        title: '删除对话',
+-        content: '确认删除该对话？此操作不可撤销。',
+-        success: (res) => resolve({confirm: res.confirm})
+-      })
+-    })
+-    if (!confirm) return
+-    await deleteChatSession(sessionId)
+-    if (activeSession?.id === sessionId) {
+-      setActiveSession(null)
+-      setMessages([])
+-    }
+-    loadSessions()
+-  }
+-
+-  const sendMessage = async (content: string, imageUrl?: string, imageBase64?: string, imageExt = 'jpg') => {
++  const sendMessage = async (
++    content: string,
++    imageUrl?: string,
++    imageBase64?: string,
++    imageExt = 'jpg',
++    options?: SendMessageOptions,
++  ) => {
+     if (!content.trim() && !imageUrl) return
+     if (!isOnline) {
+       Taro.showToast({title: '需要网络连接', icon: 'none'})
+       return
+     }
+ 
+-    let session = activeSession
++    const displayContent = content
++    const promptContent = getVoiceTranscript(content)
++    let session = options?.session || activeSession
+     if (!session) {
+-      session = await createChatSession({
+-        user_id: user!.id,
+-        member_id: activeMember?.id || null,
+-        title: content.slice(0, 20) || '新对话',
+-        context_data: {}
+-      }) as ChatSession
++      session = createLocalChatSession(user!.id, activeMember?.id || null, promptContent.slice(0, 20) || '新对话')
+       setActiveSession(session)
+-      loadSessions()
+     }
++    setActiveRtcGroupId(null)
+ 
+-    const optimisticId = `optimistic-${Date.now()}`
+-    const optimisticMsg: ChatMessage = {
+-      id: optimisticId,
+-      session_id: session.id,
+-      role: 'user',
+-      content,
+-      image_url: imageUrl || null,
+-      created_at: new Date().toISOString(),
++    if (!options?.skipUserBubble) {
++      setMessages(prev => [...prev, createLocalChatMessage(session.id, 'user', displayContent, imageUrl || null)])
+     }
+-    setMessages(prev => [...prev, optimisticMsg])
+     setInputText('')
++    setInputHeight(32)
+     setIsLoading(true)
+-
+-    createChatMessage({
+-      session_id: session.id,
+-      role: 'user',
+-      content,
+-      image_url: imageUrl || null
+-    }).then(saved => {
+-      if (saved) {
+-        setMessages(prev => prev.map(m => m.id === optimisticId ? saved : m))
+-      }
+-    })
++    let requestWs: ReturnType<typeof getAiWebSocket> | null = null
+ 
+     try {
+-      const systemParts: string[] = [
+-        '你是一个专业的健康饮食顾问，请提供营养合理、科学准确的建议。',
+-        '注意：你不能给出医疗诊断性建议（如确诊、停药、换药等）。',
+-        '涉及疾病治疗或用药互作的问题，必须在回答末尾附加「请咨询专业医生」。'
+-      ]
+-      if (useProfile && activeMember) {
+-        const healthCtx = buildHealthContext(activeMember)
+-        if (healthCtx) systemParts.push(healthCtx)
++      let healthContext = ''
++      if (useProfile) {
++        const selectedMembers = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
++        const contextMembers = selectedMembers.length > 0 ? selectedMembers : (activeMember ? [activeMember] : [])
++        healthContext = buildFamilyHealthContext(contextMembers)
+       }
++      let ingredientContext = ''
+       if (useIngredients && ingredients.length > 0) {
+-        systemParts.push(`当前称重食材：${ingredients.map(i => `${i.name}${i.weight}${i.unit}`).join('、')}`)
++        const selectedMembers = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
++        const contextMembers = selectedMembers.length > 0 ? selectedMembers : (activeMember ? [activeMember] : [])
++        const memberText = contextMembers.length > 0
++          ? `本餐用餐成员：${contextMembers.map(member => member.nickname).join('、')}；`
++          : ''
++        ingredientContext = `${memberText}当前称重食材：${ingredients.map(i => `${i.name}${i.weight}${i.unit}`).join('、')}`
+       }
+ 
+-      const contextPrefix = systemParts.join('\n')
+-      const fullPrompt = `${contextPrefix}\n\n用户问题：${content}`
++      const fullPrompt = buildChatPrompt({
++        userQuestion: promptContent,
++        healthContext,
++        ingredientContext
++      })
+ 
+       const ws = getAiWebSocket()
++      requestWs = ws
++      activeChatWsRef.current = ws
+       let aiReply = ''
++      const streamingAiId = `streaming-ai-${Date.now()}`
++      const audioChunks: ArrayBuffer[] = []
++      let streamingAudioUrl: string | null = null
++      let audioWritePromise: Promise<string | null> | null = null
++      let ttsEnded = false
++      liveAudioPlayerRef.current?.stop()
++      liveAudioPlayerRef.current = null
++      const liveAudioPlayer = imageBase64 ? null : createPcmStreamPlayer()
++      liveAudioPlayerRef.current = liveAudioPlayer
++      const createStreamingAiMessage = () => {
++        setMessages(prev => prev.some(m => m.id === streamingAiId) ? prev : [...prev, {
++          id: streamingAiId,
++          session_id: session.id,
++          role: 'assistant',
++          content: '',
++          image_url: null,
++          audio_url: null,
++          created_at: new Date().toISOString(),
++        }])
++      }
++      const updateStreamingAiMessage = (text: string) => {
++        setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, content: normalizeAiMarkdown(text)} : m))
++      }
++      const attachAudioToStreamingMessage = async () => {
++        if (streamingAudioUrl) return streamingAudioUrl
++        if (audioWritePromise) return audioWritePromise
++        audioWritePromise = writeAudioChunksToTempFile(audioChunks).then((url) => {
++          streamingAudioUrl = url
++          if (url) {
++            setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, audio_url: url} : m))
++          }
++          return url
++        })
++        return audioWritePromise
++      }
+       try {
+         if (imageBase64) {
+-          await ws.connect({mode: 'default'})
++          await ws.connect({mode: 'default', agentProfile: 'vision', userId: user!.id})
++          createStreamingAiMessage()
+           aiReply = await ws.requestImageResponse({
+-            triggerText: '请识别刚才上传图片里的食物，并结合用户问题回答。',
++            triggerText: '请先请求上传图片。收到图片后，结合图片和用户问题给出简洁回答。',
+             imageBase64,
+             fileName: `chat-image.${imageExt}`,
+-            finalText: `图片已经上传。\n${fullPrompt}`
++            finalText: `图片已上传完成，请直接结合图片和问题回答，不要再次请求上传图片。\n${fullPrompt}`,
++            onInterim: updateStreamingAiMessage
+           })
+         } else {
+-          await ws.connect({cfg: CHAT_CFG})
+-          aiReply = await ws.requestResponse(fullPrompt)
++          await ws.connect({mode: 'default', agentProfile: 'chat', userId: user!.id})
++          createStreamingAiMessage()
++          aiReply = await ws.requestResponse(fullPrompt, {
++            onInterim: updateStreamingAiMessage,
++            onAudio: (buffer) => {
++              audioChunks.push(buffer)
++              liveAudioPlayer?.append(buffer)
++            },
++            onTtsEnd: () => {
++              ttsEnded = true
++              liveAudioPlayer?.finish()
++              void attachAudioToStreamingMessage()
++            }
++          })
++          if (!streamingAudioUrl && (ttsEnded || audioChunks.length > 0)) {
++            streamingAudioUrl = await attachAudioToStreamingMessage()
++          }
+         }
+       } finally {
+         ws.disconnect()
++        if (liveAudioPlayerRef.current === liveAudioPlayer) {
++          liveAudioPlayer?.finish()
++          liveAudioPlayerRef.current = null
++        }
+       }
+ 
+-      const aiMsg = await createChatMessage({
+-        session_id: session.id,
+-        role: 'assistant',
+-        content: aiReply || '抱歉，我暂时无法回答您的问题，请稍后重试。'
++      const aiMsg = createLocalChatMessage(
++        session.id,
++        'assistant',
++        normalizeAiMarkdown(aiReply) || '抱歉，我暂时无法回答您的问题，请稍后重试。',
++        null,
++        streamingAudioUrl,
++      )
++      setMessages(prev => {
++        const hasStreamingMessage = prev.some(m => m.id === streamingAiId)
++        if (!hasStreamingMessage) return [...prev, aiMsg]
++        return prev.map(m => m.id === streamingAiId ? aiMsg : m)
+       })
+-      if (aiMsg) {
+-        setMessages(prev => [...prev, aiMsg])
+-      }
+-
+-      if (messages.length === 0) {
+-        await updateChatSession(session.id, {title: content.slice(0, 20)})
+-        loadSessions()
+-      }
+     } catch (err: any) {
+-      console.error('AI回复失败详情:', err?.message || err, err)
+-      Taro.showToast({title: 'AI回复失败，请重试', icon: 'none'})
++      const wasInterrupted = requestWs ? interruptedChatWsRef.current.has(requestWs) : false
++      if (wasInterrupted) {
++        if (requestWs) interruptedChatWsRef.current.delete(requestWs)
++        console.info('AI 回复已被用户语音输入打断')
++      } else {
++        console.error('AI回复失败详情:', err?.message || err, err)
++        Taro.showToast({title: 'AI回复失败，请重试', icon: 'none'})
++      }
+     } finally {
++      if (requestWs && activeChatWsRef.current === requestWs) {
++        activeChatWsRef.current = null
++      }
+       setIsLoading(false)
+     }
+   }
+@@ -242,33 +455,230 @@ function ChatPage() {
+     })
+   }
+ 
++  const writeAudioChunksToTempFile = async (chunks: ArrayBuffer[]): Promise<string | null> => {
++    if (chunks.length === 0) return null
++    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
++    if (totalLength < 256) return null
++    const bytes = new Uint8Array(totalLength)
++    let offset = 0
++    for (const chunk of chunks) {
++      bytes.set(new Uint8Array(chunk), offset)
++      offset += chunk.byteLength
++    }
++    if (!Taro.env.USER_DATA_PATH) return null
++    const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
++    const isMp3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33
++    const audioData = isWav || isMp3 ? bytes : wrapPcm16ToWav(bytes)
++    const ext = isMp3 ? 'mp3' : 'wav'
++    const filePath = `${Taro.env.USER_DATA_PATH}/rtc-tts-${Date.now()}.${ext}`
++    return new Promise((resolve) => {
++      Taro.getFileSystemManager().writeFile({
++        filePath,
++        data: audioData.buffer,
++        success: () => resolve(filePath),
++        fail: (err) => {
++          console.warn('写入 RTC TTS 音频失败:', err?.errMsg || err)
++          resolve(null)
++        }
++      })
++    })
++  }
++
++  const writePcmVoiceToWavFile = async (buffer: ArrayBuffer): Promise<string | null> => {
++    if (!Taro.env.USER_DATA_PATH || buffer.byteLength < 256) return null
++    const bytes = new Uint8Array(buffer)
++    const wav = wrapPcm16ToWav(bytes)
++    const filePath = `${Taro.env.USER_DATA_PATH}/voice-message-${Date.now()}.wav`
++    return new Promise((resolve) => {
++      Taro.getFileSystemManager().writeFile({
++        filePath,
++        data: wav.buffer,
++        success: () => resolve(filePath),
++        fail: (err) => {
++          console.warn('写入语音消息音频失败:', err?.errMsg || err)
++          resolve(null)
++        }
++      })
++    })
++  }
++
++  const wrapPcm16ToWav = (pcm: Uint8Array) => {
++    const sampleRate = 16000
++    const channels = 1
++    const bitsPerSample = 16
++    const headerSize = 44
++    const wav = new Uint8Array(headerSize + pcm.byteLength)
++    const view = new DataView(wav.buffer)
++    const writeString = (offset: number, value: string) => {
++      for (let i = 0; i < value.length; i += 1) wav[offset + i] = value.charCodeAt(i)
++    }
++    writeString(0, 'RIFF')
++    view.setUint32(4, 36 + pcm.byteLength, true)
++    writeString(8, 'WAVE')
++    writeString(12, 'fmt ')
++    view.setUint32(16, 16, true)
++    view.setUint16(20, 1, true)
++    view.setUint16(22, channels, true)
++    view.setUint32(24, sampleRate, true)
++    view.setUint32(28, sampleRate * channels * bitsPerSample / 8, true)
++    view.setUint16(32, channels * bitsPerSample / 8, true)
++    view.setUint16(34, bitsPerSample, true)
++    writeString(36, 'data')
++    view.setUint32(40, pcm.byteLength, true)
++    wav.set(pcm, headerSize)
++    return wav
++  }
++
++  const stopCurrentAudio = useCallback(() => {
++    audioContextRef.current?.stop()
++    audioContextRef.current?.destroy()
++    audioContextRef.current = null
++    audioMessageIdRef.current = null
++    setPlayingAudioId(null)
++  }, [])
++
++  const interruptActiveChatResponse = useCallback((reason = 'voice-input') => {
++    const ws = activeChatWsRef.current
++    if (ws) {
++      interruptedChatWsRef.current.add(ws)
++      activeChatWsRef.current = null
++      ws.disconnect()
++    }
++    liveAudioPlayerRef.current?.stop()
++    liveAudioPlayerRef.current = null
++    setIsLoading(false)
++    console.info('已打断当前 AI/TTS 回复', {reason})
++  }, [])
++
++  const handlePlayAudio = useCallback((msg: ChatMessage) => {
++    if (!msg.audio_url) return
++    unlockRtcAudioPlayback('audio-button')
++    try {
++      if (msg.audio_url.startsWith(Taro.env.USER_DATA_PATH || '')) {
++        const stat = Taro.getFileSystemManager().statSync(msg.audio_url) as Taro.Stats
++        if (!stat?.size || stat.size < 256) {
++          Taro.showToast({title: '朗读音频不可用', icon: 'none'})
++          return
++        }
++      }
++    } catch {
++      Taro.showToast({title: '朗读音频不可用', icon: 'none'})
++      return
++    }
++    if (audioMessageIdRef.current === msg.id && playingAudioId === msg.id) {
++      stopCurrentAudio()
++      return
++    }
++    stopCurrentAudio()
++    const ctx = Taro.createInnerAudioContext()
++    audioContextRef.current = ctx
++    audioMessageIdRef.current = msg.id
++    ctx.src = msg.audio_url
++    ctx.onEnded(() => {
++      if (audioMessageIdRef.current === msg.id) {
++        audioMessageIdRef.current = null
++        audioContextRef.current?.destroy()
++        audioContextRef.current = null
++        setPlayingAudioId(null)
++      }
++    })
++    ctx.onError((err) => {
++      console.warn('播放音频失败:', err?.errMsg || err)
++      if (audioMessageIdRef.current === msg.id) {
++        audioMessageIdRef.current = null
++        audioContextRef.current?.destroy()
++        audioContextRef.current = null
++        setPlayingAudioId(null)
++      }
++      Taro.showToast({title: '朗读播放失败', icon: 'none'})
++    })
++    setPlayingAudioId(msg.id)
++    ctx.play()
++  }, [playingAudioId, stopCurrentAudio])
++
++  const handleCopyMessage = useCallback((content: string) => {
++    Taro.setClipboardData({
++      data: content,
++      fail: (err) => {
++        if (isPrivacyScopeError(err)) {
++          console.warn('复制内容隐私配置缺失:', err)
++          showPrivacyScopeDeclarationTip('剪贴板')
++          return
++        }
++        Taro.showToast({title: '复制失败', icon: 'none'})
++      }
++    })
++  }, [])
++
+   // ── WebSocket 语音通话逻辑 ──────────────────────────────────────────────
+ 
+   const ensureSession = useCallback(async (title: string): Promise<ChatSession | null> => {
+     if (voiceSessionRef.current) return voiceSessionRef.current
+     if (activeSession) { voiceSessionRef.current = activeSession; return activeSession }
+-    const s = await createChatSession({
+-      user_id: user!.id,
+-      member_id: activeMember?.id || null,
+-      title,
+-      context_data: {}
+-    }) as ChatSession
++    const s = createLocalChatSession(user!.id, activeMember?.id || null, title)
+     setActiveSession(s)
++    setActiveRtcGroupId(null)
+     voiceSessionRef.current = s
+-    loadSessions()
+     return s
+-  }, [activeSession, activeMember, loadSessions, user])
++  }, [activeSession, activeMember, user])
++
++  const ensureRecordPermission = useCallback((): Promise<boolean> => {
++    const showSettingGuide = () => {
++      Taro.showModal({
++        title: '需要麦克风权限',
++        content: '请前往设置页开启麦克风权限后再使用语音输入',
++        confirmText: '去设置',
++        cancelText: '取消',
++        success: (res) => { if (res.confirm) Taro.openSetting() }
++      })
++    }
++
++    return new Promise((resolve) => {
++      Taro.getSetting({
++        success: (settingRes: any) => {
++          const status = settingRes?.authSetting?.['scope.record']
++          if (status === true) {
++            resolve(true)
++          } else if (status === false) {
++            showSettingGuide()
++            resolve(false)
++          } else {
++            Taro.authorize({
++              scope: 'scope.record',
++              success: () => resolve(true),
++              fail: () => {
++                showSettingGuide()
++                resolve(false)
++              }
++            })
++          }
++        },
++        fail: () => {
++          Taro.authorize({
++            scope: 'scope.record',
++            success: () => resolve(true),
++            fail: () => {
++              showSettingGuide()
++              resolve(false)
++            }
++          })
++        }
++      })
++    })
++  }, [])
+ 
+   const handleStartVoiceCall = useCallback(async () => {
+     if (!isOnline) { Taro.showToast({title: '需要网络连接', icon: 'none'}); return }
+     if (voiceState !== 'idle') return
++    if (!await ensureRecordPermission()) return
+ 
+     setVoiceState('connecting')
+     Taro.showToast({title: '正在连接…', icon: 'loading', duration: 3000})
+ 
+     try {
+       const ws = getAiWebSocket()
+-      await ws.connect({cfg: VOICE_CFG})
++      await ws.connect({mode: 'default', agentProfile: 'voice-realtime', userId: user!.id})
++      await ws.sendControl('[E]:[CMD]:[ASR_ENABLE_REALTIME]')
+       Taro.hideToast()
+       setVoiceState('active')
+       Taro.showToast({title: '语音通话已开始', icon: 'success', duration: 1500})
+@@ -279,12 +689,12 @@ function ChatPage() {
+         if (!session) return
+         if (voiceTempUserMsgId.current) {
+           setMessages(prev => prev.map(m =>
+-            m.id === voiceTempUserMsgId.current ? {...m, content: `🎙 ${text}`} : m
++            m.id === voiceTempUserMsgId.current ? {...m, content: `${VOICE_MESSAGE_PREFIX}${text}`} : m
+           ))
+         } else {
+           const placeholder: ChatMessage = {
+             id: `voice-user-${Date.now()}`, session_id: session.id,
+-            role: 'user', content: `🎙 ${text}`, image_url: null, created_at: new Date().toISOString()
++            role: 'user', content: `${VOICE_MESSAGE_PREFIX}${text}`, image_url: null, created_at: new Date().toISOString()
+           }
+           voiceTempUserMsgId.current = placeholder.id
+           setMessages(prev => [...prev, placeholder])
+@@ -295,19 +705,17 @@ function ChatPage() {
+         const text = data as string
+         const session = await ensureSession('语音对话')
+         if (!session) return
+-        const saved = await createChatMessage({session_id: session.id, role: 'user', content: text, image_url: null})
+-        if (saved) {
+-          if (voiceTempUserMsgId.current) {
+-            setMessages(prev => prev.map(m => m.id === voiceTempUserMsgId.current ? saved : m))
+-          } else {
+-            setMessages(prev => [...prev, saved])
+-          }
+-          voiceTempUserMsgId.current = null
++        const saved = createLocalChatMessage(session.id, 'user', `${VOICE_MESSAGE_PREFIX}${text}`)
++        if (voiceTempUserMsgId.current) {
++          setMessages(prev => prev.map(m => m.id === voiceTempUserMsgId.current ? saved : m))
++        } else {
++          setMessages(prev => [...prev, saved])
+         }
++        voiceTempUserMsgId.current = null
+       })
+ 
+       ws.onMessage('llm-interim', async (data) => {
+-        const text = data as string
++        const text = normalizeAiMarkdown(data as string)
+         const session = await ensureSession('语音对话')
+         if (!session) return
+         if (voiceTempAiMsgId.current) {
+@@ -323,23 +731,21 @@ function ChatPage() {
+       })
+ 
+       ws.onMessage('llm-final', async (data) => {
+-        const text = data as string
++        const text = normalizeAiMarkdown(data as string)
+         const session = await ensureSession('语音对话')
+         if (!session) return
+-        const saved = await createChatMessage({session_id: session.id, role: 'assistant', content: text, image_url: null})
+-        if (saved) {
+-          if (voiceTempAiMsgId.current) {
+-            setMessages(prev => prev.map(m => m.id === voiceTempAiMsgId.current ? saved : m))
+-          } else {
+-            setMessages(prev => [...prev, saved])
+-          }
+-          voiceTempAiMsgId.current = null
++        const saved = createLocalChatMessage(session.id, 'assistant', text)
++        if (voiceTempAiMsgId.current) {
++          setMessages(prev => prev.map(m => m.id === voiceTempAiMsgId.current ? saved : m))
++        } else {
++          setMessages(prev => [...prev, saved])
+         }
++        voiceTempAiMsgId.current = null
+       })
+ 
+       const rm = Taro.getRecorderManager()
+       rm.onFrameRecorded?.((res: any) => {
+-        if (res.frameBuffer) ws.sendAudio(res.frameBuffer)
++        if (res.frameBuffer) void ws.sendAudio(res.frameBuffer)
+       })
+       rm.start({duration: 600000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+       recorderManager.current = rm
+@@ -348,7 +754,7 @@ function ChatPage() {
+       Taro.hideToast()
+       Taro.showToast({title: '语音连接失败，请重试', icon: 'none'})
+     }
+-  }, [ensureSession, isOnline, voiceState])
++  }, [ensureRecordPermission, ensureSession, isOnline, user, voiceState])
+ 
+   const handleStopVoiceCall = useCallback(() => {
+     recorderManager.current?.stop()
+@@ -361,25 +767,63 @@ function ChatPage() {
+     Taro.showToast({title: '通话已结束', icon: 'none'})
+   }, [])
+ 
+-  const handleVoiceMicToggle = useCallback(() => {
+-    if (isRecording) {
+-      recorderManager.current?.stop()
++  const startVoiceRecording = useCallback(async () => {
++    if (isRecording || voiceRecordStartingRef.current) return
++    voiceRecordStartingRef.current = true
++    if (!await ensureRecordPermission()) {
++      voiceRecordStartingRef.current = false
++      return
++    }
++    if (!voicePressingRef.current) {
++      voiceRecordStartingRef.current = false
+       return
+     }
+ 
+     const doStartRecord = () => {
+       const rm = Taro.getRecorderManager()
+       recorderManager.current = rm
+-      rm.onStart(() => setIsRecording(true))
++      voiceCancelRef.current = false
++      setIsRecordingCanceling(false)
++      rm.onStart(() => {
++        voiceRecordStartingRef.current = false
++        if (!voicePressingRef.current) {
++          recorderManager.current?.stop()
++          return
++        }
++        voiceRecordStartedAtRef.current = Date.now()
++        setIsRecording(true)
++      })
+       rm.onStop(async (res) => {
++        voiceRecordStartingRef.current = false
+         setIsRecording(false)
++        setIsVoicePressing(false)
++        setIsRecordingCanceling(false)
++        if (voiceCancelRef.current) {
++          voiceCancelRef.current = false
++          voiceRecordStartedAtRef.current = 0
++          Taro.showToast({title: '已取消发送', icon: 'none'})
++          return
++        }
+         if (!res.tempFilePath) return
++        const recordDurationMs = voiceRecordStartedAtRef.current ? Date.now() - voiceRecordStartedAtRef.current : 0
++        voiceRecordStartedAtRef.current = 0
++        if (recordDurationMs < MIN_VOICE_RECORD_MS) {
++          Taro.showToast({title: '说话时间太短', icon: 'none'})
++          return
++        }
++        const ws = createAiWebSocket()
++        const session = await ensureSession('语音对话')
++        if (!session) return
++        const placeholder = createLocalChatMessage(session.id, 'user', `${VOICE_MESSAGE_PREFIX}正在识别...`)
++        setMessages(prev => [...prev, placeholder])
+         try {
+           const {base64} = await readAudioAsBase64(res.tempFilePath)
+           const buffer = Taro.base64ToArrayBuffer(base64)
+-          const ws = getAiWebSocket()
+-          await ws.connect({cfg: VOICE_CFG})
+-          ws.sendAudio(buffer)
++          const playableVoiceUrl = await writePcmVoiceToWavFile(buffer)
++          if (playableVoiceUrl) {
++            setMessages(prev => prev.map(message => message.id === placeholder.id ? {...message, audio_url: playableVoiceUrl} : message))
++          }
++          await ws.connect({mode: 'default', agentProfile: 'voice-ptt', userId: user!.id})
+           const text = await new Promise<string>((resolve, reject) => {
+             const timeout = setTimeout(() => { unsub(); reject(new Error('timeout')) }, 15000)
+             const unsub = ws.onMessage('asr-final', (data) => {
+@@ -387,54 +831,75 @@ function ChatPage() {
+               unsub()
+               resolve(data as string)
+             })
++            void (async () => {
++              await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
++              await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
++              await ws.sendAudio(buffer)
++              await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
++            })().catch((error) => {
++              clearTimeout(timeout)
++              unsub()
++              reject(error)
++            })
+           })
+-          ws.disconnect()
+           if (text.trim()) {
+-            sendMessage(`🎙 ${text.trim()}`)
++            const voiceContent = `${VOICE_MESSAGE_PREFIX}${text.trim()}`
++            setMessages(prev => prev.map(message => message.id === placeholder.id ? {...message, content: voiceContent} : message))
++            ws.disconnect()
++            await new Promise(resolve => setTimeout(resolve, 120))
++            await sendMessage(voiceContent, undefined, undefined, 'jpg', {skipUserBubble: true, session})
+           } else {
++            setMessages(prev => prev.filter(message => message.id !== placeholder.id))
+             Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
+           }
+         } catch {
++          setMessages(prev => prev.filter(message => message.id !== placeholder.id))
+           Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
++        } finally {
++          ws.disconnect()
+         }
+       })
+       rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+     }
+ 
+-    const showSettingGuide = () => {
+-      Taro.showModal({
+-        title: '需要麦克风权限',
+-        content: '请前往设置页开启麦克风权限后再使用语音输入',
+-        confirmText: '去设置',
+-        cancelText: '取消',
+-        success: (res) => { if (res.confirm) Taro.openSetting() }
+-      })
+-    }
++    doStartRecord()
++  }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
+ 
+-    Taro.getSetting({
+-      success: (settingRes: any) => {
+-        const status = settingRes?.authSetting?.['scope.record']
+-        if (status === true) {
+-          doStartRecord()
+-        } else if (status === false) {
+-          showSettingGuide()
+-        } else {
+-          Taro.authorize({
+-            scope: 'scope.record',
+-            success: () => doStartRecord(),
+-            fail: () => showSettingGuide()
+-          })
+-        }
+-      },
+-      fail: () => {
+-        Taro.authorize({
+-          scope: 'scope.record',
+-          success: () => doStartRecord(),
+-          fail: () => showSettingGuide()
+-        })
+-      }
+-    })
+-  }, [isRecording, sendMessage])
++  const handleVoiceTouchStart = useCallback((event: any) => {
++    if (isUploadingImage) return
++    unlockRtcAudioPlayback('voice-touch')
++    if (isLoading) interruptActiveChatResponse('voice-touch')
++    voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
++    voiceCancelRef.current = false
++    voicePressingRef.current = true
++    setIsVoicePressing(true)
++    setIsRecordingCanceling(false)
++    if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
++    voicePressTimerRef.current = setTimeout(() => {
++      voicePressTimerRef.current = null
++      void startVoiceRecording()
++    }, VOICE_LONG_PRESS_MS)
++  }, [interruptActiveChatResponse, isLoading, isUploadingImage, startVoiceRecording])
++
++  const handleVoiceTouchMove = useCallback((event: any) => {
++    if (!isRecording) return
++    const currentY = event?.touches?.[0]?.clientY || voiceTouchStartYRef.current
++    const shouldCancel = voiceTouchStartYRef.current - currentY > 48
++    voiceCancelRef.current = shouldCancel
++    setIsRecordingCanceling(shouldCancel)
++  }, [isRecording])
++
++  const handleVoiceTouchEnd = useCallback(() => {
++    voicePressingRef.current = false
++    setIsVoicePressing(false)
++    if (voicePressTimerRef.current) {
++      clearTimeout(voicePressTimerRef.current)
++      voicePressTimerRef.current = null
++      setIsRecordingCanceling(false)
++      return
++    }
++    recorderManager.current?.stop()
++  }, [])
+ 
+   const handleImageUpload = async () => {
+     try {
+@@ -443,19 +908,28 @@ function ChatPage() {
+       const localPath = res.tempFiles[0].tempFilePath
+       const image = await readImageAsBase64(localPath)
+       setPendingImage({localPath, base64: image.base64, ext: image.ext})
+-    } catch {
++    } catch (err) {
++      if (isUserCancelError(err)) return
++      if (isPrivacyScopeError(err)) {
++        console.warn('图片选择隐私配置缺失:', err)
++        showPrivacyScopeDeclarationTip('相册/摄像头')
++        return
++      }
+       Taro.showToast({title: '选取图片失败', icon: 'none'})
+     }
+   }
+ 
+   const handleSendWithImage = async () => {
+     if (isUploadingImage || isLoading) return
++    unlockRtcAudioPlayback('send-button')
+     if (!pendingImage) {
+       if (inputText.trim()) sendMessage(inputText)
+       return
+     }
+     setIsUploadingImage(true)
++    let loadingShown = false
+     Taro.showLoading({title: '上传中...'})
++    loadingShown = true
+     try {
+       const {uploadToSupabase} = await import('@/utils/upload')
+       const result = await uploadToSupabase(
+@@ -463,6 +937,7 @@ function ChatPage() {
+         {bucket: 'chat-images', userId: user!.id}
+       )
+       Taro.hideLoading()
++      loadingShown = false
+       if (result.success && result.data) {
+         const {data: urlData} = supabase.storage.from('chat-images').getPublicUrl(result.data.path)
+         setPendingImage(null)
+@@ -471,7 +946,7 @@ function ChatPage() {
+         Taro.showToast({title: '图片上传失败', icon: 'none'})
+       }
+     } catch {
+-      Taro.hideLoading()
++      if (loadingShown) Taro.hideLoading()
+       Taro.showToast({title: '图片上传失败', icon: 'none'})
+     } finally {
+       setIsUploadingImage(false)
+@@ -479,6 +954,7 @@ function ChatPage() {
+   }
+ 
+   const scrollContainerRef = useRef<HTMLDivElement>(null)
++  const hasStreamingAiMessage = messages.some(msg => msg.id.startsWith('streaming-ai-'))
+ 
+   useEffect(() => {
+     if (!scrollContainerRef.current) return
+@@ -488,8 +964,26 @@ function ChatPage() {
+     }, 50)
+   }, [messages, isLoading])
+ 
++  const inputBarHeight = pendingImage ? 98 : 54
++  const messageBottomPadding = inputBarHeight + 10
++  const formatRtcClock = (seconds: number) => new Date(seconds * 1000).toLocaleTimeString('zh-CN', {
++    hour: '2-digit',
++    minute: '2-digit',
++  })
++  const formatRtcGroupTime = (group: RtcHistoryGroup) => {
++    const start = new Date(group.startTime * 1000)
++    const end = new Date(group.endTime * 1000)
++    const date = end.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})
++    if (start.toDateString() === end.toDateString()) {
++      return `${date} ${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
++    }
++    return `${date} 截止 ${formatRtcClock(group.endTime)}`
++  }
++  const hasAnyHistory = rtcHistoryGroups.length > 0
++  const isVoiceButtonActive = isRecording || isVoicePressing
++
+   return (
+-    <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden">
++    <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
+       {/* 顶栏 */}
+       <div className="flex items-center gap-3 px-4 py-3 bg-card border-b border-border">
+         <div
+@@ -501,7 +995,9 @@ function ChatPage() {
+         </div>
+         <div className="flex-1 min-w-0">
+           <p className="text-xl font-semibold text-foreground">AI健康顾问</p>
+-          {activeSession ? (
++          {activeRtcGroupId ? (
++            <p className="text-xl text-muted-foreground">云端历史</p>
++          ) : activeSession ? (
+             <p className="text-xl text-muted-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+               {activeSession.title}
+             </p>
+@@ -553,7 +1049,11 @@ function ChatPage() {
+       )}
+ 
+       {/* 消息列表 */}
+-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 py-4">
++      <div
++        ref={scrollContainerRef}
++        className="flex-1 overflow-y-auto px-4 py-4"
++        style={{paddingBottom: `${messageBottomPadding}px`}}
++      >
+         {messages.length === 0 ? (
+           <div className="flex flex-col items-center pt-8 gap-3">
+             <div className="w-16 h-16 bg-gradient-primary rounded-3xl flex items-center justify-center">
+@@ -573,7 +1073,11 @@ function ChatPage() {
+                   key={q}
+                   className="px-4 py-2 rounded-[20px] text-xl text-foreground"
+                   style={{backgroundColor: '#F2F2F2'}}
+-                  onClick={() => sendMessage(q)}
++                  onTouchStart={() => unlockRtcAudioPlayback('suggestion-touch')}
++                  onClick={() => {
++                    unlockRtcAudioPlayback('suggestion')
++                    sendMessage(q)
++                  }}
+                 >
+                   {q}
+                 </div>
+@@ -610,15 +1114,30 @@ function ChatPage() {
+                             />
+                           </div>
+                         )}
+-                        {msg.content.startsWith('🎙 ') ? (
+-                          <div className="flex items-center gap-2">
+-                            <div className="flex items-end gap-0.5 flex-shrink-0" style={{height: '18px'}}>
+-                              {[0,1,2,3].map(i => (
+-                                <div key={i} className="rounded-full bg-white/80 animate-soundwave"
+-                                  style={{width: '3px', height: `${6 + (i % 3) * 4}px`, animationDelay: `${i * 0.12}s`}} />
+-                              ))}
++                        {isVoiceMessage(msg.content) ? (
++                          <div
++                            className="flex items-center gap-3 active:opacity-80"
++                          style={{minWidth: '168px'}}
++                          onClick={() => handlePlayAudio(msg)}
++                          >
++                            <div className="flex items-center justify-center rounded-full flex-shrink-0"
++                              style={{width: '30px', height: '30px', backgroundColor: 'rgba(255,255,255,0.18)'}}>
++                              <div className={`${playingAudioId === msg.id ? 'i-mdi-pause' : 'i-mdi-play'} text-xl text-white`} />
++                            </div>
++                            <div className="flex-1 min-w-0">
++                              <div className="flex items-center gap-2">
++                                <div className="flex items-end gap-0.5 flex-shrink-0" style={{height: '16px'}}>
++                                  {[0,1,2,3,4].map(i => (
++                                    <div key={i} className="rounded-full bg-white/85 animate-soundwave"
++                                      style={{width: '3px', height: `${5 + (i % 3) * 4}px`, animationDelay: `${i * 0.1}s`}} />
++                                  ))}
++                                </div>
++                                <span style={{fontSize: '11px', color: 'rgba(255,255,255,0.72)'}}>语音消息</span>
++                              </div>
++                              <p className="mt-1" style={{fontSize: '11px', lineHeight: '14px', color: 'rgba(255,255,255,0.72)'}}>
++                                {msg.audio_url ? (playingAudioId === msg.id ? '正在播放' : '点击播放') : '正在处理'}
++                              </p>
+                             </div>
+-                            <p className="text-xl leading-relaxed">{msg.content.slice(3)}</p>
+                           </div>
+                         ) : (
+                           msg.content && <p className="text-xl leading-relaxed">{msg.content}</p>
+@@ -629,20 +1148,36 @@ function ChatPage() {
+                     )}
+                   </div>
+                   {msg.role === 'assistant' && (
+-                    <button
+-                      type="button"
+-                      className="flex items-center justify-center leading-none gap-1 mt-1 px-2 active:opacity-60"
+-                      style={{height: '24px'}}
+-                      onClick={() => Taro.setClipboardData({data: msg.content})}
+-                    >
+-                      <div className="i-mdi-content-copy text-xl text-muted-foreground" />
+-                      <span className="text-muted-foreground" style={{fontSize: '11px'}}>复制</span>
+-                    </button>
++                    <div className="flex items-center gap-2 mt-1">
++                      <button
++                        type="button"
++                        className="flex items-center justify-center leading-none gap-1 px-2 active:opacity-60"
++                        style={{height: '24px'}}
++                        onClick={() => handleCopyMessage(msg.content)}
++                      >
++                        <div className="i-mdi-content-copy text-xl text-muted-foreground" />
++                        <span className="text-muted-foreground" style={{fontSize: '11px'}}>复制</span>
++                      </button>
++                      {msg.audio_url && (
++                        <button
++                          type="button"
++                          className="flex items-center justify-center leading-none gap-1 px-2 active:opacity-60"
++                          style={{height: '24px'}}
++                          onTouchStart={() => unlockRtcAudioPlayback('assistant-audio-touch')}
++                          onClick={() => handlePlayAudio(msg)}
++                        >
++                          <div className={`${playingAudioId === msg.id ? 'i-mdi-pause-circle-outline' : 'i-mdi-volume-high'} text-xl text-muted-foreground`} />
++                          <span className="text-muted-foreground" style={{fontSize: '11px'}}>
++                            {playingAudioId === msg.id ? '暂停' : '朗读'}
++                          </span>
++                        </button>
++                      )}
++                    </div>
+                   )}
+                 </div>
+               </div>
+             ))}
+-            {isLoading && (
++            {isLoading && !hasStreamingAiMessage && (
+               <div className="flex items-end gap-2 justify-start">
+                 <div className="w-8 h-8 bg-gradient-primary rounded-xl flex items-center justify-center flex-shrink-0 mb-1">
+                   <div className="i-mdi-robot text-xl text-white" />
+@@ -664,31 +1199,15 @@ function ChatPage() {
+       </div>
+ 
+       {/* 输入区 */}
+-      <div className="flex-shrink-0 bg-card border-t border-border relative" style={{padding: '8px 12px'}}>
+-        {isRecording && (
+-          <div
+-            className="absolute left-0 right-0 flex flex-col items-center justify-center gap-3 bg-card rounded-t-2xl"
+-            style={{bottom: '100%', padding: '20px 0 16px', boxShadow: '0 -4px 20px rgba(0,0,0,0.08)', zIndex: 10}}
+-          >
+-            <div className="relative flex items-center justify-center">
+-              <div className="absolute rounded-full bg-destructive/10 animate-pulse" style={{width: '72px', height: '72px'}} />
+-              <div className="relative flex items-center justify-center rounded-full bg-destructive" style={{width: '56px', height: '56px'}}>
+-                <div className="i-mdi-microphone text-3xl text-white" />
+-              </div>
+-            </div>
+-            <div className="flex items-end gap-1" style={{height: '28px'}}>
+-              {[0,1,2,3,4,5,6].map(i => (
+-                <div
+-                  key={i}
+-                  className="rounded-full bg-destructive animate-soundwave"
+-                  style={{width: '4px', height: `${10 + (i % 4) * 5}px`, animationDelay: `${i * 0.1}s`}}
+-                />
+-              ))}
+-            </div>
+-            <p className="text-xl text-muted-foreground">松开发送 · 上滑取消</p>
+-          </div>
+-        )}
+-
++      <div
++        className="flex-shrink-0 bg-card border-t border-border fixed left-0 right-0"
++        style={{
++          padding: '6px 12px',
++          bottom: '0',
++          zIndex: 50,
++          transform: 'translateZ(0)'
++        }}
++      >
+         {voiceState === 'active' ? (
+           <div className="flex items-center justify-between gap-4 py-2">
+             <div className="flex items-center gap-2 flex-1">
+@@ -715,19 +1234,60 @@ function ChatPage() {
+             <div
+               className="flex-1 flex items-center justify-center rounded-full border-2 transition-colors"
+               style={{
+-                height: '44px',
+-                borderColor: isRecording ? '#EF4444' : 'hsl(var(--border))',
+-                backgroundColor: isRecording ? '#FEF2F2' : 'hsl(var(--background))',
++                height: isVoiceButtonActive ? '58px' : '44px',
++                position: 'relative',
++                overflow: 'hidden',
++                borderColor: isVoiceButtonActive ? (isRecordingCanceling ? '#F97316' : '#EF4444') : 'hsl(var(--border))',
++                backgroundColor: isVoiceButtonActive ? (isRecordingCanceling ? '#FFF7ED' : '#EF4444') : 'hsl(var(--background))',
+               }}
+-              onTouchStart={() => { if (!isRecording) handleVoiceMicToggle() }}
+-              onTouchEnd={() => { if (isRecording) recorderManager.current?.stop() }}
++              onTouchStart={handleVoiceTouchStart}
++              onTouchMove={handleVoiceTouchMove}
++              onTouchCancel={handleVoiceTouchEnd}
++              onTouchEnd={handleVoiceTouchEnd}
+             >
+-              <div className="flex items-center gap-2">
+-                <div className={`i-mdi-microphone text-xl ${isRecording ? 'text-destructive' : 'text-muted-foreground'}`} />
+-                <span className={`text-xl ${isRecording ? 'text-destructive' : 'text-muted-foreground'}`}>
+-                  {isRecording ? '录音中...' : '按住说话'}
+-                </span>
+-              </div>
++              {isVoiceButtonActive ? (
++                <>
++                {!isRecordingCanceling && (
++                  <>
++                    <div className="absolute rounded-full" style={{
++                      width: '120px',
++                      height: '120px',
++                      border: '1px solid rgba(255,255,255,0.45)',
++                      animation: 'voiceRipple 1.15s ease-out infinite',
++                    }} />
++                    <div className="absolute rounded-full" style={{
++                      width: '120px',
++                      height: '120px',
++                      border: '1px solid rgba(255,255,255,0.32)',
++                      animation: 'voiceRipple 1.15s ease-out infinite',
++                      animationDelay: '0.36s',
++                    }} />
++                  </>
++                )}
++                <div className="flex flex-col items-center justify-center gap-1">
++                  <div className="flex items-center gap-2">
++                    <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
++                    <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
++                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
++                    </span>
++                    <div className="flex items-end gap-0.5" style={{height: '16px'}}>
++                      {[0,1,2,3,4].map(i => (
++                        <div key={i} className={`rounded-full animate-soundwave ${isRecordingCanceling ? 'bg-orange-500' : 'bg-white'}`}
++                          style={{width: '3px', height: `${5 + (i % 3) * 4}px`, animationDelay: `${i * 0.1}s`}} />
++                      ))}
++                    </div>
++                  </div>
++                  <span className={`text-xs ${isRecordingCanceling ? 'text-muted-foreground' : 'text-white/85'}`}>
++                    {isRecordingCanceling ? '松开取消发送' : '松开发送 · 上滑取消'}
++                  </span>
++                </div>
++                </>
++              ) : (
++                <div className="flex items-center gap-2">
++                  <div className="i-mdi-microphone text-xl text-muted-foreground" />
++                  <span className="text-xl text-muted-foreground">按住说话</span>
++                </div>
++              )}
+             </div>
+             <button type="button" className="flex-shrink-0 flex items-center justify-center leading-none rounded-full"
+               style={{width: '44px', height: '44px', backgroundColor: voiceState === 'connecting' ? '#F97316' : '#4A7C59'}}
+@@ -766,21 +1326,27 @@ function ChatPage() {
+             )}
+             <div className="flex items-end" style={{gap: '8px'}}>
+               <button type="button" className="flex-shrink-0 flex items-center justify-center"
+-                style={{width: '44px', height: '44px'}} onClick={() => setVoiceMode(true)}>
++                style={{width: '40px', height: '40px'}}
++                onTouchStart={() => unlockRtcAudioPlayback('voice-mode-touch')}
++                onClick={() => setVoiceMode(true)}>
+                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
+               </button>
+               <div className="flex items-center bg-white"
+-                style={{flex: 1, minWidth: 0, borderRadius: '22px', border: '1px solid #E5E5E5', minHeight: '44px', padding: '4px 12px', gap: '8px'}}>
+-                <textarea
++                style={{flex: 1, minWidth: 0, borderRadius: '18px', border: '1px solid #E5E5E5', minHeight: '38px', padding: '0 10px', gap: '8px'}}>
++                <Textarea
+                   className="flex-1 text-xl bg-transparent outline-none leading-normal"
+                   placeholder="输入健康问题..."
+                   value={inputText}
+-                  style={{minWidth: 0, height: '36px', maxHeight: '100px', resize: 'none', color: '#333333', lineHeight: '36px', display: 'block', overflowY: 'hidden'}}
++                  adjustPosition
++                  showConfirmBar={false}
++                  cursorSpacing={0}
++                  style={{minWidth: 0, height: `${inputHeight}px`, maxHeight: '88px', resize: 'none', color: '#333333', lineHeight: '20px', display: 'block', overflowY: 'hidden', padding: '5px 0', boxSizing: 'border-box'}}
+                   onInput={(e) => {
+                     const ev = e as any
+-                    setInputText(ev.detail?.value ?? ev.target?.value ?? '')
+-                    const target = ev.target as HTMLTextAreaElement
+-                    if (target) { target.style.height = '36px'; target.style.height = `${Math.min(target.scrollHeight, 100)}px` }
++                    const nextValue = ev.detail?.value ?? ev.target?.value ?? ''
++                    setInputText(nextValue)
++                    const lineCount = Math.min(Math.max(nextValue.split('\n').length, 1), 4)
++                    setInputHeight(Math.min(88, Math.max(32, 10 + lineCount * 20)))
+                   }}
+                 />
+                 <div className="flex-shrink-0 flex items-center justify-center" style={{width: '28px', height: '28px'}}
+@@ -791,7 +1357,8 @@ function ChatPage() {
+               <button
+                 type="button"
+                 className="flex-shrink-0 flex items-center justify-center leading-none rounded-full transition-colors duration-200"
+-                style={{width: '44px', height: '44px', backgroundColor: (inputText.trim() || pendingImage) && !isLoading && !isUploadingImage ? '#4A7C59' : '#E5E5E5'}}
++                style={{width: '40px', height: '40px', backgroundColor: (inputText.trim() || pendingImage) && !isLoading && !isUploadingImage ? '#4A7C59' : '#E5E5E5'}}
++                onTouchStart={() => unlockRtcAudioPlayback('send-button-touch')}
+                 onClick={handleSendWithImage}
+               >
+                 <div className="i-mdi-arrow-up text-2xl"
+@@ -818,37 +1385,77 @@ function ChatPage() {
+               <div className="rounded-full" style={{width: '40px', height: '4px', backgroundColor: '#DDDDDD'}} />
+             </div>
+             <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
+-              <span className="text-2xl font-semibold text-foreground">对话历史</span>
+-              <div className="i-mdi-close text-2xl text-muted-foreground" onClick={() => setShowDrawer(false)} />
++              <div>
++                <p className="text-2xl font-semibold text-foreground">对话历史</p>
++                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按 30 分钟自动分段</p>
++              </div>
++              <div className="flex items-center gap-4">
++                <button
++                  type="button"
++                  className="flex items-center justify-center leading-none gap-1 text-xl font-medium text-primary border border-primary rounded-lg px-3 active:bg-primary/10 transition"
++                  style={{height: '32px'}}
++                  onClick={() => void loadRtcHistory()}
++                >
++                  <div className={`i-mdi-refresh text-xl ${rtcHistoryLoading ? 'animate-spin' : ''}`} />
++                  <span>刷新</span>
++                </button>
++                <div className="i-mdi-close text-2xl text-muted-foreground" onClick={() => setShowDrawer(false)} />
++              </div>
+             </div>
+             <div className="flex-1 overflow-y-auto">
+-              {sessions.length === 0 ? (
++              {rtcHistoryLoading ? (
++                <div className="flex flex-col items-center justify-center py-12 gap-2">
++                  <div className="i-mdi-loading text-5xl text-muted-foreground" style={{animation: 'spin 1s linear infinite'}} />
++                  <p className="text-xl text-muted-foreground">正在加载 RTC 云端历史...</p>
++                </div>
++              ) : rtcHistoryError ? (
++                <div className="flex flex-col items-center justify-center py-12 gap-3 px-6">
++                  <div className="i-mdi-alert-circle-outline text-5xl text-muted-foreground" />
++                  <p className="text-xl text-muted-foreground text-center">{rtcHistoryError}</p>
++                  <button
++                    type="button"
++                    className="flex items-center justify-center leading-none text-xl font-medium text-primary border border-primary rounded-lg px-4 active:bg-primary/10 transition"
++                    style={{height: '36px'}}
++                    onClick={() => void loadRtcHistory()}
++                  >
++                    重试
++                  </button>
++                </div>
++              ) : !hasAnyHistory ? (
+                 <div className="flex flex-col items-center justify-center py-12 gap-2">
+                   <div className="i-mdi-chat-outline text-5xl text-muted-foreground" />
+-                  <p className="text-xl text-muted-foreground">暂无对话历史</p>
++                  <p className="text-xl text-muted-foreground">暂无 RTC 云端对话历史</p>
+                 </div>
+-              ) : sessions.map(s => (
+-                <div
+-                  key={s.id}
+-                  className={`flex items-center gap-3 px-4 border-b border-border ${activeSession?.id === s.id ? 'bg-primary/10' : ''}`}
+-                  style={{minHeight: '56px'}}
+-                  onClick={() => handleSelectSession(s)}
+-                >
+-                  <div className="i-mdi-chat-outline text-xl text-muted-foreground flex-shrink-0" />
+-                  <div className="flex-1 min-w-0">
+-                    <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+-                      {s.title}
+-                    </p>
+-                    <p className="text-xl text-muted-foreground">
+-                      {new Date(s.updated_at).toLocaleDateString('zh-CN')}
+-                    </p>
+-                  </div>
++              ) : (
++                <>
++                  {rtcHistoryGroups.length > 0 && (
++                    <div>
++                      <div className="px-4 py-2 bg-secondary/60 border-b border-border">
++                        <p className="text-xl font-semibold text-foreground">最近 10 个历史对话</p>
++                      </div>
++                      {rtcHistoryGroups.map(group => (
+                   <div
+-                    className="i-mdi-delete-outline text-2xl text-muted-foreground flex-shrink-0"
+-                    onClick={(e) => { e.stopPropagation(); handleDeleteSession(s.id) }}
+-                  />
+-                </div>
+-              ))}
++                    key={group.id}
++                    className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
++                    style={{minHeight: '56px'}}
++                    onClick={() => handleSelectRtcHistory(group)}
++                  >
++                    <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
++                    <div className="flex-1 min-w-0">
++                      <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
++                        {group.title}
++                      </p>
++                      <p className="text-xl text-muted-foreground">
++                        {formatRtcGroupTime(group)}
++                      </p>
++                    </div>
++                    <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
++                  </div>
++                      ))}
++                    </div>
++                  )}
++                </>
++              )}
+             </div>
+             <div className="px-4 pt-3 pb-tabbar flex-shrink-0">
+               <button
+@@ -868,4 +1475,91 @@ function ChatPage() {
+   )
+ }
+ 
++type PcmStreamPlayer = {
++  append: (buffer: ArrayBuffer) => void
++  finish: () => void
++  stop: () => void
++}
++
++function createPcmStreamPlayer(): PcmStreamPlayer | null {
++  const context = getSharedRtcAudioContext()
++  if (!context?.createBuffer || !context?.createBufferSource || !context?.destination) {
++    console.warn('RTC TTS 实时播放不可用：当前环境不支持 createWebAudioContext')
++    return null
++  }
++
++  let closed = false
++  let nextStartAt = 0
++  let cleanupTimer: ReturnType<typeof setTimeout> | null = null
++  let loggedFirstFrame = false
++  const activeSources = new Set<any>()
++  const sampleRate = 16000
++
++  const clearCleanupTimer = () => {
++    if (cleanupTimer) clearTimeout(cleanupTimer)
++    cleanupTimer = null
++  }
++
++  unlockRtcAudioPlayback('stream-player-create')
++
++  return {
++    append(buffer: ArrayBuffer) {
++      if (closed || buffer.byteLength < 2) return
++      try {
++        unlockRtcAudioPlayback('stream-audio-frame')
++        const sampleCount = Math.floor(buffer.byteLength / 2)
++        const audioBuffer = context.createBuffer(1, sampleCount, sampleRate)
++        const channel = audioBuffer.getChannelData(0)
++        const view = new DataView(buffer)
++        for (let i = 0; i < sampleCount; i += 1) {
++          channel[i] = Math.max(-1, Math.min(1, view.getInt16(i * 2, true) / 32768))
++        }
++
++        const source = context.createBufferSource()
++        source.buffer = audioBuffer
++        source.connect(context.destination)
++        activeSources.add(source)
++        source.onended = () => activeSources.delete(source)
++        const currentTime = Number(context.currentTime || 0)
++        if (nextStartAt < currentTime + 0.03) nextStartAt = currentTime + 0.04
++        source.start(nextStartAt)
++        if (!loggedFirstFrame) {
++          loggedFirstFrame = true
++          console.info('RTC TTS 实时播放已调度首帧', {
++            currentTime,
++            startAt: nextStartAt,
++            startupDelayMs: Math.max(0, Math.round((nextStartAt - currentTime) * 1000)),
++            chunkBytes: buffer.byteLength,
++          })
++        }
++        nextStartAt += audioBuffer.duration || sampleCount / sampleRate
++      } catch (err: any) {
++        closed = true
++        clearCleanupTimer()
++        console.warn('RTC TTS 流式播放不可用，已降级为完整文件播放:', err?.message || err)
++      }
++    },
++    finish() {
++      if (closed) return
++      const currentTime = Number(context.currentTime || 0)
++      const delayMs = Math.max(300, Math.ceil((nextStartAt - currentTime + 0.3) * 1000))
++      clearCleanupTimer()
++      cleanupTimer = setTimeout(() => {
++        closed = true
++        cleanupTimer = null
++      }, delayMs)
++    },
++    stop() {
++      closed = true
++      clearCleanupTimer()
++      activeSources.forEach((source) => {
++        try {
++          source.stop?.()
++        } catch {}
++      })
++      activeSources.clear()
++    },
++  }
++}
++
+ export default withRouteGuard(ChatPage)
+diff --git a/src/pages/family-edit/index.tsx b/src/pages/family-edit/index.tsx
+index ca73c1cde0289421d10721f38a5b5a0bd99d7c2c..13a2018d6c6db8e70444f8c64696636b42b1f91b 100644
+--- a/src/pages/family-edit/index.tsx
++++ b/src/pages/family-edit/index.tsx
+@@ -126,8 +126,8 @@ function FamilyEditPage() {
+                 <button
+                   key={g}
+                   type="button"
+-                  className={`flex items-center justify-center leading-none text-xl px-6 rounded-xl border-2 transition ${form.gender === g ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+-                  style={{height: '40px'}}
++                  className={`flex items-center justify-center leading-none text-xl px-6 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${form.gender === g ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
++                  style={{height: '40px', ...(form.gender === g ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                   onClick={() => setForm({...form, gender: g})}
+                 >{label}</button>
+               ))}
+@@ -188,8 +188,8 @@ function FamilyEditPage() {
+               <button
+                 key={d}
+                 type="button"
+-                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition ${(form.chronic_diseases || []).includes(d) ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+-                style={{height: '36px'}}
++                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${(form.chronic_diseases || []).includes(d) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
++                style={{height: '36px', ...((form.chronic_diseases || []).includes(d) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                 onClick={() => toggleDisease(d)}
+               >{d}</button>
+             ))}
+@@ -207,8 +207,8 @@ function FamilyEditPage() {
+               <button
+                 key={a}
+                 type="button"
+-                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition ${(form.allergens || []).includes(a) ? 'border-destructive bg-destructive/10 text-destructive' : 'border-border bg-secondary text-muted-foreground'}`}
+-                style={{height: '36px'}}
++                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${(form.allergens || []).includes(a) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
++                style={{height: '36px', ...((form.allergens || []).includes(a) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                 onClick={() => toggleAllergen(a)}
+               >{a}</button>
+             ))}
+diff --git a/src/pages/home/index.tsx b/src/pages/home/index.tsx
+index d9f3a3b19b6cc2934841ec5a0325f4b9d5b6e353..616f94f5345cbe3748d9eab788e3764a4c89aa4e 100644
+--- a/src/pages/home/index.tsx
++++ b/src/pages/home/index.tsx
+@@ -2,7 +2,7 @@
+ 
+ import {Image} from '@tarojs/components'
+ import Taro, {useDidShow} from '@tarojs/taro'
+-import {useCallback, useEffect, useRef, useState } from 'react'
++import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import {supabase} from '@/client/supabase'
+ import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
+ import {DisclaimerModal} from '@/components/DisclaimerModal'
+@@ -11,23 +11,60 @@ import {withRouteGuard} from '@/components/RouteGuard'
+ import {useAuth} from '@/contexts/AuthContext'
+ import {createWeighingRecord, getDevices, getWeighingRecords, updateProfile } from '@/db/api'
+ import type {Ingredient, WeighingRecord } from '@/db/types'
+-import {getAiWebSocket} from '@/services/aiWebSocket'
++import {getAiWebSocket, type AgentProfile} from '@/services/aiWebSocket'
+ import {useAppStore} from '@/store/appStore'
+-import {buildHealthContext, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
++import {buildFamilyHealthContext, checkAllergens, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
++import {buildFoodRecognitionPrompt, parseRecognizedFoods} from '@/utils/aiPromptHelpers'
++import {stripLeadingJsonMetadata} from '@/utils/markdownText'
++import {extractNutritionValues, NUTRITION_RECORDS_UPDATED} from '@/utils/nutrition'
++import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
+ import {bleMockService} from '@/utils/bleMock'
+ import type {WeightUnit} from '@/utils/bleService'
+ import {bleService} from '@/utils/bleService'
+-import {CHAT_CFG, VOICE_CFG} from '@/utils/brtcConfig'
++
++const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
++
++function formatNumber(value: number | null, digits = 1): string {
++  if (value == null || !Number.isFinite(value)) return '--'
++  return Number.isInteger(value) ? String(value) : value.toFixed(digits).replace(/\.0$/, '')
++}
++
++function buildAnalysisFallbackMarkdown(params: {
++  nutrition: ReturnType<typeof extractNutritionValues>
++  personCount: number
++  memberNames: string[]
++}): string {
++  const {nutrition, personCount, memberNames} = params
++  const perPerson = {
++    calories: nutrition.calories == null ? null : nutrition.calories / personCount,
++    protein: nutrition.protein == null ? null : nutrition.protein / personCount,
++    fat: nutrition.fat == null ? null : nutrition.fat / personCount,
++    carbs: nutrition.carbs == null ? null : nutrition.carbs / personCount,
++  }
++  const names = memberNames.length > 0 ? memberNames : ['本餐成员']
++  return [
++    '## 营养总览',
++    `| 项目 | 整餐总量 | 人均（${personCount}人平摊） |`,
++    '| --- | --- | --- |',
++    `| 热量 | 约 ${formatNumber(nutrition.calories, 0)} 千卡 | 约 ${formatNumber(perPerson.calories, 0)} 千卡 |`,
++    `| 蛋白质 | 约 ${formatNumber(nutrition.protein)} 克 | 约 ${formatNumber(perPerson.protein)} 克 |`,
++    `| 脂肪 | 约 ${formatNumber(nutrition.fat)} 克 | 约 ${formatNumber(perPerson.fat)} 克 |`,
++    `| 碳水 | 约 ${formatNumber(nutrition.carbs)} 克 | 约 ${formatNumber(perPerson.carbs)} 克 |`,
++    '',
++    '## 综合建议',
++    ...names.map(name => `- **${name}**：本次 AI 仅返回了营养数据，建议结合个人健康档案控制总量，并继续关注过敏源、慢性病和用药相关饮食禁忌。`),
++  ].join('\n')
++}
+ 
+ function HomePage() {
+   const {user, profile, refreshProfile} = useAuth()
+   const {
+-    activeMember, refreshMembers,
++    activeMember, familyMembers, refreshMembers,
+     bleStatus, setBLEStatus, batteryLevel, setBatteryLevel,
+     currentWeight, setCurrentWeight, weightUnit, setWeightUnit,
+-    isWeightStable, setIsWeightStable, hasTare, setHasTare,
++    isWeightStable, setIsWeightStable,
+     ingredients, addIngredient, removeIngredient, clearIngredients,
+-    personCount, setPersonCount, isOnline
++    personCount, selectedMealMemberIds, setSelectedMealMemberIds, isOnline
+   } = useAppStore()
+ 
+   const [showDisclaimer, setShowDisclaimer] = useState(false)
+@@ -45,8 +82,32 @@ function HomePage() {
+   const [allergenWarning, setAllergenWarning] = useState('')
+   const [recognizing, setRecognizing] = useState(false)
+   const [historyRefreshing, setHistoryRefreshing] = useState(false)
++  const [connectedDeviceName, setConnectedDeviceName] = useState('')
++  const [showAnalysisContent, setShowAnalysisContent] = useState(true)
++  const [showMealMemberSelector, setShowMealMemberSelector] = useState(false)
+   const recorderManager = useRef<Taro.RecorderManager | null>(null)
+ 
++  const selectedMealMembers = useMemo(() => {
++    const selected = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
++    if (selected.length > 0) return selected
++    return activeMember ? [activeMember] : []
++  }, [activeMember, familyMembers, selectedMealMemberIds])
++
++  const selectedMealMemberNames = selectedMealMembers.map(member => member.nickname).join('、')
++  const mealAwareIngredients = useMemo(() => {
++    const members = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
++    if (members.length === 0) return ingredients
++    return ingredients.map(ingredient => {
++      const allergenNames = members.flatMap(member => checkAllergens(ingredient.name, member))
++      const uniqueAllergenNames = Array.from(new Set(allergenNames))
++      return {
++        ...ingredient,
++        hasAllergen: uniqueAllergenNames.length > 0,
++        allergenName: uniqueAllergenNames.join('、')
++      }
++    })
++  }, [activeMember, ingredients, selectedMealMembers])
++
+   // 检查免责声明；已同意过的用户直接标记 confirmed 允许 BLE 初始化
+   useEffect(() => {
+     if (!profile) return
+@@ -75,8 +136,11 @@ function HomePage() {
+     // 监听未运行时启动监听（不受 bleStatus 限制）
+     if (!bleService.isListening) {
+       if (devices.length > 0) {
++        setConnectedDeviceName(devices[0].device_name || '')
+         tryConnectDeviceRef.current(devices[0].device_id)
+       }
++    } else if (devices.length > 0) {
++      setConnectedDeviceName(devices[0].device_name || '')
+     }
+   }, [user, activeMember?.id, refreshMembers])
+ 
+@@ -91,6 +155,9 @@ function HomePage() {
+       onConnectionChange: (connected) => {
+         setBLEStatus(connected ? 'connected' : 'disconnected')
+       },
++      onDeviceNameUpdate: (name) => {
++        if (name) setConnectedDeviceName(name)
++      },
+     })
+     loadData()
+   })
+@@ -111,6 +178,9 @@ function HomePage() {
+       onConnectionChange: (connected) => {
+         setBLEStatus(connected ? 'connected' : 'disconnected')
+       },
++      onDeviceNameUpdate: (name) => {
++        if (name) setConnectedDeviceName(name)
++      },
+     })
+     if (isMock) {
+       await service.connect(deviceId)
+@@ -134,11 +204,17 @@ function HomePage() {
+ 
+   // 过敏源预警检查
+   useEffect(() => {
+-    const enriched = enrichIngredientsWithAllergens(ingredients, activeMember)
+-    const warned = enriched.filter(i => i.hasAllergen).map(i => i.allergenName || '').filter(Boolean)
+-    setAllergenWarning(warned.join('、'))
++    const members = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
++    const warned = members.flatMap(member => {
++      const enriched = enrichIngredientsWithAllergens(ingredients, member)
++      return enriched
++        .filter(i => i.hasAllergen)
++        .map(i => i.allergenName ? `${member.nickname}：${i.allergenName}` : '')
++        .filter(Boolean)
++    })
++    setAllergenWarning(Array.from(new Set(warned)).join('、'))
+     setShowAllergenBanner(true)
+-  }, [ingredients, activeMember])
++  }, [ingredients, activeMember, selectedMealMembers])
+ 
+   const handleAddIngredient = () => {
+     if (!foodName.trim()) {
+@@ -153,11 +229,29 @@ function HomePage() {
+     const base = {name: foodName.trim(), weight: w, unit: weightUnit, image_url: currentIngredientImageUrl ?? null}
+     const enriched = enrichIngredientsWithAllergens([base], activeMember)
+     addIngredient(enriched[0])
++    if (familyMembers.length > 0 && selectedMealMembers.length === 0 && activeMember) {
++      setSelectedMealMemberIds([activeMember.id])
++    }
+     setFoodName('')
+     setManualWeight('')
+     setCurrentIngredientImageUrl(null)
+   }
+ 
++  const toggleMealMember = (memberId: string) => {
++    const selected = selectedMealMemberIds.length > 0
++      ? selectedMealMemberIds
++      : (activeMember ? [activeMember.id] : [])
++    if (selected.includes(memberId)) {
++      if (selected.length <= 1) {
++        Taro.showToast({title: '至少选择1位用餐成员', icon: 'none'})
++        return
++      }
++      setSelectedMealMemberIds(selected.filter(id => id !== memberId))
++      return
++    }
++    setSelectedMealMemberIds([...selected, memberId])
++  }
++
+   // 读取文件为base64（小程序专用）
+   const readFileAsBase64 = (filePath: string): Promise<{base64: string; size: number}> => {
+     return new Promise((resolve, reject) => {
+@@ -195,14 +289,22 @@ function HomePage() {
+     })
+   }
+ 
+-  const parseRecognizedFoods = (raw: string): string[] => {
+-    return raw
+-      .replace(/\[M\]:/g, '')
+-      .replace(/让我想想啊[.。]*/g, '')
+-      .replace(/图片中(?:的)?(?:水果|食材|食物)(?:是|包括|有)[:：]*/g, '')
+-      .split(/[\n、，,]/)
+-      .map(s => s.trim().replace(/^[\d.、\-*]+\s*/, '').replace(/[。.!！]+$/g, ''))
+-      .filter(Boolean)
++  const connectDefaultAgent = async (ws: ReturnType<typeof getAiWebSocket>, agentProfile: AgentProfile, attempts = 2) => {
++    let lastError: unknown
++    for (let attempt = 1; attempt <= attempts; attempt += 1) {
++      try {
++        await ws.connect({mode: 'default', agentProfile, userId: user?.id})
++        return
++      } catch (err) {
++        lastError = err
++        ws.disconnect()
++        if (attempt < attempts) {
++          console.warn('AI WebSocket 连接失败，准备重试:', (err as any)?.message || err)
++          await wait(500)
++        }
++      }
++    }
++    throw lastError instanceof Error ? lastError : new Error('AI WebSocket connect failed')
+   }
+ 
+   const handleVoiceInput = () => {
+@@ -220,10 +322,9 @@ function HomePage() {
+       setRecognizing(true)
+       const ws = getAiWebSocket()
+       try {
+-        await ws.connect({cfg: VOICE_CFG})
++        await connectDefaultAgent(ws, 'voice-ptt')
+         const {base64} = await readFileAsBase64(res.tempFilePath)
+         const buffer = Taro.base64ToArrayBuffer(base64)
+-        ws.sendAudio(buffer)
+         const text = await new Promise<string>((resolve, reject) => {
+           const timeout = setTimeout(() => { unsub(); reject(new Error('ASR timeout')) }, 15000)
+           const unsub = ws.onMessage('asr-final', (data) => {
+@@ -231,6 +332,16 @@ function HomePage() {
+             unsub()
+             resolve(data as string)
+           })
++          void (async () => {
++            await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
++            await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
++            await ws.sendAudio(buffer)
++            await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
++          })().catch((error) => {
++            clearTimeout(timeout)
++            unsub()
++            reject(error)
++          })
+         })
+         if (text.trim()) {
+           setFoodName(text.trim())
+@@ -257,6 +368,7 @@ function HomePage() {
+       Taro.showToast({title: '需要网络连接', icon: 'none'})
+       return
+     }
++    let loadingShown = false
+     try {
+       const res = await Taro.chooseMedia({count: 1, mediaType: ['image'], sourceType: ['album', 'camera']})
+       if (!res.tempFiles?.[0]) return
+@@ -264,6 +376,7 @@ function HomePage() {
+ 
+       // Step 1: 压缩图片
+       Taro.showLoading({title: '图片压缩中...'})
++      loadingShown = true
+       let compressedPath = res.tempFiles[0].tempFilePath
+       try {
+         const compressRes = await Taro.compressImage({src: compressedPath, quality: 80})
+@@ -282,20 +395,23 @@ function HomePage() {
+       const ws = getAiWebSocket()
+       const [recognizeResult, uploadResult] = await Promise.allSettled([
+         (async () => {
+-          await ws.connect({mode: 'default'})
+-          const result = await ws.requestImageResponse({
+-            triggerText: '请识别刚才上传图片里的食材/食物名称，每行一个，只输出名称。',
+-            imageBase64: base64Image,
+-            fileName: `food.${ext}`,
+-            finalText: '图片已经上传，请识别图片中的所有食材/食物名称，每行一个，只输出名称。'
+-          })
+-          ws.disconnect()
+-          return result
++          try {
++            await connectDefaultAgent(ws, 'vision')
++            return await ws.requestImageResponse({
++              triggerText: buildFoodRecognitionPrompt('trigger'),
++              imageBase64: base64Image,
++              fileName: `food.${ext}`,
++              finalText: buildFoodRecognitionPrompt('final')
++            })
++          } finally {
++            ws.disconnect()
++          }
+         })(),
+         supabase.functions.invoke('upload-food-image', {body: {image: base64Image, ext}})
+       ])
+ 
+       Taro.hideLoading()
++      loadingShown = false
+ 
+       // 处理上传结果
+       let uploadedImageUrl: string | null = null
+@@ -318,8 +434,14 @@ function HomePage() {
+         Taro.showToast({title: '未识别到食材，请光线充足正面拍摄', icon: 'none'})
+       }
+     } catch (err: any) {
+-      Taro.hideLoading()
++      if (loadingShown) Taro.hideLoading()
+       setCurrentIngredientImageUrl(null)
++      if (isUserCancelError(err)) return
++      if (isPrivacyScopeError(err)) {
++        console.warn('拍照识别隐私配置缺失:', err)
++        showPrivacyScopeDeclarationTip('相册/摄像头')
++        return
++      }
+       console.error('拍照识别失败:', err?.message || err)
+       Taro.showToast({title: '识别失败，请重新拍摄', icon: 'none'})
+     } finally {
+@@ -339,52 +461,62 @@ function HomePage() {
+     }
+     setIsAnalyzing(true)
+     setAnalysisResult('')
+-    const healthCtx = buildHealthContext(activeMember)
+-    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${personCount}人食用）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":数值,"protein":数值,"fat":数值,"carbs":数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs单位为g。然后用Markdown格式输出详细分析。`
++    setShowAnalysisContent(true)
++    const analysisMembers = selectedMealMembers.length > 0 ? selectedMealMembers : (activeMember ? [activeMember] : [])
++    const analysisPersonCount = Math.max(1, analysisMembers.length || personCount)
++    const healthCtx = buildFamilyHealthContext(analysisMembers)
++    const mealMemberText = analysisMembers.length > 0
++      ? `用餐成员：${analysisMembers.map(member => member.nickname).join('、')}`
++      : `用餐人数：${analysisPersonCount}人`
++    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${analysisPersonCount}人食用，${mealMemberText}）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n请先估算整餐总营养，再按${analysisPersonCount}人平摊。综合建议需要结合每位已选成员的健康档案，分别提示过敏源、慢性病、用药或营养目标相关注意事项。\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":整餐总热量数值,"protein":整餐总蛋白质数值,"fat":整餐总脂肪数值,"carbs":整餐总碳水数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs单位为g。\n\nJSON代码块后必须输出 Markdown 正文，不要输出纯文本。请严格使用以下简单 Markdown 结构：\n## 营养总览\n| 项目 | 整餐总量 | 人均（${analysisPersonCount}人平摊） |\n| --- | --- | --- |\n| 热量 | 约 xx 千卡 | 约 xx 千卡 |\n| 蛋白质 | 约 xx 克 | 约 xx 克 |\n| 脂肪 | 约 xx 克 | 约 xx 克 |\n| 碳水 | 约 xx 克 | 约 xx 克 |\n\n## 综合建议\n- **成员名**：结合健康档案给出建议。\n- **注意事项**：提示过敏源、慢性病、用药或营养目标相关注意事项。`
+ 
+     try {
+       const ws = getAiWebSocket()
+-      await ws.connect({cfg: CHAT_CFG})
+-      const result = await ws.requestResponse(prompt)
+-      ws.disconnect()
+-      const cleanResult = result.replace(/```json[\s\S]*?```\s*/g, '').trimStart()
+-      setAnalysisResult(cleanResult)
+-
+-      let parsed: {calories?: number; protein?: number; fat?: number; carbs?: number} = {}
+-
+-      const jsonBlock = result.match(/```json\s*([\s\S]*?)```/)
+-      if (jsonBlock) {
+-        try {
+-          parsed = JSON.parse(jsonBlock[1].trim())
+-        } catch {
+-          parsed = {}
+-        }
++      let result = ''
++      try {
++        await connectDefaultAgent(ws, 'chat')
++        result = await ws.requestResponse(prompt, {
++          onInterim: (text) => {
++            const interimResult = stripLeadingJsonMetadata(text)
++            if (interimResult) setAnalysisResult(interimResult)
++          }
++        })
++      } finally {
++        ws.disconnect()
+       }
+ 
+-      const caloriesRe = /(?:热量|总热量|能量)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*(?:kcal|千卡|大卡|Cal|cal)/i
+-      const proteinRe = /(?:蛋白质)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
+-      const fatRe = /(?:脂肪|脂坊)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
+-      const carbsRe = /(?:碳水[化合物]?|碳水)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
+-
+-      const caloriesMatch = !parsed.calories ? result.match(caloriesRe) : null
+-      const proteinMatch = !parsed.protein ? result.match(proteinRe) : null
+-      const fatMatch = !parsed.fat ? result.match(fatRe) : null
+-      const carbsMatch = !parsed.carbs ? result.match(carbsRe) : null
+-
+-      await createWeighingRecord({
+-        user_id: user!.id,
+-        member_id: activeMember?.id || null,
+-        ingredients: list,
+-        person_count: personCount,
+-        analysis_result: cleanResult,
+-        total_calories: parsed.calories ?? (caloriesMatch ? parseFloat(caloriesMatch[1]) : null),
+-        protein: parsed.protein ?? (proteinMatch ? parseFloat(proteinMatch[1]) : null),
+-        fat: parsed.fat ?? (fatMatch ? parseFloat(fatMatch[1]) : null),
+-        carbs: parsed.carbs ?? (carbsMatch ? parseFloat(carbsMatch[1]) : null),
++      const nutrition = extractNutritionValues(result)
++      const cleanResult = stripLeadingJsonMetadata(result) || buildAnalysisFallbackMarkdown({
++        nutrition,
++        personCount: analysisPersonCount,
++        memberNames: analysisMembers.map(member => member.nickname),
+       })
++      setAnalysisResult(cleanResult)
++      const perPersonNutrition = {
++        total_calories: nutrition.calories == null ? null : nutrition.calories / analysisPersonCount,
++        protein: nutrition.protein == null ? null : nutrition.protein / analysisPersonCount,
++        fat: nutrition.fat == null ? null : nutrition.fat / analysisPersonCount,
++        carbs: nutrition.carbs == null ? null : nutrition.carbs / analysisPersonCount,
++      }
++
++      const recordMembers = analysisMembers.length > 0 ? analysisMembers : [null]
++      const savedRecords = await Promise.all(recordMembers.map(member => createWeighingRecord({
++          user_id: user!.id,
++          member_id: member?.id || null,
++          ingredients: list,
++          person_count: analysisPersonCount,
++          analysis_result: cleanResult,
++          ...perPersonNutrition,
++        })
++      ))
++      if (savedRecords.every(record => !record)) {
++        Taro.showToast({title: '分析完成，但记录保存失败', icon: 'none'})
++        console.warn('营养分析记录未能保存，统计页不会更新', {nutrition: perPersonNutrition})
++      }
+ 
+       const records = await getWeighingRecords(user!.id, activeMember?.id)
+       setHistory(records)
++      Taro.eventCenter.trigger(NUTRITION_RECORDS_UPDATED)
+     } catch (err: any) {
+       console.error('AI分析失败:', err?.message || err)
+       Taro.showToast({title: '分析失败，请检查网络后重试', icon: 'none'})
+@@ -399,11 +531,7 @@ function HomePage() {
+   }
+ 
+   const handleContinueChat = () => {
+-    const ctx = encodeURIComponent(JSON.stringify({
+-      ingredients,
+-      analysis: analysisResult
+-    }))
+-    Taro.navigateTo({url: `/pages/chat/index?context=${ctx}`})
++    Taro.switchTab({url: '/pages/chat/index'})
+   }
+ 
+   const bleStatusColor = bleStatus === 'connected' ? 'bg-primary' : bleStatus === 'connecting' ? 'bg-warning animate-breathe' : 'bg-muted-foreground'
+@@ -447,9 +575,11 @@ function HomePage() {
+             >
+               <div className={`w-2 h-2 rounded-full flex-shrink-0 ${bleStatusColor}`} />
+               <span className="text-xl text-white/80">{bleStatusText}</span>
+-              {activeMember && bleStatus === 'connected' && (
++              {bleStatus === 'connected' && connectedDeviceName ? (
++                <span className="text-xl text-white/70">· {connectedDeviceName}</span>
++              ) : activeMember && bleStatus === 'connected' ? (
+                 <span className="text-xl text-white/70">· {activeMember.nickname}</span>
+-              )}
++              ) : null}
+               {batteryLevel > 0 && bleStatus === 'connected' && (
+                 <div className="flex items-center gap-1 ml-1">
+                   <div className="i-mdi-battery text-xl text-white/70" />
+@@ -459,25 +589,17 @@ function HomePage() {
+             </div>
+             {/* 单位切换 */}
+             <div className="flex gap-1">
+-              {(['g', 'kg'] as const).map(u => (
++              {(['g', 'oz', 'lb', 'ml'] as const).map(u => (
+                 <button
+                   key={u}
+                   type="button"
+-                  className={`flex items-center justify-center leading-none text-xl rounded-lg px-3 transition ${weightUnit === u ? 'bg-white text-primary font-semibold' : 'text-white/70'}`}
++                  className={`flex items-center justify-center leading-none text-xl rounded-lg px-2 transition active:scale-95 ${weightUnit === u ? 'bg-white text-primary font-semibold' : 'text-white/70'}`}
+                   style={{height: '32px'}}
+                   onClick={() => setWeightUnit(u as WeightUnit)}
+                 >
+                   {u}
+                 </button>
+               ))}
+-              {(weightUnit === 'lb' || weightUnit === 'oz' || weightUnit === 'ml') && (
+-                <div
+-                  className="flex items-center justify-center leading-none text-xl rounded-lg px-3 bg-white text-primary font-semibold"
+-                  style={{height: '32px'}}
+-                >
+-                  {weightUnit}
+-                </div>
+-              )}
+             </div>
+           </div>
+ 
+@@ -488,7 +610,6 @@ function HomePage() {
+               <span className="text-xl text-white/70">
+                 {isWeightStable ? '已稳定' : '稳定中...'}
+               </span>
+-              {hasTare && <span className="text-xl text-white/70 ml-2">已去皮</span>}
+             </div>
+           </div>
+ 
+@@ -505,39 +626,20 @@ function HomePage() {
+             )}
+           </div>
+ 
+-          {/* 去皮按钮 */}
+-          <div className="flex gap-3 mt-2">
+-            {(() => {
+-              const canTare = bleStatus === 'connected' && isWeightStable
+-              return (
+-                <button
+-                  type="button"
+-                  className={`flex-1 flex items-center justify-center leading-none gap-2 text-xl font-semibold rounded-xl border-2 transition active:scale-95 ${canTare ? 'bg-white text-primary border-white shadow-lg' : 'bg-white/30 text-white/50 border-white/20'}`}
+-                  style={{height: '48px'}}
+-                  onClick={() => {
+-                    if (!canTare) return
+-                    setHasTare(true)
+-                    setCurrentWeight(0)
+-                    Taro.showToast({title: '已去皮', icon: 'success'})
+-                  }}
+-                >
+-                  <div className="i-mdi-scale-balance text-xl" />
+-                  <span>去皮</span>
+-                </button>
+-              )
+-            })()}
+-            {bleStatus !== 'connected' && (
++          {/* 连接设备按钮（未连接时显示） */}
++          {bleStatus !== 'connected' && (
++            <div className="flex gap-3 mt-2">
+               <button
+                 type="button"
+-                className="flex-1 flex items-center justify-center leading-none gap-2 text-xl font-medium rounded-xl border-2 border-white/40 text-white"
++                className="flex-1 flex items-center justify-center leading-none gap-2 text-xl font-medium rounded-xl border-2 border-white/40 text-white active:scale-95 active:opacity-80 transition"
+                 style={{height: '44px'}}
+                 onClick={() => Taro.navigateTo({url: '/pages/device-add/index'})}
+               >
+                 <div className="i-mdi-bluetooth-connect text-xl" />
+                 <span>连接设备</span>
+               </button>
+-            )}
+-          </div>
++            </div>
++          )}
+         </div>
+ 
+         {/* 食材录入区 */}
+@@ -606,24 +708,67 @@ function HomePage() {
+ 
+         {/* 用餐人数 */}
+         {ingredients.length > 0 && (
+-          <div className="bg-card rounded-2xl px-4 py-3 shadow-elegant flex items-center justify-between">
+-            <div className="flex items-center gap-2">
+-              <div className="i-mdi-account-group text-2xl text-primary" />
+-              <span className="text-xl text-foreground">用餐人数</span>
+-            </div>
+-            <div className="flex items-center gap-4">
+-              <button
+-                type="button"
+-                className={`flex items-center justify-center leading-none w-10 h-10 rounded-full border-2 text-2xl font-semibold transition ${personCount <= 1 ? 'border-border text-muted-foreground' : 'border-primary text-primary'}`}
+-                onClick={() => personCount > 1 && setPersonCount(personCount - 1)}
+-              >-</button>
+-              <span className="text-2xl font-bold text-foreground w-8 text-center">{personCount}</span>
++          <div className="bg-card rounded-2xl p-4 shadow-elegant">
++            <div className="flex items-center justify-between gap-3">
++              <div className="flex items-center gap-2 min-w-0">
++                <div className="i-mdi-account-group text-2xl text-primary flex-shrink-0" />
++                <div className="min-w-0">
++                  <div className="flex items-center gap-2">
++                    <span className="text-xl text-foreground">用餐人数</span>
++                    <span className="text-2xl font-bold text-foreground">{personCount}</span>
++                  </div>
++                  <p className="text-xl text-muted-foreground truncate" style={{maxWidth: '210px'}}>
++                    {selectedMealMemberNames || '请选择用餐成员'}
++                  </p>
++                </div>
++              </div>
+               <button
+                 type="button"
+-                className={`flex items-center justify-center leading-none w-10 h-10 rounded-full border-2 text-2xl font-semibold transition ${personCount >= 20 ? 'border-border text-muted-foreground' : 'border-primary text-primary'}`}
+-                onClick={() => personCount < 20 && setPersonCount(personCount + 1)}
+-              >+</button>
++                className="flex items-center justify-center leading-none gap-1 text-xl font-medium border-2 border-primary text-primary rounded-xl px-3 flex-shrink-0"
++                style={{height: '36px'}}
++                onClick={() => setShowMealMemberSelector(v => !v)}
++              >
++                <div className={showMealMemberSelector ? 'i-mdi-chevron-up text-xl' : 'i-mdi-plus text-xl'} />
++                <span>{showMealMemberSelector ? '收起' : '添加用餐人数'}</span>
++              </button>
+             </div>
++
++            {showMealMemberSelector && (
++              <div className="mt-3 pt-3 border-t border-border">
++                {familyMembers.length === 0 ? (
++                  <div className="flex items-center justify-between gap-3">
++                    <span className="text-xl text-muted-foreground">暂无家庭成员</span>
++                    <button
++                      type="button"
++                      className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
++                      style={{height: '34px'}}
++                      onClick={() => Taro.navigateTo({url: '/pages/family/index'})}
++                    >去管理</button>
++                  </div>
++                ) : (
++                  <div className="flex flex-wrap gap-2">
++                    {familyMembers.map(member => {
++                      const selectedIds = selectedMealMemberIds.length > 0
++                        ? selectedMealMemberIds
++                        : (activeMember ? [activeMember.id] : [])
++                      const isSelected = selectedIds.includes(member.id)
++                      return (
++                        <button
++                          key={member.id}
++                          type="button"
++                          className={`flex items-center justify-center leading-none gap-1 text-xl rounded-xl border-2 px-3 transition active:scale-95 ${isSelected ? 'border-primary' : 'bg-secondary border-border text-foreground'}`}
++                          style={{height: '36px', ...(isSelected ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
++                          onClick={() => toggleMealMember(member.id)}
++                        >
++                          <div className={isSelected ? 'i-mdi-checkbox-marked-circle text-xl' : 'i-mdi-checkbox-blank-circle-outline text-xl'} />
++                          <span>{member.nickname}</span>
++                        </button>
++                      )
++                    })}
++                  </div>
++                )}
++              </div>
++            )}
+           </div>
+         )}
+ 
+@@ -639,7 +784,7 @@ function HomePage() {
+               >清空</button>
+             </div>
+             <div className="flex flex-col gap-2">
+-              {ingredients.map((ing, idx) => (
++              {mealAwareIngredients.map((ing, idx) => (
+                 <div key={idx} className={`flex items-center gap-3 py-3 px-3 rounded-xl ${ing.hasAllergen ? 'bg-destructive/10 border border-destructive/30' : 'bg-secondary'}`}>
+                   <div
+                     className="flex-shrink-0 overflow-hidden"
+@@ -665,7 +810,7 @@ function HomePage() {
+                   <div className="flex-1">
+                     <div className="flex items-center gap-2">
+                       <span className="text-xl font-medium text-foreground">{ing.name}</span>
+-                      {ing.hasAllergen && <div className="i-mdi-alert text-xl text-destructive" />}
++                      {ing.hasAllergen && <div className="i-mdi-alert-circle text-xl" style={{color: '#ef4444'}} />}
+                     </div>
+                     <span className="text-xl text-muted-foreground">{ing.weight} {ing.unit}</span>
+                   </div>
+@@ -712,25 +857,42 @@ function HomePage() {
+ 
+         {/* 分析结果 */}
+         {(isAnalyzing || analysisResult) && (
+-          <div className="bg-card rounded-2xl p-4 shadow-elegant">
+-            <div className="flex items-center gap-2 mb-3">
+-              <div className="i-mdi-chart-donut text-2xl text-primary" />
+-              <span className="text-2xl font-semibold text-foreground">营养分析结果</span>
++          <div id="analysis-result" className="bg-card rounded-2xl p-4 shadow-elegant">
++            <div className="flex items-center justify-between mb-3">
++              <div className="flex items-center gap-2">
++                <div className="i-mdi-chart-donut text-2xl text-primary" />
++                <span className="text-2xl font-semibold text-foreground">营养分析结果</span>
++              </div>
++              {!isAnalyzing && analysisResult && (
++                <button
++                  type="button"
++                  className="flex items-center justify-center leading-none p-1 active:opacity-70"
++                  onClick={() => setShowAnalysisContent(v => !v)}
++                >
++                  <div
++                    className="i-mdi-chevron-down text-2xl text-muted-foreground"
++                    style={{transform: showAnalysisContent ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.25s'}}
++                  />
++                </button>
++              )}
+             </div>
+ 
+-            {isAnalyzing ? (
++            {isAnalyzing && !analysisResult ? (
+               <div className="flex flex-col gap-3 py-4">
+                 {[1,2,3].map(i => (
+                   <div key={i} className="h-6 bg-secondary rounded-lg animate-breathe" />
+                 ))}
+                 <p className="text-xl text-muted-foreground text-center">AI分析中，请稍候...</p>
+               </div>
+-            ) : (
++            ) : showAnalysisContent ? (
+               <>
++                {isAnalyzing && (
++                  <p className="text-xl text-muted-foreground mb-3">AI分析中，正在生成...</p>
++                )}
+                 {allergenWarning && (
+-                  <div className="flex items-start gap-2 p-3 bg-destructive/10 rounded-xl mb-3 border border-destructive/30">
+-                    <div className="i-mdi-alert text-2xl text-destructive flex-shrink-0 mt-0.5" />
+-                    <p className="text-xl text-destructive">含您的过敏原：{allergenWarning}，请谨慎食用</p>
++                  <div className="flex items-start gap-2 p-3 bg-red-50 rounded-xl mb-3 border border-red-400">
++                    <div className="i-mdi-alert-circle text-2xl flex-shrink-0 mt-0.5" style={{color: '#ef4444'}} />
++                    <p className="text-xl" style={{color: '#ef4444'}}>含您的过敏原：{allergenWarning}，请谨慎食用</p>
+                   </div>
+                 )}
+                 <MarkdownRenderer content={analysisResult} />
+@@ -755,7 +917,7 @@ function HomePage() {
+                   </button>
+                 </div>
+               </>
+-            )}
++            ) : null}
+           </div>
+         )}
+ 
+@@ -790,7 +952,8 @@ function HomePage() {
+                 <div className={`i-mdi-refresh text-2xl text-muted-foreground transition ${historyRefreshing ? 'opacity-40' : 'active:text-primary'}`} />
+               </button>
+               <div
+-                className={`i-mdi-chevron-${showHistory ? 'up' : 'down'} text-2xl text-muted-foreground`}
++                className="i-mdi-chevron-down text-2xl text-muted-foreground"
++                style={{transform: showHistory ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.25s'}}
+                 onClick={() => setShowHistory(!showHistory)}
+               />
+             </div>
+@@ -866,6 +1029,10 @@ function HomePage() {
+                       onClick={() => {
+                         if (record.analysis_result) {
+                           setAnalysisResult(record.analysis_result)
++                          setShowAnalysisContent(true)
++                          setTimeout(() => {
++                            Taro.pageScrollTo({selector: '#analysis-result', duration: 300, offsetTop: -16})
++                          }, 100)
+                         }
+                       }}
+                     >查看完整分析</button>
+diff --git a/src/pages/privacy/index.tsx b/src/pages/privacy/index.tsx
+index 14a3c49cbdb4aca82cfa09f921fec7a36a1375a6..176d2dcc8949381042fe56fc8e663cbda796b198 100644
+--- a/src/pages/privacy/index.tsx
++++ b/src/pages/privacy/index.tsx
+@@ -23,13 +23,18 @@ export default function PrivacyPage() {
+         {Section('一、我们收集的信息', [
+           '【账号信息】：您注册时提供的用户名、密码（加密存储，不可逆）。',
+           '【健康档案】：您主动填写的年龄、性别、身高、体重、健康目标等。',
+-          '【饮食记录】：您通过拍照、扫描或手动输入的食材和饮食数据。',
++          '【饮食记录】：您通过拍照、从相册选择图片或手动输入的食材和饮食数据。',
++          '【照片或视频信息】：您主动选择或拍摄的食材图片，仅用于食材识别、图片问答和饮食记录展示。',
++          '【语音信息】：您主动录入的语音内容，仅用于转换为文字并完成语音输入或 AI 问答。',
++          '【蓝牙信息】：用于搜索并连接您的智能秤设备，读取称重数据。',
++          '【剪贴板信息】：仅在您点击复制时写入回答文本，便于您粘贴使用。',
+           '【设备信息】：为兼容不同硬件，我们收集设备型号和操作系统版本（不含设备唯一标识符）。',
+           '【使用日志】：功能使用频率等匿名统计数据，用于产品改进。',
+         ])}
+ 
+         {Section('二、信息使用方式', [
+-          '提供食材识别、营养分析和个性化健康建议等核心功能。',
++          '提供拍照识别食材、相册图片识别、营养分析和个性化健康建议等核心功能。',
++          '在 AI 问答中使用您主动上传的食材图片，以便结合图片内容生成回答。',
+           '生成饮食统计报告，帮助您追踪健康目标进度。',
+           '改善 AI 模型准确性（使用匿名聚合数据，不含个人标识）。',
+           '发送与您服务相关的通知（如饮食提醒）。',
+@@ -44,8 +49,8 @@ export default function PrivacyPage() {
+         ])}
+ 
+         {Section('四、第三方服务', [
+-          '【AI 识别服务】：食材图片会发送至百度 AI 平台进行识别，百度不会保存您的图片。',
+-          '【语音服务】：语音输入内容通过百度语音识别处理，仅用于文字转换，不作他用。',
++          '【AI 识别服务】：您主动拍摄或选择的食材图片会发送至百度 AI 平台进行识别和问答处理。',
++          '【语音服务】：语音输入内容通过百度语音识别处理，仅用于文字转换和 AI 问答。',
+           '以上第三方服务均已签署数据处理协议，受其各自隐私政策约束。',
+         ])}
+ 
+diff --git a/src/pages/recipe/index.tsx b/src/pages/recipe/index.tsx
+index 5692b626eecbeb79cc732dad5c60faec5de1c9da..78738ba1ae32e35298d6109b25865307bdb22ad7 100644
+--- a/src/pages/recipe/index.tsx
++++ b/src/pages/recipe/index.tsx
+@@ -9,7 +9,7 @@ import type {Ingredient} from '@/db/types'
+ import {getAiWebSocket} from '@/services/aiWebSocket'
+ import {useAppStore} from '@/store/appStore'
+ import {buildHealthContext, enrichIngredientsWithAllergens} from '@/utils/allergenUtils'
+-import {CHAT_CFG} from '@/utils/brtcConfig'
++import {normalizeAiMarkdown} from '@/utils/markdownText'
+ 
+ function RecipePage() {
+   const {activeMember, isOnline, ingredients: storeIngredients} = useAppStore()
+@@ -56,22 +56,29 @@ function RecipePage() {
+ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+ 
+ 要求：
+-1. 给出菜名
+-2. 列出所需食材及用量
+-3. 分步骤说明烹饪方法
+-4. 说明该菜肴的营养特点
+-5. 不要使用含过敏原的食材
+-用Markdown格式输出。`
++1. 不要使用含过敏原的食材
++2. 必须使用简单 Markdown 输出，不要输出纯文本
++3. 请严格按以下结构输出：
++# 菜名
++## 食材用量
++- 食材：用量
++## 烹饪步骤
++1. 步骤说明
++## 营养特点
++- **重点**：说明适合人群和注意事项`
+ 
+     try {
+       const ws = getAiWebSocket()
+-      await ws.connect({cfg: CHAT_CFG})
+-      const result = await ws.requestResponse(prompt)
++      await ws.connect({mode: 'default', agentProfile: 'chat'})
++      const result = await ws.requestResponse(prompt, {
++        onInterim: (text) => setRecipeContent(normalizeAiMarkdown(text))
++      })
+       ws.disconnect()
+-      setRecipeContent(result)
++      const cleanResult = normalizeAiMarkdown(result)
++      setRecipeContent(cleanResult)
+ 
+       // 提取菜名
+-      const titleMatch = result.match(/^#\s+(.+)$/m) || result.match(/菜名[：:]\s*(.+)/)
++      const titleMatch = cleanResult.match(/^#\s+(.+)$/m) || cleanResult.match(/菜名[：:]\s*(.+)/)
+       if (titleMatch) setRecipeTitle(titleMatch[1].trim())
+ 
+       // 检查过敏源
+@@ -91,11 +98,7 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+   }, [])
+ 
+   const handleContinueChat = () => {
+-    const ctx = encodeURIComponent(JSON.stringify({
+-      ingredients,
+-      recipe: recipeContent
+-    }))
+-    Taro.navigateTo({url: `/pages/chat/index?context=${ctx}`})
++    Taro.switchTab({url: '/pages/chat/index'})
+   }
+ 
+   return (
+@@ -116,15 +119,15 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+       <div className="px-4 py-4 flex flex-col gap-4">
+         {/* 过敏预警 */}
+         {allergenWarning && (
+-          <div className="flex items-start gap-2 p-3 bg-destructive/10 rounded-xl border border-destructive/30">
+-            <div className="i-mdi-alert text-2xl text-destructive flex-shrink-0 mt-0.5" />
+-            <p className="text-xl text-destructive">含您的过敏原：{allergenWarning}，请谨慎参考</p>
++          <div className="flex items-start gap-2 p-3 rounded-xl border" style={{background: '#fff1f2', borderColor: '#ef4444'}}>
++            <div className="i-mdi-alert-circle text-2xl flex-shrink-0 mt-0.5" style={{color: '#ef4444'}} />
++            <p className="text-xl" style={{color: '#ef4444'}}>含您的过敏原：{allergenWarning}，请谨慎参考</p>
+           </div>
+         )}
+ 
+         {/* 菜谱内容 */}
+         <div className="bg-card rounded-2xl p-4 shadow-elegant">
+-          {loading ? (
++          {loading && !recipeContent ? (
+             <div className="flex flex-col gap-3 py-6">
+               <div className="flex flex-col items-center gap-3">
+                 <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center">
+diff --git a/src/pages/reminder-settings/index.tsx b/src/pages/reminder-settings/index.tsx
+index 1df767c833103c98f492336b3790020fe4ece806..cc843aa63aabe03cce9a513721a7ac38af269160 100644
+--- a/src/pages/reminder-settings/index.tsx
++++ b/src/pages/reminder-settings/index.tsx
+@@ -101,23 +101,29 @@ function ReminderSettingsPage() {
+                   <p className="text-xl font-medium text-foreground">{item.label}</p>
+                   <p className="text-xl text-muted-foreground">{timeVal}</p>
+                 </div>
+-                {/* Toggle — 开启绿色 / 关闭灰色；圆圈28px，四周均留2px间距，完全对称 */}
++                {/* Toggle — 使用固定内边距和 transform，避免小程序样式转换后圆点越界。 */}
+                 <div
+-                  className="relative w-14 h-8 rounded-full flex-shrink-0"
++                  className="relative rounded-full flex-shrink-0"
+                   style={{
++                    width: '44px',
++                    height: '24px',
+                     backgroundColor: isEnabled ? 'hsl(142 40% 34%)' : '#C4C9D4',
+-                    transition: 'background-color 0.2s',
++                    border: `1px solid ${isEnabled ? 'hsl(142 40% 34%)' : '#D6DAE2'}`,
++                    transition: 'background-color 0.2s ease, border-color 0.2s ease',
++                    boxSizing: 'border-box',
+                   }}
+                   onClick={() => toggleReminder(item.key)}
+                 >
+-                  {/* 圆圈直径 28px = 胶囊高度 32px - 上下各 2px；左右端点 left = 2px / 26px */}
+                   <div
+                     className="absolute bg-white rounded-full shadow"
+                     style={{
+-                      width: '28px', height: '28px',
+-                      top: '2px',
+-                      left: isEnabled ? '26px' : '2px',
+-                      transition: 'left 0.2s',
++                      width: '20px',
++                      height: '20px',
++                      top: '1px',
++                      left: '1px',
++                      transform: isEnabled ? 'translateX(20px)' : 'translateX(0)',
++                      transition: 'transform 0.2s ease',
++                      boxShadow: '0 1px 3px rgba(0,0,0,0.18)',
+                     }}
+                   />
+                 </div>
+diff --git a/src/pages/stats/index.tsx b/src/pages/stats/index.tsx
+index f12b1bcc4439131e4639e716127e4e7b7bbe8f39..64f0dd2f6ce6c88626cae7df40453f887aacfe8c 100644
+--- a/src/pages/stats/index.tsx
++++ b/src/pages/stats/index.tsx
+@@ -1,13 +1,13 @@
+ // @title 饮食统计
+-import {useState, useCallback, useEffect, useMemo, useRef} from 'react'
++import {useState, useCallback, useEffect, useMemo} from 'react'
+ import Taro, {useDidShow} from '@tarojs/taro'
+ import {Canvas} from '@tarojs/components'
+ import {useAuth} from '@/contexts/AuthContext'
+ import {useAppStore} from '@/store/appStore'
+ import {withRouteGuard} from '@/components/RouteGuard'
+ import {getNutritionStats} from '@/db/api'
+-import {supabase} from '@/client/supabase'
+ import type {NutritionStats} from '@/db/types'
++import {NUTRITION_RECORDS_UPDATED} from '@/utils/nutrition'
+ 
+ type Period = 'day' | 'week' | 'month'
+ 
+@@ -212,24 +212,13 @@ function StatsPage() {
+   useEffect(() => { loadStats() }, [loadStats])
+   useDidShow(() => { loadStats() })
+ 
+-  // Realtime 订阅 weighing_records，首页新增记录后统计页立即刷新
+-  const realtimeRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+   useEffect(() => {
+-    if (!user) return
+-    const channel = supabase
+-      .channel(`stats-weighing-${user.id}`)
+-      .on(
+-        'postgres_changes',
+-        {event: 'INSERT', schema: 'public', table: 'weighing_records', filter: `user_id=eq.${user.id}`},
+-        () => { loadStats() }
+-      )
+-      .subscribe()
+-    realtimeRef.current = channel
++    const handleRecordsUpdated = () => { loadStats() }
++    Taro.eventCenter.on(NUTRITION_RECORDS_UPDATED, handleRecordsUpdated)
+     return () => {
+-      supabase.removeChannel(channel)
+-      realtimeRef.current = null
++      Taro.eventCenter.off(NUTRITION_RECORDS_UPDATED, handleRecordsUpdated)
+     }
+-  }, [user, loadStats])
++  }, [loadStats])
+ 
+   // 聚合数据 — 直接使用真实数据
+   const effectiveStats = stats

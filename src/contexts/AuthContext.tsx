@@ -1,11 +1,13 @@
 import {createContext, useCallback, useContext, useEffect, useState, type ReactNode} from 'react'
-import Taro from '@tarojs/taro'
 import {supabase} from '@/client/supabase'
 import type {User} from '@supabase/supabase-js'
-
-export interface Profile {
-   [key: string]: unknown;
-}
+import type {Profile} from '@/db/types'
+import {
+  bindWechatAccount,
+  registerWechatAccount,
+  startWechatLogin,
+  type WechatStartResult
+} from '@/services/wechatAuth'
 
 export async function getProfile(userId: string): Promise<Profile | null> {
   const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle()
@@ -26,7 +28,9 @@ interface AuthContextType {
   signUpWithPhone: (phone: string, password: string) => Promise<{error: Error | null}>
   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
-  signInWithWechat: () => Promise<{error: Error | null}>
+  startWechatSignIn: () => Promise<{data: WechatStartResult | null; error: Error | null}>
+  registerWechatSignIn: (ticket: string, phoneCode?: string) => Promise<{error: Error | null}>
+  bindWechatSignIn: (ticket: string) => Promise<{error: Error | null}>
   signOut: () => Promise<void>
   refreshProfile: () => Promise<void>
 }
@@ -150,33 +154,26 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
   }
 
-  const signInWithWechat = async () => {
+  const startWechatSignIn = async () => {
     try {
-      // Check if running in WeChat Mini Program environment
-      if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) {
-        throw new Error('仅支持微信小程序登录，网页端请使用用户名密码登录')
-      }
+      return {data: await startWechatLogin(), error: null}
+    } catch (error) {
+      return {data: null, error: error as Error}
+    }
+  }
 
-      // Get WeChat login code
-      const loginResult = await Taro.login()
+  const registerWechatSignIn = async (ticket: string, phoneCode?: string) => {
+    try {
+      await registerWechatAccount(ticket, phoneCode)
+      return {error: null}
+    } catch (error) {
+      return {error: error as Error}
+    }
+  }
 
-      // Call backend Edge Function for login
-      const {data, error} = await supabase.functions.invoke('wechat_miniapp_login', {
-        body: {code: loginResult?.code}
-      })
-
-      if (error) {
-        const errorMsg = (await error?.context?.text?.()) || error.message
-        throw new Error(errorMsg)
-      }
-
-      // Verify OTP token
-      const {error: verifyError} = await supabase.auth.verifyOtp({
-        token_hash: data.token,
-        type: 'magiclink'
-      })
-
-      if (verifyError) throw verifyError
+  const bindWechatSignIn = async (ticket: string) => {
+    try {
+      await bindWechatAccount(ticket)
       return {error: null}
     } catch (error) {
       return {error: error as Error}
@@ -200,7 +197,9 @@ export function AuthProvider({children}: {children: ReactNode}) {
         signUpWithPhone,
         signInWithPhone,
         verifyPhoneOtp,
-        signInWithWechat,
+        startWechatSignIn,
+        registerWechatSignIn,
+        bindWechatSignIn,
         signOut,
         refreshProfile
       }}>

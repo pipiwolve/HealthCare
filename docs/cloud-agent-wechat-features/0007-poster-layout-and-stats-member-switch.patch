@@ -1,0 +1,304 @@
+diff --git a/scripts/checkWechatFeatures.mjs b/scripts/checkWechatFeatures.mjs
+index e202f35..a993a35 100644
+--- a/scripts/checkWechatFeatures.mjs
++++ b/scripts/checkWechatFeatures.mjs
+@@ -16,6 +16,7 @@ const dispatchFunction = read('supabase/functions/wechat-notification-dispatch/i
+ const recipePage = read('src/pages/recipe/index.tsx')
+ const recipeSharePage = read('src/pages/recipe-share/index.tsx')
+ const poster = read('src/utils/recipePoster.ts')
++const statsPage = read('src/pages/stats/index.tsx')
+ const migration = read('supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql')
+ 
+ assert(supabaseClient.includes('storage: taroAuthStorage') && supabaseClient.includes('persistSession: true'), 'Supabase auth must persist through Taro storage')
+@@ -34,6 +35,10 @@ assert(recipePage.includes('createRecipeShare') && recipePage.includes('generate
+ assert(recipeSharePage.includes('getRecipeShare') && recipeSharePage.includes('useShareTimeline'), 'Public recipe page must load and support onward sharing')
+ assert(poster.includes('card: {width: 1000, height: 800}') && poster.includes('poster: {width: 1080, height: 1440}'), 'Poster renderer must expose the required dimensions')
+ assert(poster.includes("ctx.setFillStyle('#FFFFFF')\n  ctx.fillRect(0, 0, width, height)\n  drawBackgroundCover("), 'Poster renderer must paint an opaque white base before the template')
++assert(poster.includes("panelMargin = variant === 'poster' ? 32 : 36") && poster.includes('maxLinesPerItem') && poster.includes("variant === 'poster' ? 3 : 2"), 'Poster renderer must use the full canvas and wrap recipe steps across multiple lines')
++
++assert(statsPage.includes('familyMembers, loadingMembers, setActiveMemberById') && statsPage.includes('showMemberPicker') && statsPage.includes('handleSelectMember') && statsPage.includes('切换查看成员'), 'Stats page must expose a family-member picker')
++assert(statsPage.includes('getNutritionStats(user.id, activeMember?.id || null, period)') && statsPage.includes('await setActiveMemberById(memberId)'), 'Stats member switching must reload member-filtered nutrition data')
+ 
+ for (const table of ['wechat_identities', 'wechat_access_tokens', 'notification_jobs', 'recipe_shares']) {
+   assert(migration.includes(`create table if not exists public.${table}`), `Migration must create ${table}`)
+diff --git a/src/pages/stats/index.tsx b/src/pages/stats/index.tsx
+index 64f0dd2..208cc58 100644
+--- a/src/pages/stats/index.tsx
++++ b/src/pages/stats/index.tsx
+@@ -1,12 +1,13 @@
+ // @title 饮食统计
+-import {useState, useCallback, useEffect, useMemo} from 'react'
+-import Taro, {useDidShow} from '@tarojs/taro'
++
+ import {Canvas} from '@tarojs/components'
+-import {useAuth} from '@/contexts/AuthContext'
+-import {useAppStore} from '@/store/appStore'
++import Taro, {useDidShow} from '@tarojs/taro'
++import {useCallback, useEffect, useMemo, useState} from 'react'
+ import {withRouteGuard} from '@/components/RouteGuard'
++import {useAuth} from '@/contexts/AuthContext'
+ import {getNutritionStats} from '@/db/api'
+ import type {NutritionStats} from '@/db/types'
++import {useAppStore} from '@/store/appStore'
+ import {NUTRITION_RECORDS_UPDATED} from '@/utils/nutrition'
+ 
+ type Period = 'day' | 'week' | 'month'
+@@ -193,10 +194,29 @@ function TrendLineChart({data, mode, xSubTitle}: {
+ 
+ function StatsPage() {
+   const {user} = useAuth()
+-  const {activeMember} = useAppStore()
++  const {activeMember, familyMembers, loadingMembers, setActiveMemberById} = useAppStore()
+   const [period, setPeriod] = useState<Period>('day')
+   const [stats, setStats] = useState<NutritionStats[]>([])
+   const [loading, setLoading] = useState(false)
++  const [showMemberPicker, setShowMemberPicker] = useState(false)
++  const [switchingMemberId, setSwitchingMemberId] = useState<string | null>(null)
++
++  const handleSelectMember = useCallback(async (memberId: string) => {
++    if (memberId === activeMember?.id) {
++      setShowMemberPicker(false)
++      return
++    }
++    setSwitchingMemberId(memberId)
++    try {
++      await setActiveMemberById(memberId)
++      setShowMemberPicker(false)
++    } catch (error) {
++      console.error('切换统计成员失败:', error)
++      Taro.showToast({title: '切换成员失败，请重试', icon: 'none'})
++    } finally {
++      setSwitchingMemberId(null)
++    }
++  }, [activeMember?.id, setActiveMemberById])
+ 
+   const loadStats = useCallback(async () => {
+     if (!user) return
+@@ -316,10 +336,21 @@ function StatsPage() {
+       <div className="px-4 py-4 pb-tabbar flex flex-col gap-4">
+         {/* 成员提示 */}
+         {activeMember && (
+-          <div className="flex items-center gap-2 px-4 py-3 bg-primary/10 rounded-xl border border-primary/20">
+-            <div className="i-mdi-account-circle text-2xl text-primary" />
+-            <span className="text-xl text-primary">当前查看：{activeMember.nickname}</span>
+-          </div>
++          <button
++            type="button"
++            disabled={loadingMembers || switchingMemberId !== null}
++            className="w-full flex items-center justify-between gap-3 px-4 py-3 bg-primary/10 rounded-xl border border-primary/20 disabled:opacity-60"
++            onClick={() => setShowMemberPicker(true)}
++          >
++            <div className="flex items-center gap-2 min-w-0">
++              <div className="i-mdi-account-circle text-2xl text-primary flex-shrink-0" />
++              <span className="text-xl text-primary truncate">当前查看：{activeMember.nickname}</span>
++            </div>
++            <div className="flex items-center gap-1 text-primary flex-shrink-0">
++              <span className="text-xl font-medium">切换</span>
++              <div className="i-mdi-chevron-right text-2xl" />
++            </div>
++          </button>
+         )}
+ 
+         {loading ? (
+@@ -471,6 +502,81 @@ function StatsPage() {
+           </>
+         )}
+       </div>
++
++      {showMemberPicker && (
++        <div className="fixed inset-0 flex flex-col justify-end" style={{zIndex: 9999}}>
++          <div
++            className="absolute inset-0"
++            style={{backgroundColor: 'rgba(0,0,0,0.42)'}}
++            onClick={() => switchingMemberId === null && setShowMemberPicker(false)}
++          />
++          <div
++            className="relative bg-white flex flex-col"
++            style={{maxHeight: '70vh', borderRadius: '16px 16px 0 0', paddingBottom: 'env(safe-area-inset-bottom, 0px)'}}
++          >
++            <div className="flex justify-center pt-3 pb-1 flex-shrink-0">
++              <div className="rounded-full" style={{width: '40px', height: '4px', backgroundColor: '#D8D8D8'}} />
++            </div>
++            <div className="flex items-center justify-between px-5 py-3 border-b border-border flex-shrink-0">
++              <div>
++                <p className="text-2xl font-semibold text-foreground">切换查看成员</p>
++                <p className="text-xl text-muted-foreground mt-1">统计数据和营养目标将同步切换</p>
++              </div>
++              <button
++                type="button"
++                className="flex items-center justify-center"
++                style={{width: '40px', height: '40px'}}
++                onClick={() => switchingMemberId === null && setShowMemberPicker(false)}
++              >
++                <div className="i-mdi-close text-2xl text-muted-foreground" />
++              </button>
++            </div>
++            <div className="overflow-y-auto px-5">
++              {familyMembers.map(member => {
++                const selected = member.id === activeMember?.id
++                const switching = member.id === switchingMemberId
++                return (
++                  <button
++                    key={member.id}
++                    type="button"
++                    disabled={switchingMemberId !== null}
++                    className="w-full flex items-center justify-between gap-3 py-4 border-b border-border disabled:opacity-60"
++                    onClick={() => void handleSelectMember(member.id)}
++                  >
++                    <div className="flex items-center gap-3 min-w-0">
++                      <div
++                        className="flex items-center justify-center rounded-full flex-shrink-0"
++                        style={{width: '42px', height: '42px', backgroundColor: selected ? '#E8F3EC' : '#F2F2F2'}}
++                      >
++                        <div className="i-mdi-account text-2xl" style={{color: selected ? '#4A7C59' : '#777777'}} />
++                      </div>
++                      <div className="text-left min-w-0">
++                        <p className="text-xl font-medium text-foreground truncate">{member.nickname}</p>
++                        {member.is_primary && <p className="text-xl text-muted-foreground mt-1">主成员</p>}
++                      </div>
++                    </div>
++                    {switching
++                      ? <div className="i-mdi-loading text-2xl text-primary" style={{animation: 'spin 1s linear infinite'}} />
++                      : selected && <div className="i-mdi-check text-2xl text-primary" />}
++                  </button>
++                )
++              })}
++            </div>
++            <button
++              type="button"
++              className="flex items-center justify-center gap-2 mx-5 mt-3 text-xl font-medium text-primary"
++              style={{height: '48px'}}
++              onClick={() => {
++                setShowMemberPicker(false)
++                Taro.navigateTo({url: '/pages/family/index'})
++              }}
++            >
++              <div className="i-mdi-account-multiple-plus text-2xl" />
++              <span>管理家庭成员</span>
++            </button>
++          </div>
++        </div>
++      )}
+     </div>
+   )
+ }
+diff --git a/src/utils/recipePoster.ts b/src/utils/recipePoster.ts
+index cc20ccc..a0ce116 100644
+--- a/src/utils/recipePoster.ts
++++ b/src/utils/recipePoster.ts
+@@ -76,62 +76,90 @@ export async function renderRecipePoster(canvasId: string, variant: PosterVarian
+   const {width, height} = SIZES[variant]
+   const ctx = Taro.createCanvasContext(canvasId)
+   const sections = extractPosterSections(data.recipeContent)
+-  const margin = variant === 'poster' ? 74 : 60
+-  const contentWidth = width - margin * 2
++  const panelMargin = variant === 'poster' ? 32 : 36
++  const panelPadding = variant === 'poster' ? 38 : 32
++  const contentWidth = width - panelMargin * 2
+ 
+   ctx.setFillStyle('#FFFFFF')
+   ctx.fillRect(0, 0, width, height)
+   drawBackgroundCover(ctx, data.backgroundImage || recipePosterBackground, width, height)
+   ctx.setFillStyle('#204E3A')
+-  ctx.fillRect(0, 0, width, variant === 'poster' ? 250 : 210)
++  ctx.fillRect(0, 0, width, variant === 'poster' ? 232 : 210)
+   ctx.setFillStyle('#E05A47')
+-  ctx.fillRect(margin, variant === 'poster' ? 218 : 182, 120, 10)
++  ctx.fillRect(panelMargin, variant === 'poster' ? 214 : 190, 132, 10)
+   ctx.setFillStyle('#FFFFFF')
+-  ctx.setFontSize(variant === 'poster' ? 62 : 54)
++  ctx.setFontSize(variant === 'poster' ? 62 : 50)
+   ctx.setTextAlign('left')
+   wrapText(ctx, data.title || 'AI 推荐菜谱', contentWidth, 2).forEach((line, index) => {
+-    ctx.fillText(line, margin, 96 + index * 68)
++    ctx.fillText(line, panelMargin, (variant === 'poster' ? 82 : 72) + index * (variant === 'poster' ? 66 : 54))
+   })
+   ctx.setFontSize(26)
+   ctx.setFillStyle('#DCE9E2')
+-  ctx.fillText('智能健康助手 · 营养菜谱', margin, variant === 'poster' ? 205 : 170)
++  ctx.fillText('智能健康助手 · 营养菜谱', panelMargin, variant === 'poster' ? 200 : 174)
+ 
+-  const panelTop = variant === 'poster' ? 292 : 246
+-  drawRoundedRect(ctx, margin, panelTop, contentWidth, height - panelTop - margin, 24)
++  const panelTop = variant === 'poster' ? 252 : 230
++  drawRoundedRect(ctx, panelMargin, panelTop, contentWidth, height - panelTop - panelMargin, 22)
+   ctx.setFillStyle('#FFFFFF')
+   ctx.fill()
+ 
+-  let y = panelTop + 62
+-  const drawSection = (label: string, items: string[], maxItems: number, maxLines = 1) => {
+-    if (!items.length) return
++  const textX = panelMargin + panelPadding
++  const textWidth = contentWidth - panelPadding * 2
++  const lineHeight = variant === 'poster' ? 43 : 37
++  const bodyBottom = height - panelMargin - 104
++  let y = panelTop + 54
++  const drawSection = (
++    label: string,
++    items: string[],
++    maxItems: number,
++    maxLinesPerItem: number,
++    sectionBottom: number
++  ) => {
++    if (!items.length || y + 72 > sectionBottom) return
+     ctx.setFillStyle('#204E3A')
+-    ctx.setFontSize(32)
+-    ctx.fillText(label, margin + 38, y)
+-    y += 42
++    ctx.setFontSize(variant === 'poster' ? 34 : 31)
++    ctx.fillText(label, textX, y)
++    y += variant === 'poster' ? 48 : 43
+     ctx.setFillStyle('#303734')
+-    ctx.setFontSize(variant === 'poster' ? 27 : 25)
++    ctx.setFontSize(variant === 'poster' ? 29 : 25)
+     for (const item of items.slice(0, maxItems)) {
+-      const lines = wrapText(ctx, `• ${item}`, contentWidth - 76, maxLines)
++      const availableLines = Math.floor((sectionBottom - y) / lineHeight)
++      if (availableLines <= 0) break
++      const lines = wrapText(ctx, `• ${item}`, textWidth, Math.min(maxLinesPerItem, availableLines))
+       for (const line of lines) {
+-        ctx.fillText(line, margin + 38, y)
+-        y += variant === 'poster' ? 40 : 36
++        ctx.fillText(line, textX, y)
++        y += lineHeight
+       }
++      y += variant === 'poster' ? 7 : 5
+     }
+-    y += 24
++    y = Math.min(y + (variant === 'poster' ? 22 : 18), sectionBottom)
+   }
+ 
+   const ingredientLines = data.ingredients.length
+     ? data.ingredients.map(item => `${item.name} ${item.weight}${item.unit}`)
+     : sections.ingredients
+-  drawSection('主要食材', ingredientLines, variant === 'poster' ? 8 : variant === 'timeline' ? 6 : 4)
+-  drawSection('烹饪步骤', sections.steps, variant === 'poster' ? 4 : variant === 'timeline' ? 3 : 2)
+-  if (variant === 'poster') drawSection('营养亮点', sections.nutrition, 2)
++  const ingredientBottom = panelTop + (variant === 'poster' ? 330 : variant === 'timeline' ? 270 : 225)
++  const stepsBottom = variant === 'poster' ? panelTop + 825 : bodyBottom
++  drawSection(
++    '主要食材',
++    ingredientLines,
++    variant === 'poster' ? 8 : variant === 'timeline' ? 6 : 4,
++    2,
++    ingredientBottom
++  )
++  drawSection(
++    '烹饪步骤',
++    sections.steps,
++    variant === 'poster' ? 6 : variant === 'timeline' ? 4 : 3,
++    variant === 'poster' ? 3 : 2,
++    stepsBottom
++  )
++  if (variant === 'poster') drawSection('营养亮点', sections.nutrition, 3, 3, bodyBottom)
+ 
+   ctx.setFillStyle('#6D756F')
+   ctx.setFontSize(24)
+-  ctx.fillText('打开小程序查看完整做法', margin + 38, height - margin - 38)
++  ctx.fillText('打开小程序查看完整做法', textX, height - panelMargin - 38)
+   ctx.setFillStyle('#E05A47')
+-  ctx.fillRect(width - margin - 92, height - margin - 64, 54, 54)
++  ctx.fillRect(width - panelMargin - panelPadding - 54, height - panelMargin - 64, 54, 54)
+ 
+   await new Promise<void>(resolve => ctx.draw(false, resolve))
+   return exportCanvas(canvasId, width, height)

@@ -1,0 +1,1349 @@
+diff --git a/src/app.config.ts b/src/app.config.ts
+index d987382..83b7c50 100644
+--- a/src/app.config.ts
++++ b/src/app.config.ts
+@@ -7,9 +7,12 @@ export default defineAppConfig({
+     'pages/device-manager/index',
+     'pages/device-add/index',
+     'pages/personal-info/index',
++    'pages/account-settings/index',
++    'pages/profile-onboarding/index',
+     'pages/family/index',
+     'pages/family-edit/index',
+     'pages/recipe/index',
++    'pages/recipe-share/index',
+     'pages/reminder-settings/index',
+     'pages/login/index',
+     'pages/agreement/index',
+diff --git a/src/client/supabase.ts b/src/client/supabase.ts
+index 1631b71..2bad4a7 100644
+--- a/src/client/supabase.ts
++++ b/src/client/supabase.ts
+@@ -7,6 +7,23 @@ const supabaseUrl: string = process.env.TARO_APP_SUPABASE_URL!
+ const supabaseAnonKey: string = process.env.TARO_APP_SUPABASE_ANON_KEY || 'TOKEN'
+ const appId: string = process.env.TARO_APP_APP_ID!
+ 
++const taroAuthStorage = {
++  getItem: async (key: string): Promise<string | null> => {
++    try {
++      const value = Taro.getStorageSync(key)
++      return typeof value === 'string' && value ? value : null
++    } catch {
++      return null
++    }
++  },
++  setItem: async (key: string, value: string): Promise<void> => {
++    Taro.setStorageSync(key, value)
++  },
++  removeItem: async (key: string): Promise<void> => {
++    Taro.removeStorageSync(key)
++  }
++}
++
+ let noticed = false
+ const normalizeRequestUrl = (input: RequestInfo | URL): string => {
+   if (typeof input === 'string') return input
+@@ -75,6 +92,10 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+     fetch: customFetch
+   },
+   auth: {
+-    storageKey: `${appId}-auth-token`
++    storageKey: `${appId}-auth-token`,
++    storage: taroAuthStorage,
++    persistSession: true,
++    autoRefreshToken: true,
++    detectSessionInUrl: false
+   }
+ })
+diff --git a/src/components/RouteGuard.tsx b/src/components/RouteGuard.tsx
+index ebf47b0..2c85199 100644
+--- a/src/components/RouteGuard.tsx
++++ b/src/components/RouteGuard.tsx
+@@ -2,15 +2,13 @@ import {useCallback, useEffect, useState} from 'react'
+ import Taro, {useDidShow} from '@tarojs/taro'
+ import type {TabBarItem} from '@tarojs/taro'
+ import {useAuth} from '@/contexts/AuthContext'
++import {buildCurrentRouteUrl, STORAGE_KEY_REDIRECT_PATH} from '@/utils/authRedirect'
+ 
+ // Public pages that don't require authentication
+-const PUBLIC_PAGE_PATHS = ['/pages/login/index']
++const PUBLIC_PAGE_PATHS = ['/pages/login/index', '/pages/recipe-share/index']
+ 
+ const LOGIN_PAGE_PATH = '/pages/login/index'
+ 
+-// Storage key for saving redirect path after login
+-export const STORAGE_KEY_REDIRECT_PATH = 'loginRedirectPath'
+-
+ function getTabBarPages(): string[] {
+   const app = Taro.getApp()
+   const tabBarList = app?.config?.tabBar?.list || []
+@@ -56,7 +54,7 @@ function RouteGuard({children}: {children: React.ReactNode}) {
+       return
+     }
+ 
+-    const currentPath: string = Taro.getCurrentInstance()?.router?.path || ''
++    const currentPath = buildCurrentRouteUrl()
+ 
+     // Allow access if user is authenticated or page is public
+     const isPublic = PUBLIC_PAGE_PATHS.some((publicPath) => currentPath?.includes(publicPath))
+diff --git a/src/contexts/AuthContext.tsx b/src/contexts/AuthContext.tsx
+index c2e2afa..ca96334 100644
+--- a/src/contexts/AuthContext.tsx
++++ b/src/contexts/AuthContext.tsx
+@@ -1,11 +1,13 @@
+ import {createContext, useCallback, useContext, useEffect, useState, type ReactNode} from 'react'
+-import Taro from '@tarojs/taro'
+ import {supabase} from '@/client/supabase'
+ import type {User} from '@supabase/supabase-js'
+-
+-export interface Profile {
+-   [key: string]: unknown;
+-}
++import type {Profile} from '@/db/types'
++import {
++  bindWechatAccount,
++  registerWechatAccount,
++  startWechatLogin,
++  type WechatStartResult
++} from '@/services/wechatAuth'
+ 
+ export async function getProfile(userId: string): Promise<Profile | null> {
+   const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle()
+@@ -26,7 +28,9 @@ interface AuthContextType {
+   signUpWithPhone: (phone: string, password: string) => Promise<{error: Error | null}>
+   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
+   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
+-  signInWithWechat: () => Promise<{error: Error | null}>
++  startWechatSignIn: () => Promise<{data: WechatStartResult | null; error: Error | null}>
++  registerWechatSignIn: (ticket: string, phoneCode?: string) => Promise<{error: Error | null}>
++  bindWechatSignIn: (ticket: string) => Promise<{error: Error | null}>
+   signOut: () => Promise<void>
+   refreshProfile: () => Promise<void>
+ }
+@@ -150,33 +154,26 @@ export function AuthProvider({children}: {children: ReactNode}) {
+     }
+   }
+ 
+-  const signInWithWechat = async () => {
++  const startWechatSignIn = async () => {
+     try {
+-      // Check if running in WeChat Mini Program environment
+-      if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) {
+-        throw new Error('仅支持微信小程序登录，网页端请使用用户名密码登录')
+-      }
+-
+-      // Get WeChat login code
+-      const loginResult = await Taro.login()
+-
+-      // Call backend Edge Function for login
+-      const {data, error} = await supabase.functions.invoke('wechat_miniapp_login', {
+-        body: {code: loginResult?.code}
+-      })
+-
+-      if (error) {
+-        const errorMsg = (await error?.context?.text?.()) || error.message
+-        throw new Error(errorMsg)
+-      }
++      return {data: await startWechatLogin(), error: null}
++    } catch (error) {
++      return {data: null, error: error as Error}
++    }
++  }
+ 
+-      // Verify OTP token
+-      const {error: verifyError} = await supabase.auth.verifyOtp({
+-        token_hash: data.token,
+-        type: 'magiclink'
+-      })
++  const registerWechatSignIn = async (ticket: string, phoneCode?: string) => {
++    try {
++      await registerWechatAccount(ticket, phoneCode)
++      return {error: null}
++    } catch (error) {
++      return {error: error as Error}
++    }
++  }
+ 
+-      if (verifyError) throw verifyError
++  const bindWechatSignIn = async (ticket: string) => {
++    try {
++      await bindWechatAccount(ticket)
+       return {error: null}
+     } catch (error) {
+       return {error: error as Error}
+@@ -200,7 +197,9 @@ export function AuthProvider({children}: {children: ReactNode}) {
+         signUpWithPhone,
+         signInWithPhone,
+         verifyPhoneOtp,
+-        signInWithWechat,
++        startWechatSignIn,
++        registerWechatSignIn,
++        bindWechatSignIn,
+         signOut,
+         refreshProfile
+       }}>
+diff --git a/src/pages/account-settings/index.config.ts b/src/pages/account-settings/index.config.ts
+new file mode 100644
+index 0000000..027233f
+--- /dev/null
++++ b/src/pages/account-settings/index.config.ts
+@@ -0,0 +1 @@
++export default definePageConfig({navigationBarTitleText: '账号与微信'})
+diff --git a/src/pages/account-settings/index.tsx b/src/pages/account-settings/index.tsx
+new file mode 100644
+index 0000000..43f4117
+--- /dev/null
++++ b/src/pages/account-settings/index.tsx
+@@ -0,0 +1,68 @@
++import {useCallback, useState} from 'react'
++import Taro, {useDidShow} from '@tarojs/taro'
++import {withRouteGuard} from '@/components/RouteGuard'
++import {bindWechatAccount, getWechatAccountStatus, prepareWechatBinding, type WechatAccountStatus} from '@/services/wechatAuth'
++
++function AccountSettingsPage() {
++  const [status, setStatus] = useState<WechatAccountStatus | null>(null)
++  const [loading, setLoading] = useState(false)
++
++  const loadStatus = useCallback(async () => {
++    try {
++      setStatus(await getWechatAccountStatus())
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '账号状态加载失败', icon: 'none'})
++    }
++  }, [])
++
++  useDidShow(() => { void loadStatus() })
++
++  const handleBind = async () => {
++    setLoading(true)
++    try {
++      const ticket = await prepareWechatBinding()
++      await bindWechatAccount(ticket)
++      await loadStatus()
++      Taro.showToast({title: '微信绑定成功', icon: 'success'})
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '微信绑定失败', icon: 'none'})
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  return (
++    <div className="min-h-screen bg-background px-4 py-4">
++      <div className="bg-card border border-border rounded-xl px-4 py-4">
++        <div className="flex items-center gap-3 mb-4">
++          <div className="i-mdi-wechat text-3xl text-green-600" />
++          <div className="flex-1">
++            <p className="text-xl font-semibold text-foreground">微信账号</p>
++            <p className="text-xl text-muted-foreground">{status?.bound ? '已绑定' : '未绑定'}</p>
++          </div>
++          <div className={`text-xl font-medium ${status?.bound ? 'text-primary' : 'text-muted-foreground'}`}>
++            {status?.bound ? '已连接' : '未连接'}
++          </div>
++        </div>
++        {status?.phoneMasked && (
++          <div className="flex items-center justify-between py-3 border-t border-border">
++            <span className="text-xl text-muted-foreground">授权手机号</span>
++            <span className="text-xl text-foreground">{status.phoneMasked}</span>
++          </div>
++        )}
++        {!status?.bound && (
++          <button
++            type="button"
++            disabled={loading}
++            className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl mt-3 disabled:opacity-50"
++            style={{height: '48px'}}
++            onClick={handleBind}
++          >{loading ? '绑定中...' : '绑定当前微信'}</button>
++        )}
++      </div>
++      <p className="text-xl text-muted-foreground mt-3 px-1">为保护健康数据，本期不支持在小程序内自动合并或解绑账号。</p>
++    </div>
++  )
++}
++
++export default withRouteGuard(AccountSettingsPage)
+diff --git a/src/pages/login/index.tsx b/src/pages/login/index.tsx
+index 418d9e0..3cfa99b 100644
+--- a/src/pages/login/index.tsx
++++ b/src/pages/login/index.tsx
+@@ -2,14 +2,26 @@
+ import {useState} from 'react'
+ import Taro from '@tarojs/taro'
+ import {useAuth} from '@/contexts/AuthContext'
++import {completeLoginRedirect} from '@/utils/authRedirect'
++
++type WechatStep = 'idle' | 'choice' | 'bind'
+ 
+ export default function LoginPage() {
+-  const {signInWithUsername, signUpWithUsername, signInWithWechat} = useAuth()
++  const {
++    signInWithUsername,
++    signUpWithUsername,
++    startWechatSignIn,
++    registerWechatSignIn,
++    bindWechatSignIn,
++    signOut
++  } = useAuth()
+   const [tab, setTab] = useState<'login' | 'register'>('login')
+   const [username, setUsername] = useState('')
+   const [password, setPassword] = useState('')
+   const [agreed, setAgreed] = useState(false)
+   const [loading, setLoading] = useState(false)
++  const [wechatStep, setWechatStep] = useState<WechatStep>('idle')
++  const [wechatTicket, setWechatTicket] = useState('')
+ 
+   const isWeApp = Taro.getEnv() === Taro.ENV_TYPE.WEAPP
+ 
+@@ -33,14 +45,7 @@ export default function LoginPage() {
+       if (error) {
+         Taro.showToast({title: error.message || '操作失败', icon: 'none'})
+       } else {
+-        const redirectPath = Taro.getStorageSync('loginRedirectPath') || '/pages/home/index'
+-        Taro.removeStorageSync('loginRedirectPath')
+-        const tabBarPaths = ['/pages/home/index', '/pages/chat/index', '/pages/stats/index', '/pages/profile/index']
+-        if (tabBarPaths.includes(redirectPath)) {
+-          Taro.switchTab({url: redirectPath})
+-        } else {
+-          Taro.redirectTo({url: redirectPath})
+-        }
++        completeLoginRedirect()
+       }
+     } finally {
+       setLoading(false)
+@@ -54,19 +59,63 @@ export default function LoginPage() {
+     }
+     setLoading(true)
+     try {
+-      const {error} = await signInWithWechat()
++      const {data, error} = await startWechatSignIn()
+       if (error) {
+         Taro.showToast({title: error.message || '微信登录失败', icon: 'none'})
++      } else if (data?.status === 'authenticated') {
++        completeLoginRedirect()
+       } else {
+-        const redirectPath = Taro.getStorageSync('loginRedirectPath') || '/pages/home/index'
+-        Taro.removeStorageSync('loginRedirectPath')
+-        const tabBarPaths = ['/pages/home/index', '/pages/chat/index', '/pages/stats/index', '/pages/profile/index']
+-        if (tabBarPaths.includes(redirectPath)) {
+-          Taro.switchTab({url: redirectPath})
+-        } else {
+-          Taro.redirectTo({url: redirectPath})
+-        }
++        setWechatTicket(data?.status === 'unbound' ? data.registrationTicket : '')
++        setWechatStep('choice')
++      }
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  const finishWechatRegistration = async (phoneCode?: string) => {
++    if (!wechatTicket) return
++    setLoading(true)
++    try {
++      const {error} = await registerWechatSignIn(wechatTicket, phoneCode)
++      if (error) {
++        Taro.showToast({title: error.message || '微信账号创建失败', icon: 'none'})
++        return
+       }
++      Taro.redirectTo({url: '/pages/profile-onboarding/index'})
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  const handlePhoneRegistration = (event: any) => {
++    const phoneCode = event?.detail?.code
++    if (!phoneCode) {
++      Taro.showToast({title: '未授权手机号，可选择跳过', icon: 'none'})
++      return
++    }
++    void finishWechatRegistration(phoneCode)
++  }
++
++  const handleBindExisting = async () => {
++    if (!username.trim() || password.length < 6) {
++      Taro.showToast({title: '请输入已有账号和密码', icon: 'none'})
++      return
++    }
++    setLoading(true)
++    try {
++      const {error: loginError} = await signInWithUsername(username.trim(), password)
++      if (loginError) {
++        Taro.showToast({title: loginError.message || '已有账号登录失败', icon: 'none'})
++        return
++      }
++      const {error: bindError} = await bindWechatSignIn(wechatTicket)
++      if (bindError) {
++        await signOut()
++        Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
++        return
++      }
++      completeLoginRedirect()
+     } finally {
+       setLoading(false)
+     }
+@@ -85,6 +134,38 @@ export default function LoginPage() {
+ 
+       {/* 登录卡片 */}
+       <div className="flex-1 px-6 pt-8">
++        {wechatStep === 'choice' && (
++          <div className="bg-card border border-border rounded-xl p-4 mb-6">
++            <p className="text-2xl font-semibold text-foreground mb-2">首次使用微信登录</p>
++            <p className="text-xl text-muted-foreground mb-4">创建新账号，或绑定已有用户名账号。</p>
++            <button
++              type="button"
++              {...({openType: 'getPhoneNumber', onGetPhoneNumber: handlePhoneRegistration} as any)}
++              className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl mb-3"
++              style={{height: '48px'}}
++            >手机号快捷创建</button>
++            <button
++              type="button"
++              className="w-full flex items-center justify-center text-xl font-medium border border-primary text-primary rounded-xl mb-3"
++              style={{height: '48px'}}
++              onClick={() => void finishWechatRegistration()}
++            >跳过手机号并创建</button>
++            <button
++              type="button"
++              className="w-full flex items-center justify-center text-xl text-muted-foreground"
++              style={{height: '40px'}}
++              onClick={() => setWechatStep('bind')}
++            >绑定已有账号</button>
++          </div>
++        )}
++
++        {wechatStep === 'bind' && (
++          <div className="bg-primary/10 rounded-xl px-4 py-3 mb-4 flex items-center justify-between">
++            <span className="text-xl text-primary">输入已有账号完成微信绑定</span>
++            <button type="button" className="text-xl text-primary" onClick={() => setWechatStep('choice')}>返回</button>
++          </div>
++        )}
++
+         {/* Tab切换 */}
+         <div className="flex bg-secondary rounded-xl p-1 mb-6">
+           {(['login', 'register'] as const).map(t => (
+@@ -158,13 +239,13 @@ export default function LoginPage() {
+           type="button"
+           className={`w-full flex items-center justify-center leading-none text-2xl font-semibold rounded-xl mb-4 transition ${loading ? 'bg-primary/50 text-white' : 'bg-gradient-primary text-white shadow-elegant'}`}
+           style={{height: '56px'}}
+-          onClick={handleSubmit}
++          onClick={wechatStep === 'bind' ? handleBindExisting : handleSubmit}
+         >
+-          {loading ? '处理中...' : tab === 'login' ? '登录' : '注册'}
++          {loading ? '处理中...' : wechatStep === 'bind' ? '登录并绑定微信' : tab === 'login' ? '登录' : '注册'}
+         </button>
+ 
+         {/* 微信登录 */}
+-        {isWeApp && (
++        {isWeApp && wechatStep === 'idle' && (
+           <button
+             type="button"
+             className="w-full flex items-center justify-center leading-none gap-3 text-xl font-semibold rounded-xl border-2 border-border bg-card text-foreground"
+diff --git a/src/pages/profile-onboarding/index.config.ts b/src/pages/profile-onboarding/index.config.ts
+new file mode 100644
+index 0000000..b9aa598
+--- /dev/null
++++ b/src/pages/profile-onboarding/index.config.ts
+@@ -0,0 +1 @@
++export default definePageConfig({navigationBarTitleText: '完善资料'})
+diff --git a/src/pages/profile-onboarding/index.tsx b/src/pages/profile-onboarding/index.tsx
+new file mode 100644
+index 0000000..a794025
+--- /dev/null
++++ b/src/pages/profile-onboarding/index.tsx
+@@ -0,0 +1,95 @@
++import {useState} from 'react'
++import Taro from '@tarojs/taro'
++import {Image} from '@tarojs/components'
++import {useAuth} from '@/contexts/AuthContext'
++import {getFamilyMembers, updateFamilyMember, updateProfile} from '@/db/api'
++import {useAppStore} from '@/store/appStore'
++import {uploadWechatAvatar} from '@/services/wechatAuth'
++import {completeLoginRedirect} from '@/utils/authRedirect'
++import {withRouteGuard} from '@/components/RouteGuard'
++
++function ProfileOnboardingPage() {
++  const {user, refreshProfile} = useAuth()
++  const {refreshMembers} = useAppStore()
++  const [nickname, setNickname] = useState('')
++  const [avatarPath, setAvatarPath] = useState('')
++  const [saving, setSaving] = useState(false)
++
++  const handleChooseAvatar = (event: any) => {
++    const path = event?.detail?.avatarUrl
++    if (path) setAvatarPath(path)
++  }
++
++  const handleSave = async () => {
++    if (!user) return
++    setSaving(true)
++    try {
++      const avatarUrl = avatarPath ? await uploadWechatAvatar(avatarPath) : undefined
++      const updates = {
++        ...(nickname.trim() ? {nickname: nickname.trim()} : {}),
++        ...(avatarUrl ? {avatar_url: avatarUrl} : {})
++      }
++      if (Object.keys(updates).length > 0) {
++        const saved = await updateProfile(user.id, updates)
++        if (!saved) throw new Error('资料保存失败')
++        const members = await getFamilyMembers(user.id)
++        const primary = members.find(member => member.is_primary)
++        if (primary) await updateFamilyMember(primary.id, updates)
++        await Promise.all([refreshProfile(), refreshMembers(user.id)])
++      }
++      completeLoginRedirect()
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '资料保存失败', icon: 'none'})
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  return (
++    <div className="min-h-screen bg-background px-6 pt-10">
++      <div className="flex flex-col items-center mb-8">
++        <button
++          type="button"
++          {...({openType: 'chooseAvatar', onChooseAvatar: handleChooseAvatar} as any)}
++          className="overflow-hidden border-2 border-primary/30 bg-primary/10 flex items-center justify-center"
++          style={{width: '96px', height: '96px', borderRadius: '50%'}}
++        >
++          {avatarPath
++            ? <Image src={avatarPath} mode="aspectFill" style={{width: '96px', height: '96px'}} />
++            : <div className="i-mdi-account text-5xl text-primary" />}
++        </button>
++        <p className="text-xl text-muted-foreground mt-3">选择头像</p>
++      </div>
++      <div className="mb-6">
++        <p className="text-xl text-muted-foreground mb-2">昵称</p>
++        <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
++          <input
++            type="nickname"
++            value={nickname}
++            placeholder="填写微信昵称"
++            className="w-full text-xl text-foreground bg-transparent outline-none"
++            onInput={(event) => {
++              const value = (event as any).detail?.value ?? (event as any).target?.value ?? ''
++              setNickname(value)
++            }}
++          />
++        </div>
++      </div>
++      <button
++        type="button"
++        disabled={saving}
++        className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50"
++        style={{height: '52px'}}
++        onClick={handleSave}
++      >{saving ? '保存中...' : '保存并继续'}</button>
++      <button
++        type="button"
++        className="w-full flex items-center justify-center text-xl text-muted-foreground mt-3"
++        style={{height: '44px'}}
++        onClick={completeLoginRedirect}
++      >暂时跳过</button>
++    </div>
++  )
++}
++
++export default withRouteGuard(ProfileOnboardingPage)
+diff --git a/src/pages/profile/index.tsx b/src/pages/profile/index.tsx
+index d7d35d8..c83dc02 100644
+--- a/src/pages/profile/index.tsx
++++ b/src/pages/profile/index.tsx
+@@ -40,6 +40,7 @@ function ProfilePage() {
+   const menuItems = [
+     {icon: 'i-mdi-bluetooth', label: '设备管理', desc: `${devices.length}台设备`, url: '/pages/device-manager/index'},
+     {icon: 'i-mdi-account-edit', label: '个人资料', desc: activeMember?.nickname || '未设置', url: '/pages/personal-info/index'},
++    {icon: 'i-mdi-shield-account', label: '账号与微信', desc: '登录与绑定', url: '/pages/account-settings/index'},
+     {icon: 'i-mdi-account-group', label: '家庭成员', desc: familyMembers.length > 0 ? `${familyMembers.length}位成员` : '未配置', url: '/pages/family/index'},
+     {icon: 'i-mdi-bell-outline', label: '提醒设置', desc: '餐前&饮水提醒', url: '/pages/reminder-settings/index'},
+     {icon: 'i-mdi-help-circle-outline', label: '使用帮助', desc: '使用指引', url: '/pages/device-add/index'},
+diff --git a/src/services/wechatAuth.ts b/src/services/wechatAuth.ts
+new file mode 100644
+index 0000000..20f5dd9
+--- /dev/null
++++ b/src/services/wechatAuth.ts
+@@ -0,0 +1,87 @@
++import Taro from '@tarojs/taro'
++import {supabase} from '@/client/supabase'
++
++export type WechatStartResult =
++  | {status: 'authenticated'}
++  | {status: 'unbound'; registrationTicket: string}
++
++export interface WechatAccountStatus {
++  bound: boolean
++  phoneMasked: string | null
++}
++
++async function getFunctionError(error: any, fallback: string): Promise<Error> {
++  try {
++    const text = await error?.context?.text?.()
++    if (text) {
++      const parsed = JSON.parse(text)
++      return new Error(parsed.message || parsed.error || fallback)
++    }
++  } catch {}
++  return new Error(error?.message || fallback)
++}
++
++async function verifyMagicLink(token: string): Promise<void> {
++  const {error} = await supabase.auth.verifyOtp({token_hash: token, type: 'magiclink'})
++  if (error) throw error
++}
++
++async function invokeWechat(body: Record<string, unknown>): Promise<any> {
++  const {data, error} = await supabase.functions.invoke('wechat_miniapp_login', {body})
++  if (error) throw await getFunctionError(error, '微信登录服务不可用')
++  if (!data || typeof data !== 'object') throw new Error('微信登录服务返回异常')
++  return data
++}
++
++export async function startWechatLogin(): Promise<WechatStartResult> {
++  if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) throw new Error('仅支持微信小程序登录')
++  const {code} = await Taro.login()
++  if (!code) throw new Error('未获取到微信登录凭证')
++  // 同时发送 code，兼容尚未升级到分阶段协议的云端函数。
++  const data = await invokeWechat({action: 'start', loginCode: code, code})
++  if (data.token && (!data.status || data.status === 'authenticated')) {
++    await verifyMagicLink(data.token)
++    return {status: 'authenticated'}
++  }
++  if (data.status === 'unbound' && data.registrationTicket) {
++    return {status: 'unbound', registrationTicket: data.registrationTicket}
++  }
++  throw new Error('微信登录状态异常')
++}
++
++export async function registerWechatAccount(registrationTicket: string, phoneCode?: string): Promise<void> {
++  const data = await invokeWechat({action: 'register', registrationTicket, phoneCode: phoneCode || undefined})
++  if (!data.token) throw new Error('微信账号创建失败')
++  await verifyMagicLink(data.token)
++}
++
++export async function bindWechatAccount(registrationTicket: string): Promise<void> {
++  const data = await invokeWechat({action: 'bind', registrationTicket})
++  if (data.status !== 'bound') throw new Error('微信账号绑定失败')
++}
++
++export async function prepareWechatBinding(): Promise<string> {
++  if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) throw new Error('仅支持微信小程序绑定')
++  const {code} = await Taro.login()
++  if (!code) throw new Error('未获取到微信登录凭证')
++  const data = await invokeWechat({action: 'prepare-bind', loginCode: code})
++  if (!data.registrationTicket) throw new Error('微信绑定凭证获取失败')
++  return data.registrationTicket
++}
++
++export async function getWechatAccountStatus(): Promise<WechatAccountStatus> {
++  const data = await invokeWechat({action: 'status'})
++  return {bound: !!data.bound, phoneMasked: data.phoneMasked || null}
++}
++
++export async function uploadWechatAvatar(localPath: string): Promise<string> {
++  const fs = Taro.getFileSystemManager()
++  const base64 = fs.readFileSync(localPath, 'base64') as string
++  const extension = localPath.split('.').pop()?.toLowerCase() || 'jpg'
++  const {data, error} = await supabase.functions.invoke('upload-avatar', {
++    body: {image: base64, ext: extension}
++  })
++  if (error) throw await getFunctionError(error, '头像上传失败')
++  if (!data?.url) throw new Error('头像上传返回异常')
++  return data.url
++}
+diff --git a/src/utils/authRedirect.ts b/src/utils/authRedirect.ts
+new file mode 100644
+index 0000000..3d06dd8
+--- /dev/null
++++ b/src/utils/authRedirect.ts
+@@ -0,0 +1,41 @@
++import Taro from '@tarojs/taro'
++
++export const STORAGE_KEY_REDIRECT_PATH = 'loginRedirectPath'
++const DEFAULT_REDIRECT = '/pages/home/index'
++const TAB_BAR_PATHS = new Set([
++  '/pages/home/index',
++  '/pages/chat/index',
++  '/pages/stats/index',
++  '/pages/profile/index'
++])
++
++export function buildCurrentRouteUrl(): string {
++  const router = Taro.getCurrentInstance()?.router
++  const path = router?.path ? `/${router.path.replace(/^\//, '')}` : ''
++  if (!path) return ''
++
++  const query = Object.entries(router?.params || {})
++    .filter(([key, value]) => key !== '$taroTimestamp' && value !== undefined && value !== null && value !== '')
++    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
++    .join('&')
++  return query ? `${path}?${query}` : path
++}
++
++export function getStoredRedirect(): string {
++  return Taro.getStorageSync(STORAGE_KEY_REDIRECT_PATH) || DEFAULT_REDIRECT
++}
++
++export function clearStoredRedirect(): void {
++  Taro.removeStorageSync(STORAGE_KEY_REDIRECT_PATH)
++}
++
++export function completeLoginRedirect(): void {
++  const target = getStoredRedirect()
++  clearStoredRedirect()
++  const path = target.split('?')[0]
++  if (TAB_BAR_PATHS.has(path)) {
++    Taro.switchTab({url: path})
++  } else {
++    Taro.redirectTo({url: target})
++  }
++}
+diff --git a/supabase/config.toml b/supabase/config.toml
+index a06e62b..e0afa8e 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -1,2 +1,11 @@
+ [auth.email]
+ enable_confirmations = false
++
++[functions.wechat_miniapp_login]
++verify_jwt = false
++
++[functions.wechat-notification-dispatch]
++verify_jwt = false
++
++[functions.recipe-share]
++verify_jwt = false
+diff --git a/supabase/functions/_shared/common.ts b/supabase/functions/_shared/common.ts
+new file mode 100644
+index 0000000..7991e54
+--- /dev/null
++++ b/supabase/functions/_shared/common.ts
+@@ -0,0 +1,62 @@
++import {createClient, type SupabaseClient} from 'jsr:@supabase/supabase-js'
++
++export const corsHeaders = {
++  'Access-Control-Allow-Origin': '*',
++  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
++  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-dispatch-secret',
++}
++
++export class HttpError extends Error {
++  constructor(public status: number, message: string) {
++    super(message)
++  }
++}
++
++export function json(data: unknown, status = 200): Response {
++  return new Response(JSON.stringify(data), {
++    status,
++    headers: {...corsHeaders, 'Content-Type': 'application/json'}
++  })
++}
++
++export function getSupabaseAdmin(): SupabaseClient {
++  const url = Deno.env.get('APP_SUPABASE_URL') || Deno.env.get('SUPABASE_URL') || ''
++  const key = Deno.env.get('APP_SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
++  if (!url || !key) throw new HttpError(500, 'Supabase service configuration is missing')
++  return createClient(url, key, {auth: {persistSession: false, autoRefreshToken: false}})
++}
++
++export async function getAuthUserId(req: Request, required = true): Promise<string | null> {
++  const auth = req.headers.get('Authorization') || ''
++  const token = auth.replace(/^Bearer\s+/i, '')
++  if (!token) {
++    if (required) throw new HttpError(401, '请先登录')
++    return null
++  }
++  const {data, error} = await getSupabaseAdmin().auth.getUser(token)
++  if (error || !data.user?.id) {
++    if (required) throw new HttpError(401, '登录状态已失效')
++    return null
++  }
++  return data.user.id
++}
++
++export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
++  const controller = new AbortController()
++  const timer = setTimeout(() => controller.abort(), timeoutMs)
++  try {
++    return await fetch(url, {...init, signal: controller.signal})
++  } catch (error) {
++    if (error instanceof DOMException && error.name === 'AbortError') throw new HttpError(504, '微信服务响应超时')
++    throw error
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++export function handleError(error: unknown, scope: string): Response {
++  const status = error instanceof HttpError ? error.status : 500
++  const message = error instanceof Error ? error.message : 'Internal error'
++  console.error(`[${scope}] failed`, {status, message})
++  return json({message: status >= 500 ? '服务暂时不可用，请稍后重试' : message}, status)
++}
+diff --git a/supabase/functions/_shared/wechat.ts b/supabase/functions/_shared/wechat.ts
+new file mode 100644
+index 0000000..d343e0a
+--- /dev/null
++++ b/supabase/functions/_shared/wechat.ts
+@@ -0,0 +1,147 @@
++import {fetchWithTimeout, getSupabaseAdmin, HttpError} from './common.ts'
++
++const encoder = new TextEncoder()
++const decoder = new TextDecoder()
++
++function bytesToBase64Url(bytes: Uint8Array): string {
++  let binary = ''
++  bytes.forEach(byte => { binary += String.fromCharCode(byte) })
++  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
++}
++
++function base64UrlToBytes(value: string): Uint8Array {
++  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
++  const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='))
++  return Uint8Array.from(binary, char => char.charCodeAt(0))
++}
++
++async function importTicketKey(): Promise<CryptoKey> {
++  const secret = Deno.env.get('WECHAT_LOGIN_TICKET_SECRET') || ''
++  if (secret.length < 32) throw new HttpError(500, 'WeChat login ticket secret is missing')
++  return crypto.subtle.importKey('raw', encoder.encode(secret), {name: 'HMAC', hash: 'SHA-256'}, false, ['sign', 'verify'])
++}
++
++export interface WechatTicketPayload {
++  openid: string
++  unionid?: string
++  exp: number
++  nonce: string
++}
++
++export async function createLoginTicket(identity: {openid: string; unionid?: string}): Promise<string> {
++  const payload: WechatTicketPayload = {
++    openid: identity.openid,
++    ...(identity.unionid ? {unionid: identity.unionid} : {}),
++    exp: Math.floor(Date.now() / 1000) + 10 * 60,
++    nonce: crypto.randomUUID()
++  }
++  const encoded = bytesToBase64Url(encoder.encode(JSON.stringify(payload)))
++  const signature = await crypto.subtle.sign('HMAC', await importTicketKey(), encoder.encode(encoded))
++  return `${encoded}.${bytesToBase64Url(new Uint8Array(signature))}`
++}
++
++export async function verifyLoginTicket(ticket: unknown): Promise<WechatTicketPayload> {
++  if (typeof ticket !== 'string' || !ticket.includes('.')) throw new HttpError(400, '微信登录凭证无效')
++  const [encoded, signature] = ticket.split('.')
++  const valid = await crypto.subtle.verify('HMAC', await importTicketKey(), base64UrlToBytes(signature), encoder.encode(encoded))
++  if (!valid) throw new HttpError(400, '微信登录凭证无效')
++  const payload = JSON.parse(decoder.decode(base64UrlToBytes(encoded))) as WechatTicketPayload
++  if (!payload.openid || payload.exp < Math.floor(Date.now() / 1000)) throw new HttpError(400, '微信登录凭证已过期，请重试')
++  return payload
++}
++
++export async function codeToSession(code: unknown): Promise<{openid: string; unionid?: string}> {
++  if (typeof code !== 'string' || !code.trim()) throw new HttpError(400, '缺少微信登录凭证')
++  const appId = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_ID') || ''
++  const secret = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_SECRET') || ''
++  if (!appId || !secret) throw new HttpError(500, 'WeChat login configuration is missing')
++  const query = new URLSearchParams({appid: appId, secret, js_code: code, grant_type: 'authorization_code'})
++  const response = await fetchWithTimeout(`https://api.weixin.qq.com/sns/jscode2session?${query.toString()}`, {method: 'GET'})
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.openid) {
++    const message = data.errcode === 40029 || data.errcode === 40163 ? '微信登录凭证已失效，请重试' : '微信身份校验失败'
++    throw new HttpError(data.errcode === 40029 || data.errcode === 40163 ? 400 : 502, message)
++  }
++  return {openid: data.openid, ...(data.unionid ? {unionid: data.unionid} : {})}
++}
++
++export async function sha256(value: string): Promise<string> {
++  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value))
++  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
++}
++
++export async function getWechatAccessToken(): Promise<string> {
++  const admin = getSupabaseAdmin()
++  const now = new Date()
++  const {data: cached} = await admin
++    .from('wechat_access_tokens')
++    .select('access_token, expires_at')
++    .eq('token_key', 'miniapp')
++    .maybeSingle()
++  if (cached?.access_token && new Date(cached.expires_at).getTime() > now.getTime() + 120_000) return cached.access_token
++
++  const appId = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_ID') || ''
++  const secret = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_SECRET') || ''
++  if (!appId || !secret) throw new HttpError(500, 'WeChat login configuration is missing')
++  const response = await fetchWithTimeout('https://api.weixin.qq.com/cgi-bin/stable_token', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/json'},
++    body: JSON.stringify({grant_type: 'client_credential', appid: appId, secret, force_refresh: false})
++  })
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.access_token) throw new HttpError(502, '微信服务令牌获取失败')
++  const expiresAt = new Date(now.getTime() + Math.max(300, Number(data.expires_in || 7200) - 120) * 1000).toISOString()
++  await admin.from('wechat_access_tokens').upsert({token_key: 'miniapp', access_token: data.access_token, expires_at: expiresAt})
++  return data.access_token
++}
++
++export async function getPhoneNumber(phoneCode: unknown): Promise<string> {
++  if (typeof phoneCode !== 'string' || !phoneCode.trim()) throw new HttpError(400, '手机号授权凭证无效')
++  const token = await getWechatAccessToken()
++  const response = await fetchWithTimeout(`https://api.weixin.qq.com/wxa/business/getuserphonenumber?access_token=${encodeURIComponent(token)}`, {
++    method: 'POST',
++    headers: {'Content-Type': 'application/json'},
++    body: JSON.stringify({code: phoneCode})
++  })
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.phone_info?.phoneNumber) throw new HttpError(400, '手机号授权已失效，可选择跳过')
++  return String(data.phone_info.phoneNumber)
++}
++
++export function maskPhone(phone: string | null | undefined): string | null {
++  if (!phone) return null
++  return phone.replace(/^(\d{3})\d+(\d{4})$/, '$1****$2')
++}
++
++export type ReminderKind = 'breakfast' | 'lunch' | 'dinner' | 'water'
++export interface WechatTemplateConfig {
++  templateId: string
++  page: string
++  fields: {title: string; time: string; remark?: string}
++}
++
++export function getSubscribeTemplates(): Partial<Record<ReminderKind, WechatTemplateConfig>> {
++  const raw = Deno.env.get('WECHAT_SUBSCRIBE_TEMPLATES_JSON') || ''
++  if (!raw) return {}
++  try {
++    const parsed = JSON.parse(raw) as Record<string, any>
++    const result: Partial<Record<ReminderKind, WechatTemplateConfig>> = {}
++    for (const kind of ['breakfast', 'lunch', 'dinner', 'water'] as ReminderKind[]) {
++      const item = parsed[kind]
++      if (item?.templateId && item?.fields?.title && item?.fields?.time) {
++        result[kind] = {
++          templateId: String(item.templateId),
++          page: typeof item.page === 'string' ? item.page : '/pages/home/index',
++          fields: {
++            title: String(item.fields.title),
++            time: String(item.fields.time),
++            ...(item.fields.remark ? {remark: String(item.fields.remark)} : {})
++          }
++        }
++      }
++    }
++    return result
++  } catch {
++    throw new HttpError(500, 'WeChat subscribe template configuration is invalid')
++  }
++}
+diff --git a/supabase/functions/upload-avatar/index.ts b/supabase/functions/upload-avatar/index.ts
+new file mode 100644
+index 0000000..62d2c14
+--- /dev/null
++++ b/supabase/functions/upload-avatar/index.ts
+@@ -0,0 +1,29 @@
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++
++function decodeBase64(value: string): Uint8Array {
++  const raw = value.includes(',') ? value.split(',')[1] : value
++  const binary = atob(raw)
++  return Uint8Array.from(binary, char => char.charCodeAt(0))
++}
++
++Deno.serve(async (req: Request) => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const userId = await getAuthUserId(req)
++    const {image, ext = 'jpg'} = await req.json().catch(() => ({}))
++    if (typeof image !== 'string' || !image) throw new HttpError(400, '缺少头像图片')
++    const safeExt = String(ext).toLowerCase() === 'png' ? 'png' : String(ext).toLowerCase() === 'webp' ? 'webp' : 'jpg'
++    const bytes = decodeBase64(image)
++    if (bytes.byteLength > 2 * 1024 * 1024) throw new HttpError(400, '头像不能超过 2MB')
++    const path = `${userId}/${crypto.randomUUID()}.${safeExt}`
++    const contentType = safeExt === 'jpg' ? 'image/jpeg' : `image/${safeExt}`
++    const admin = getSupabaseAdmin()
++    const {error} = await admin.storage.from('avatars').upload(path, bytes, {contentType, upsert: false})
++    if (error) throw error
++    const {data} = admin.storage.from('avatars').getPublicUrl(path)
++    return json({url: data.publicUrl})
++  } catch (error) {
++    return handleError(error, 'upload-avatar')
++  }
++})
+diff --git a/supabase/functions/wechat_miniapp_login/index.ts b/supabase/functions/wechat_miniapp_login/index.ts
+index 57d4c6f..435fca8 100644
+--- a/supabase/functions/wechat_miniapp_login/index.ts
++++ b/supabase/functions/wechat_miniapp_login/index.ts
+@@ -1,94 +1,147 @@
+-// wechat_miniapp_login — 微信小程序登录 EF
+-// 1. 用微信 code 换取 openid
+-// 2. 自动创建/复用 Supabase 用户
+-// 3. 生成 magiclink token 返回给客户端
+-import { createClient } from 'jsr:@supabase/supabase-js'
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++import {codeToSession, createLoginTicket, getPhoneNumber, maskPhone, sha256, verifyLoginTicket} from '../_shared/wechat.ts'
+ 
+-const SUPABASE_URL = Deno.env.get("APP_SUPABASE_URL") || Deno.env.get("SUPABASE_URL")!
+-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("APP_SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
++const PROVIDER = 'wechat_miniapp'
+ 
+-const corsHeaders = {
+-  'Access-Control-Allow-Origin': '*',
+-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
++async function findIdentity(openid: string) {
++  const admin = getSupabaseAdmin()
++  const {data, error} = await admin
++    .from('wechat_identities')
++    .select('user_id, openid, unionid, phone_number')
++    .eq('provider', PROVIDER)
++    .eq('openid', openid)
++    .maybeSingle()
++  if (error) throw error
++  if (data) return data
++
++  const {data: legacy, error: legacyError} = await admin
++    .from('profiles')
++    .select('id, openid')
++    .eq('openid', openid)
++    .maybeSingle()
++  if (legacyError) throw legacyError
++  if (!legacy) return null
++  const {data: migrated, error: migrateError} = await admin
++    .from('wechat_identities')
++    .upsert({provider: PROVIDER, user_id: legacy.id, openid}, {onConflict: 'provider,openid'})
++    .select('user_id, openid, unionid, phone_number')
++    .single()
++  if (migrateError) throw migrateError
++  return migrated
+ }
+ 
+-Deno.serve(async (req) => {
+-  if (req.method === 'OPTIONS') {
+-    return new Response(null, { status: 204, headers: corsHeaders })
+-  }
++async function generateLoginToken(userId: string): Promise<string> {
++  const admin = getSupabaseAdmin()
++  const {data: userData, error: userError} = await admin.auth.admin.getUserById(userId)
++  const email = userData.user?.email
++  if (userError || !email) throw new HttpError(500, '账号登录信息不完整')
++  const {data, error} = await admin.auth.admin.generateLink({type: 'magiclink', email})
++  const token = data?.properties?.hashed_token
++  if (error || !token) throw new HttpError(500, '无法生成登录凭证')
++  return token
++}
+ 
+-  try {
+-    const { code } = await req.json().catch(() => ({}))
+-    if (!code) {
+-      return new Response(JSON.stringify({ message: '缺少code' }), {
+-        status: 400,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleStart(loginCode: unknown) {
++  const session = await codeToSession(loginCode)
++  const identity = await findIdentity(session.openid)
++  if (identity) return json({status: 'authenticated', token: await generateLoginToken(identity.user_id)})
++  return json({status: 'unbound', registrationTicket: await createLoginTicket(session)})
++}
+ 
+-    const APP_ID = Deno.env.get("WECHAT_MINIPROGRAM_LOGIN_APP_ID")
+-    const APP_SECRET = Deno.env.get("WECHAT_MINIPROGRAM_LOGIN_APP_SECRET")
++async function handleLegacy(code: unknown) {
++  const session = await codeToSession(code)
++  const identity = await findIdentity(session.openid)
++  if (identity) return json({token: await generateLoginToken(identity.user_id), openid: session.openid})
++  return handleRegister(await createLoginTicket(session), undefined)
++}
+ 
+-    const wxRes = await fetch(
+-      `https://api.weixin.qq.com/sns/jscode2session?appid=${APP_ID}&secret=${APP_SECRET}&js_code=${code}&grant_type=authorization_code`
+-    )
+-    const wxData = await wxRes.json()
++async function handlePrepareBind(req: Request, loginCode: unknown) {
++  const currentUserId = await getAuthUserId(req)
++  const session = await codeToSession(loginCode)
++  const identity = await findIdentity(session.openid)
++  if (identity && identity.user_id !== currentUserId) throw new HttpError(409, '该微信已绑定其他账号')
++  return json({registrationTicket: await createLoginTicket(session)})
++}
+ 
+-    if (wxData.errcode) {
+-      return new Response(JSON.stringify({ message: `微信接口错误: ${wxData.errmsg}` }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleRegister(registrationTicket: unknown, phoneCode: unknown) {
++  const ticket = await verifyLoginTicket(registrationTicket)
++  const existing = await findIdentity(ticket.openid)
++  if (existing) return json({status: 'authenticated', token: await generateLoginToken(existing.user_id)})
+ 
+-    const { openid } = wxData
+-    const email = `${openid}@wechat.login`
++  const admin = getSupabaseAdmin()
++  const phone = phoneCode ? await getPhoneNumber(phoneCode) : null
++  const email = `wx_${(await sha256(ticket.openid)).slice(0, 40)}@wechat.login`
++  const {data: created, error: createError} = await admin.auth.admin.createUser({
++    email,
++    email_confirm: true,
++    user_metadata: {from: 'wechat', openid: ticket.openid}
++  })
++  if (createError || !created.user) throw new HttpError(500, '微信账号创建失败')
+ 
+-    // 若用户不存在则创建；忽略"已注册"错误
+-    const { error: createError } = await supabaseAdmin.auth.admin.createUser({
+-      email,
+-      email_confirm: true,
+-      user_metadata: { from: 'wechat', openid },
+-    })
+-    if (createError && !createError.message.includes('already been registered')) {
+-      return new Response(JSON.stringify({ message: createError.message }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++  const {error: identityError} = await admin.from('wechat_identities').insert({
++    provider: PROVIDER,
++    user_id: created.user.id,
++    openid: ticket.openid,
++    unionid: ticket.unionid || null,
++    phone_number: phone
++  })
++  if (identityError) {
++    await admin.auth.admin.deleteUser(created.user.id)
++    const raced = await findIdentity(ticket.openid)
++    if (raced) return json({status: 'authenticated', token: await generateLoginToken(raced.user_id)})
++    throw new HttpError(409, '微信账号创建冲突，请重试')
++  }
++  return json({status: 'authenticated', token: await generateLoginToken(created.user.id)})
++}
+ 
+-    const { data: magicLinkData, error: magicLinkError } =
+-      await supabaseAdmin.auth.admin.generateLink({
+-        type: 'magiclink',
+-        email,
+-        options: { data: { from: 'wechat', openid } },
+-      })
++async function handleBind(req: Request, registrationTicket: unknown) {
++  const userId = await getAuthUserId(req)
++  const ticket = await verifyLoginTicket(registrationTicket)
++  const admin = getSupabaseAdmin()
++  const existing = await findIdentity(ticket.openid)
++  if (existing && existing.user_id !== userId) throw new HttpError(409, '该微信已绑定其他账号')
++  if (!existing) {
++    const {error} = await admin.from('wechat_identities').insert({
++      provider: PROVIDER,
++      user_id: userId,
++      openid: ticket.openid,
++      unionid: ticket.unionid || null
++    })
++    if (error?.code === '23505') throw new HttpError(409, '该账号或微信已存在绑定关系')
++    if (error) throw error
++  }
++  await admin.from('profiles').update({openid: ticket.openid}).eq('id', userId).is('openid', null)
++  return json({status: 'bound'})
++}
+ 
+-    if (magicLinkError) {
+-      return new Response(JSON.stringify({ message: magicLinkError.message }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleStatus(req: Request) {
++  const userId = await getAuthUserId(req)
++  const {data, error} = await getSupabaseAdmin()
++    .from('wechat_identities')
++    .select('phone_number')
++    .eq('provider', PROVIDER)
++    .eq('user_id', userId)
++    .maybeSingle()
++  if (error) throw error
++  return json({bound: !!data, phoneMasked: maskPhone(data?.phone_number)})
++}
+ 
+-    const hashedToken = magicLinkData?.properties?.hashed_token ?? ''
+-    if (!hashedToken) {
+-      return new Response(JSON.stringify({ message: '无法生成token' }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
++Deno.serve(async (req: Request) => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const body = await req.json().catch(() => ({}))
++    switch (body.action) {
++      case 'start': return await handleStart(body.loginCode)
++      case 'prepare-bind': return await handlePrepareBind(req, body.loginCode)
++      case 'register': return await handleRegister(body.registrationTicket, body.phoneCode)
++      case 'bind': return await handleBind(req, body.registrationTicket)
++      case 'status': return await handleStatus(req)
++      default:
++        if (body.code) return await handleLegacy(body.code)
++        throw new HttpError(400, '未知的微信账号操作')
+     }
+-
+-    return new Response(JSON.stringify({ token: hashedToken, openid }), {
+-      status: 200,
+-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-    })
+   } catch (error) {
+-    return new Response(JSON.stringify({ message: error.message }), {
+-      status: 500,
+-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-    })
++    return handleError(error, 'wechat_miniapp_login')
+   }
+ })
+diff --git a/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql b/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql
+new file mode 100644
+index 0000000..0dad959
+--- /dev/null
++++ b/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql
+@@ -0,0 +1,133 @@
++-- 微信身份、一次性订阅通知、菜谱分享快照。
++-- 生产执行前先运行文末的重复 openid 审计查询。
++
++create table if not exists public.wechat_identities (
++  id uuid primary key default gen_random_uuid(),
++  provider text not null default 'wechat_miniapp',
++  user_id uuid not null references public.profiles(id) on delete cascade,
++  openid text not null,
++  unionid text,
++  phone_number text,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now(),
++  constraint wechat_identities_provider_openid_key unique (provider, openid),
++  constraint wechat_identities_provider_user_key unique (provider, user_id)
++);
++
++insert into public.wechat_identities (provider, user_id, openid)
++select 'wechat_miniapp', id, openid
++from public.profiles
++where openid is not null and btrim(openid) <> ''
++on conflict do nothing;
++
++create table if not exists public.wechat_access_tokens (
++  token_key text primary key,
++  access_token text not null,
++  expires_at timestamptz not null,
++  updated_at timestamptz not null default now()
++);
++
++create table if not exists public.notification_jobs (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references public.profiles(id) on delete cascade,
++  kind text not null check (kind in ('breakfast', 'lunch', 'dinner', 'water')),
++  template_id text not null,
++  scheduled_at timestamptz not null,
++  status text not null default 'pending' check (status in ('pending', 'processing', 'sent', 'cancelled', 'failed')),
++  attempts integer not null default 0,
++  wechat_msg_id text,
++  last_error text,
++  locked_at timestamptz,
++  sent_at timestamptz,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now()
++);
++
++create unique index if not exists notification_jobs_one_active_kind_idx
++  on public.notification_jobs(user_id, kind)
++  where status in ('pending', 'processing', 'failed');
++create index if not exists notification_jobs_due_idx
++  on public.notification_jobs(status, scheduled_at);
++
++create table if not exists public.recipe_shares (
++  id uuid primary key default gen_random_uuid(),
++  owner_id uuid not null references public.profiles(id) on delete cascade,
++  title text not null,
++  recipe_content text not null,
++  ingredients jsonb not null default '[]'::jsonb,
++  expires_at timestamptz not null default (now() + interval '90 days'),
++  revoked_at timestamptz,
++  created_at timestamptz not null default now()
++);
++
++create index if not exists recipe_shares_owner_created_idx on public.recipe_shares(owner_id, created_at desc);
++create index if not exists recipe_shares_expiry_idx on public.recipe_shares(expires_at);
++
++alter table public.wechat_identities enable row level security;
++alter table public.wechat_access_tokens enable row level security;
++alter table public.notification_jobs enable row level security;
++alter table public.recipe_shares enable row level security;
++
++-- 以上表只允许 service_role 通过 Edge Functions 访问，不创建 anon/authenticated policy。
++
++drop trigger if exists wechat_identities_updated_at on public.wechat_identities;
++create trigger wechat_identities_updated_at
++  before update on public.wechat_identities
++  for each row execute function public.update_updated_at();
++
++drop trigger if exists notification_jobs_updated_at on public.notification_jobs;
++create trigger notification_jobs_updated_at
++  before update on public.notification_jobs
++  for each row execute function public.update_updated_at();
++
++create or replace function public.claim_due_notification_jobs(batch_size integer default 50)
++returns setof public.notification_jobs
++language plpgsql
++security definer
++set search_path = public
++as $$
++begin
++  return query
++  with due as (
++    select id
++    from public.notification_jobs
++    where (
++        status in ('pending', 'failed')
++        or (status = 'processing' and locked_at < now() - interval '5 minutes')
++      )
++      and scheduled_at <= now()
++      and attempts < 3
++      and (locked_at is null or locked_at < now() - interval '5 minutes')
++    order by scheduled_at asc
++    limit greatest(1, least(batch_size, 100))
++    for update skip locked
++  )
++  update public.notification_jobs jobs
++  set status = 'processing', locked_at = now(), attempts = jobs.attempts + 1, updated_at = now()
++  from due
++  where jobs.id = due.id
++  returning jobs.*;
++end;
++$$;
++
++revoke all on function public.claim_due_notification_jobs(integer) from public, anon, authenticated;
++grant execute on function public.claim_due_notification_jobs(integer) to service_role;
++
++insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
++values ('avatars', 'avatars', true, 2097152, array['image/jpeg', 'image/png', 'image/webp'])
++on conflict (id) do update
++set public = excluded.public,
++    file_size_limit = excluded.file_size_limit,
++    allowed_mime_types = excluded.allowed_mime_types;
++
++drop policy if exists avatars_public_read on storage.objects;
++create policy avatars_public_read on storage.objects
++  for select to public using (bucket_id = 'avatars');
++
++grant select, insert, update, delete on public.wechat_identities to service_role;
++grant select, insert, update, delete on public.wechat_access_tokens to service_role;
++grant select, insert, update, delete on public.notification_jobs to service_role;
++grant select, insert, update, delete on public.recipe_shares to service_role;
++
++-- Preflight audit: this query must return zero rows before applying the migration.
++-- select openid, count(*) from public.profiles where openid is not null group by openid having count(*) > 1;
+diff --git a/supabase/secrets/required.json b/supabase/secrets/required.json
+index 76b7f27..ba9dc46 100644
+--- a/supabase/secrets/required.json
++++ b/supabase/secrets/required.json
+@@ -1 +1 @@
+-{"required_secrets": ["BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_QIANFAN_API_KEY", "BAIDU_AK", "BAIDU_SK", "BAIDU_QIANFAN_API_KEY", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_ASR_APP_KEY", "BAIDU_ASR_APP_SECRET", "BAIDU_ASR_APP_KEY", "BAIDU_ASR_APP_SECRET", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_BRTC_LICENSE_KEY", "BAIDU_BRTC_APPID"]}
++{"required_secrets":["BAIDU_BRTC_AK","BAIDU_BRTC_SK","BAIDU_QIANFAN_API_KEY","BAIDU_AK","BAIDU_SK","BAIDU_ASR_APP_KEY","BAIDU_ASR_APP_SECRET","BAIDU_BRTC_LICENSE_KEY","BAIDU_BRTC_APPID","WECHAT_MINIPROGRAM_LOGIN_APP_ID","WECHAT_MINIPROGRAM_LOGIN_APP_SECRET","WECHAT_LOGIN_TICKET_SECRET","WECHAT_SUBSCRIBE_TEMPLATES_JSON","WECHAT_NOTIFICATION_DISPATCH_SECRET"]}

@@ -41,6 +41,7 @@ taro-weapp-template.tar
 .vscode/
 output/
 .sync
+.codegraph/
 history/*.json
 .vite_cache
 /.skills

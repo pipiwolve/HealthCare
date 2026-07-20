@@ -1,19 +1,119 @@
 // @title AI健康顾问
 
 import {Image, Textarea} from '@tarojs/components'
-import Taro, {useDidHide, useDidShow } from '@tarojs/taro'
-import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {supabase} from '@/client/supabase'
+import Taro, {useDidHide, useDidShow} from '@tarojs/taro'
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
-import {createChatMessage, createChatSession, getRtcHistoryGroups, updateChatSession } from '@/db/api'
+import {getRtcHistoryGroups } from '@/db/api'
 import type {ChatMessage, ChatSession, RtcHistoryGroup } from '@/db/types'
-import {getAiWebSocket} from '@/services/aiWebSocket'
+import {createAiWebSocket, getAiWebSocket} from '@/services/aiWebSocket'
 import {useAppStore} from '@/store/appStore'
-import {buildFamilyHealthContext} from '@/utils/allergenUtils'
 import {buildChatPrompt} from '@/utils/aiPromptHelpers'
-import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
+import {buildFamilyHealthContext} from '@/utils/allergenUtils'
+import {normalizeAiMarkdown} from '@/utils/markdownText'
+import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
+
+const VOICE_MESSAGE_PREFIX = '🎙 '
+const VOICE_LONG_PRESS_MS = 120
+const MIN_VOICE_RECORD_MS = 500
+
+let sharedRtcAudioContext: any = null
+let sharedRtcAudioUnlockLogged = false
+let rtcAudioKeepaliveSource: any = null
+let rtcAudioKeepaliveUntil = 0
+
+function isVoiceMessage(content: string): boolean {
+  return content.startsWith(VOICE_MESSAGE_PREFIX)
+}
+
+function getVoiceTranscript(content: string): string {
+  return isVoiceMessage(content) ? content.slice(VOICE_MESSAGE_PREFIX.length).trim() : content
+}
+
+function createLocalChatSession(userId: string, memberId: string | null, title: string): ChatSession {
+  const now = new Date().toISOString()
+  return {
+    id: `local-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    user_id: userId,
+    member_id: memberId,
+    title: title || '新对话',
+    context_data: {},
+    created_at: now,
+    updated_at: now,
+  }
+}
+
+function createLocalChatMessage(
+  sessionId: string,
+  role: ChatMessage['role'],
+  content: string,
+  imageUrl: string | null = null,
+  audioUrl: string | null = null,
+): ChatMessage {
+  return {
+    id: `local-message-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    session_id: sessionId,
+    role,
+    content,
+    image_url: imageUrl,
+    audio_url: audioUrl,
+    created_at: new Date().toISOString(),
+  }
+}
+
+type SendMessageOptions = {
+  skipUserBubble?: boolean
+  session?: ChatSession
+}
+
+function getSharedRtcAudioContext(): any | null {
+  const wxApi = (globalThis as any).wx || (Taro as any)
+  if (!sharedRtcAudioContext) {
+    sharedRtcAudioContext = wxApi?.createWebAudioContext?.() || null
+  }
+  return sharedRtcAudioContext
+}
+
+function unlockRtcAudioPlayback(reason = 'interaction'): boolean {
+  const context = getSharedRtcAudioContext()
+  if (!context?.createBuffer || !context?.createBufferSource || !context?.destination) return false
+  try {
+    const resumeResult = context.resume?.()
+    if (resumeResult?.catch) {
+      void resumeResult.catch((error: unknown) => {
+        console.warn('RTC TTS 播放上下文恢复失败:', error)
+      })
+    }
+    const now = Date.now()
+    if (!rtcAudioKeepaliveSource || now > rtcAudioKeepaliveUntil - 2000) {
+      try {
+        rtcAudioKeepaliveSource?.stop?.()
+      } catch {}
+      rtcAudioKeepaliveSource = null
+      const keepaliveSeconds = 45
+      const silentBuffer = context.createBuffer(1, 16000 * keepaliveSeconds, 16000)
+      const silentSource = context.createBufferSource()
+      silentSource.buffer = silentBuffer
+      silentSource.connect(context.destination)
+      silentSource.onended = () => {
+        if (rtcAudioKeepaliveSource === silentSource) rtcAudioKeepaliveSource = null
+      }
+      silentSource.start(0)
+      rtcAudioKeepaliveSource = silentSource
+      rtcAudioKeepaliveUntil = now + keepaliveSeconds * 1000
+    }
+    if (!sharedRtcAudioUnlockLogged) {
+      sharedRtcAudioUnlockLogged = true
+      console.info('RTC TTS 播放上下文已通过用户手势解锁', {reason})
+    }
+    return true
+  } catch (err: any) {
+    console.warn('RTC TTS 播放上下文解锁失败:', err?.message || err)
+    return false
+  }
+}
 
 function ChatPage() {
   const {user} = useAuth()
@@ -25,7 +125,8 @@ function ChatPage() {
   const [activeRtcGroupId, setActiveRtcGroupId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputText, setInputText] = useState('')
-  const [inputHeight, setInputHeight] = useState(32)
+  const [inputHeight, setInputHeight] = useState(24)
+  const [keyboardHeight, setKeyboardHeight] = useState(0)
   const [isLoading, setIsLoading] = useState(false)
   const [showDrawer, setShowDrawer] = useState(false)
   const [rtcHistoryGroups, setRtcHistoryGroups] = useState<RtcHistoryGroup[]>([])
@@ -33,31 +134,36 @@ function ChatPage() {
   const [rtcHistoryError, setRtcHistoryError] = useState('')
   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
   const [isRecording, setIsRecording] = useState(false)
+  const [isVoicePressing, setIsVoicePressing] = useState(false)
+  const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
   const [useProfile, setUseProfile] = useState(true)
   const [useIngredients, setUseIngredients] = useState(false)
   const recorderManager = useRef<Taro.RecorderManager | null>(null)
   const audioContextRef = useRef<Taro.InnerAudioContext | null>(null)
   const audioMessageIdRef = useRef<string | null>(null)
-  const [pendingImage, setPendingImage] = useState<{localPath: string; base64: string; ext: string} | null>(null)
-  const [isUploadingImage, setIsUploadingImage] = useState(false)
-
-  // WebSocket 语音通话状态
-  const [voiceState, setVoiceState] = useState<'idle' | 'connecting' | 'active'>('idle')
+  const liveAudioPlayerRef = useRef<PcmStreamPlayer | null>(null)
+  const activeChatWsRef = useRef<ReturnType<typeof getAiWebSocket> | null>(null)
+  const interruptedChatWsRef = useRef<Set<ReturnType<typeof getAiWebSocket>>>(new Set())
+  const voiceTouchStartYRef = useRef(0)
+  const voiceCancelRef = useRef(false)
+  const voicePressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const voicePressingRef = useRef(false)
+  const voiceRecordStartingRef = useRef(false)
+  const voiceRecordStartedAtRef = useRef(0)
   const [voiceMode, setVoiceMode] = useState(false)
-  const voiceTempUserMsgId = useRef<string | null>(null)
-  const voiceTempAiMsgId = useRef<string | null>(null)
   const voiceSessionRef = useRef<ChatSession | null>(null)
 
   const loadRtcHistory = useCallback(async () => {
     if (!user) return
     setRtcHistoryLoading(true)
     setRtcHistoryError('')
+
     try {
       const data = await getRtcHistoryGroups()
       setRtcHistoryGroups(data)
     } catch (err: any) {
-      console.error('加载云端历史失败:', err?.message || err)
-      setRtcHistoryError(err?.message || '云端历史加载失败')
+      console.error('加载 RTC 云端历史失败:', err?.message || err)
+      setRtcHistoryError(err?.message || 'RTC 云端历史加载失败')
     } finally {
       setRtcHistoryLoading(false)
     }
@@ -76,8 +182,11 @@ function ChatPage() {
 
   useEffect(() => {
     return () => {
+      if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
       audioContextRef.current?.destroy()
       audioContextRef.current = null
+      liveAudioPlayerRef.current?.stop()
+      liveAudioPlayerRef.current = null
     }
   }, [])
 
@@ -129,7 +238,7 @@ function ChatPage() {
     setActiveRtcGroupId(null)
     setMessages([])
     setInputText('')
-    setInputHeight(32)
+    setInputHeight(24)
     if (contextData) setUseIngredients(true)
   }
 
@@ -148,49 +257,29 @@ function ChatPage() {
     setShowDrawer(false)
   }
 
-  const sendMessage = async (content: string, imageUrl?: string, imageBase64?: string, imageExt = 'jpg') => {
-    if (!content.trim() && !imageUrl) return
+  const sendMessage = async (content: string, options?: SendMessageOptions) => {
+    if (!content.trim()) return
     if (!isOnline) {
       Taro.showToast({title: '需要网络连接', icon: 'none'})
       return
     }
 
-    let session = activeSession
+    const displayContent = content
+    const promptContent = getVoiceTranscript(content)
+    let session = options?.session || activeSession
     if (!session) {
-      session = await createChatSession({
-        user_id: user!.id,
-        member_id: activeMember?.id || null,
-        title: content.slice(0, 20) || '新对话',
-        context_data: {}
-      }) as ChatSession
+      session = createLocalChatSession(user!.id, activeMember?.id || null, promptContent.slice(0, 20) || '新对话')
       setActiveSession(session)
     }
     setActiveRtcGroupId(null)
 
-    const optimisticId = `optimistic-${Date.now()}`
-    const optimisticMsg: ChatMessage = {
-      id: optimisticId,
-      session_id: session.id,
-      role: 'user',
-      content,
-      image_url: imageUrl || null,
-      created_at: new Date().toISOString(),
+    if (!options?.skipUserBubble) {
+      setMessages(prev => [...prev, createLocalChatMessage(session.id, 'user', displayContent)])
     }
-    setMessages(prev => [...prev, optimisticMsg])
     setInputText('')
-    setInputHeight(32)
+    setInputHeight(24)
     setIsLoading(true)
-
-    createChatMessage({
-      session_id: session.id,
-      role: 'user',
-      content,
-      image_url: imageUrl || null
-    }).then(saved => {
-      if (saved) {
-        setMessages(prev => prev.map(m => m.id === optimisticId ? saved : m))
-      }
-    })
+    let requestWs: ReturnType<typeof getAiWebSocket> | null = null
 
     try {
       let healthContext = ''
@@ -210,18 +299,24 @@ function ChatPage() {
       }
 
       const fullPrompt = buildChatPrompt({
-        userQuestion: content,
+        userQuestion: promptContent,
         healthContext,
         ingredientContext
       })
 
       const ws = getAiWebSocket()
+      requestWs = ws
+      activeChatWsRef.current = ws
       let aiReply = ''
       const streamingAiId = `streaming-ai-${Date.now()}`
       const audioChunks: ArrayBuffer[] = []
       let streamingAudioUrl: string | null = null
       let audioWritePromise: Promise<string | null> | null = null
       let ttsEnded = false
+      liveAudioPlayerRef.current?.stop()
+      liveAudioPlayerRef.current = null
+      const liveAudioPlayer = createPcmStreamPlayer()
+      liveAudioPlayerRef.current = liveAudioPlayer
       const createStreamingAiMessage = () => {
         setMessages(prev => prev.some(m => m.id === streamingAiId) ? prev : [...prev, {
           id: streamingAiId,
@@ -234,7 +329,7 @@ function ChatPage() {
         }])
       }
       const updateStreamingAiMessage = (text: string) => {
-        setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, content: text} : m))
+        setMessages(prev => prev.map(m => m.id === streamingAiId ? {...m, content: normalizeAiMarkdown(text)} : m))
       }
       const attachAudioToStreamingMessage = async () => {
         if (streamingAudioUrl) return streamingAudioUrl
@@ -249,56 +344,56 @@ function ChatPage() {
         return audioWritePromise
       }
       try {
-        if (imageBase64) {
-          await ws.connect({mode: 'default', userId: user!.id})
-          createStreamingAiMessage()
-          aiReply = await ws.requestImageResponse({
-            triggerText: '请先请求上传图片。收到图片后，结合图片和用户问题给出简洁回答。',
-            imageBase64,
-            fileName: `chat-image.${imageExt}`,
-            finalText: `图片已上传完成，请直接结合图片和问题回答，不要再次请求上传图片。\n${fullPrompt}`,
-            onInterim: updateStreamingAiMessage
-          })
-        } else {
-          await ws.connect({mode: 'default', userId: user!.id})
-          createStreamingAiMessage()
-          aiReply = await ws.requestResponse(fullPrompt, {
-            onInterim: updateStreamingAiMessage,
-            onAudio: (buffer) => audioChunks.push(buffer),
-            onTtsEnd: () => {
-              ttsEnded = true
-              void attachAudioToStreamingMessage()
-            }
-          })
-          if (!streamingAudioUrl && (ttsEnded || audioChunks.length > 0)) {
-            streamingAudioUrl = await attachAudioToStreamingMessage()
+        await ws.connect({mode: 'default', agentProfile: 'chat', userId: user!.id})
+        createStreamingAiMessage()
+        aiReply = await ws.requestResponse(fullPrompt, {
+          onInterim: updateStreamingAiMessage,
+          onAudio: (buffer) => {
+            audioChunks.push(buffer)
+            liveAudioPlayer?.append(buffer)
+          },
+          onTtsEnd: () => {
+            ttsEnded = true
+            liveAudioPlayer?.finish()
+            void attachAudioToStreamingMessage()
           }
+        })
+        if (!streamingAudioUrl && (ttsEnded || audioChunks.length > 0)) {
+          streamingAudioUrl = await attachAudioToStreamingMessage()
         }
       } finally {
         ws.disconnect()
+        if (liveAudioPlayerRef.current === liveAudioPlayer) {
+          liveAudioPlayer?.finish()
+          liveAudioPlayerRef.current = null
+        }
       }
 
-      const aiMsg = await createChatMessage({
-        session_id: session.id,
-        role: 'assistant',
-        content: aiReply || '抱歉，我暂时无法回答您的问题，请稍后重试。'
+      const aiMsg = createLocalChatMessage(
+        session.id,
+        'assistant',
+        normalizeAiMarkdown(aiReply) || '抱歉，我暂时无法回答您的问题，请稍后重试。',
+        null,
+        streamingAudioUrl,
+      )
+      setMessages(prev => {
+        const hasStreamingMessage = prev.some(m => m.id === streamingAiId)
+        if (!hasStreamingMessage) return [...prev, aiMsg]
+        return prev.map(m => m.id === streamingAiId ? aiMsg : m)
       })
-      if (aiMsg) {
-        const renderedAiMsg = streamingAudioUrl ? {...aiMsg, audio_url: streamingAudioUrl} : aiMsg
-        setMessages(prev => {
-          const hasStreamingMessage = prev.some(m => m.id === streamingAiId)
-          if (!hasStreamingMessage) return [...prev, renderedAiMsg]
-          return prev.map(m => m.id === streamingAiId ? renderedAiMsg : m)
-        })
-      }
-
-      if (messages.length === 0) {
-        await updateChatSession(session.id, {title: content.slice(0, 20)})
-      }
     } catch (err: any) {
-      console.error('AI回复失败详情:', err?.message || err, err)
-      Taro.showToast({title: 'AI回复失败，请重试', icon: 'none'})
+      const wasInterrupted = requestWs ? interruptedChatWsRef.current.has(requestWs) : false
+      if (wasInterrupted) {
+        if (requestWs) interruptedChatWsRef.current.delete(requestWs)
+        console.info('AI 回复已被用户语音输入打断')
+      } else {
+        console.error('AI回复失败详情:', err?.message || err, err)
+        Taro.showToast({title: 'AI回复失败，请重试', icon: 'none'})
+      }
     } finally {
+      if (requestWs && activeChatWsRef.current === requestWs) {
+        activeChatWsRef.current = null
+      }
       setIsLoading(false)
     }
   }
@@ -321,23 +416,6 @@ function ChatPage() {
     })
   }
 
-  const readImageAsBase64 = (filePath: string): Promise<{base64: string; ext: string}> => {
-    return new Promise((resolve, reject) => {
-      const fs = Taro.getFileSystemManager()
-      fs.readFile({
-        filePath,
-        encoding: 'base64',
-        success: (res) => {
-          const ext = filePath.split('.').pop()?.toLowerCase() || 'jpg'
-          const mimeMap: Record<string, string> = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp'}
-          const mime = mimeMap[ext] || 'image/jpeg'
-          resolve({base64: `data:${mime};base64,${res.data}`, ext})
-        },
-        fail: reject
-      })
-    })
-  }
-
   const writeAudioChunksToTempFile = async (chunks: ArrayBuffer[]): Promise<string | null> => {
     if (chunks.length === 0) return null
     const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
@@ -350,10 +428,7 @@ function ChatPage() {
     }
     if (!Taro.env.USER_DATA_PATH) return null
     const isWav = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
-    const isMp3 = (
-      (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) ||
-      (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)
-    )
+    const isMp3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33
     const audioData = isWav || isMp3 ? bytes : wrapPcm16ToWav(bytes)
     const ext = isMp3 ? 'mp3' : 'wav'
     const filePath = `${Taro.env.USER_DATA_PATH}/rtc-tts-${Date.now()}.${ext}`
@@ -364,6 +439,24 @@ function ChatPage() {
         success: () => resolve(filePath),
         fail: (err) => {
           console.warn('写入 RTC TTS 音频失败:', err?.errMsg || err)
+          resolve(null)
+        }
+      })
+    })
+  }
+
+  const writePcmVoiceToWavFile = async (buffer: ArrayBuffer): Promise<string | null> => {
+    if (!Taro.env.USER_DATA_PATH || buffer.byteLength < 256) return null
+    const bytes = new Uint8Array(buffer)
+    const wav = wrapPcm16ToWav(bytes)
+    const filePath = `${Taro.env.USER_DATA_PATH}/voice-message-${Date.now()}.wav`
+    return new Promise((resolve) => {
+      Taro.getFileSystemManager().writeFile({
+        filePath,
+        data: wav.buffer,
+        success: () => resolve(filePath),
+        fail: (err) => {
+          console.warn('写入语音消息音频失败:', err?.errMsg || err)
           resolve(null)
         }
       })
@@ -405,8 +498,22 @@ function ChatPage() {
     setPlayingAudioId(null)
   }, [])
 
+  const interruptActiveChatResponse = useCallback((reason = 'voice-input') => {
+    const ws = activeChatWsRef.current
+    if (ws) {
+      interruptedChatWsRef.current.add(ws)
+      activeChatWsRef.current = null
+      ws.disconnect()
+    }
+    liveAudioPlayerRef.current?.stop()
+    liveAudioPlayerRef.current = null
+    setIsLoading(false)
+    console.info('已打断当前 AI/TTS 回复', {reason})
+  }, [])
+
   const handlePlayAudio = useCallback((msg: ChatMessage) => {
     if (!msg.audio_url) return
+    unlockRtcAudioPlayback('audio-button')
     try {
       if (msg.audio_url.startsWith(Taro.env.USER_DATA_PATH || '')) {
         const stat = Taro.getFileSystemManager().statSync(msg.audio_url) as Taro.Stats
@@ -437,7 +544,7 @@ function ChatPage() {
       }
     })
     ctx.onError((err) => {
-      console.warn('播放 RTC TTS 音频失败:', err?.errMsg || err)
+      console.warn('播放音频失败:', err?.errMsg || err)
       if (audioMessageIdRef.current === msg.id) {
         audioMessageIdRef.current = null
         audioContextRef.current?.destroy()
@@ -464,165 +571,17 @@ function ChatPage() {
     })
   }, [])
 
-  // ── WebSocket 语音通话逻辑 ──────────────────────────────────────────────
-
   const ensureSession = useCallback(async (title: string): Promise<ChatSession | null> => {
     if (voiceSessionRef.current) return voiceSessionRef.current
     if (activeSession) { voiceSessionRef.current = activeSession; return activeSession }
-    const s = await createChatSession({
-      user_id: user!.id,
-      member_id: activeMember?.id || null,
-      title,
-      context_data: {}
-    }) as ChatSession
+    const s = createLocalChatSession(user!.id, activeMember?.id || null, title)
     setActiveSession(s)
     setActiveRtcGroupId(null)
     voiceSessionRef.current = s
     return s
   }, [activeSession, activeMember, user])
 
-  const handleStartVoiceCall = useCallback(async () => {
-    if (!isOnline) { Taro.showToast({title: '需要网络连接', icon: 'none'}); return }
-    if (voiceState !== 'idle') return
-
-    setVoiceState('connecting')
-    Taro.showToast({title: '正在连接…', icon: 'loading', duration: 3000})
-
-    try {
-      const ws = getAiWebSocket()
-      await ws.connect({mode: 'default', userId: user!.id})
-      Taro.hideToast()
-      setVoiceState('active')
-      Taro.showToast({title: '语音通话已开始', icon: 'success', duration: 1500})
-
-      ws.onMessage('asr-interim', async (data) => {
-        const text = data as string
-        const session = await ensureSession('语音对话')
-        if (!session) return
-        if (voiceTempUserMsgId.current) {
-          setMessages(prev => prev.map(m =>
-            m.id === voiceTempUserMsgId.current ? {...m, content: `🎙 ${text}`} : m
-          ))
-        } else {
-          const placeholder: ChatMessage = {
-            id: `voice-user-${Date.now()}`, session_id: session.id,
-            role: 'user', content: `🎙 ${text}`, image_url: null, created_at: new Date().toISOString()
-          }
-          voiceTempUserMsgId.current = placeholder.id
-          setMessages(prev => [...prev, placeholder])
-        }
-      })
-
-      ws.onMessage('asr-final', async (data) => {
-        const text = data as string
-        const session = await ensureSession('语音对话')
-        if (!session) return
-        const saved = await createChatMessage({session_id: session.id, role: 'user', content: text, image_url: null})
-        if (saved) {
-          if (voiceTempUserMsgId.current) {
-            setMessages(prev => prev.map(m => m.id === voiceTempUserMsgId.current ? saved : m))
-          } else {
-            setMessages(prev => [...prev, saved])
-          }
-          voiceTempUserMsgId.current = null
-        }
-      })
-
-      ws.onMessage('llm-interim', async (data) => {
-        const text = data as string
-        const session = await ensureSession('语音对话')
-        if (!session) return
-        if (voiceTempAiMsgId.current) {
-          setMessages(prev => prev.map(m => m.id === voiceTempAiMsgId.current ? {...m, content: text} : m))
-        } else {
-          const placeholder: ChatMessage = {
-            id: `voice-ai-${Date.now()}`, session_id: session.id,
-            role: 'assistant', content: text, image_url: null, created_at: new Date().toISOString()
-          }
-          voiceTempAiMsgId.current = placeholder.id
-          setMessages(prev => [...prev, placeholder])
-        }
-      })
-
-      ws.onMessage('llm-final', async (data) => {
-        const text = data as string
-        const session = await ensureSession('语音对话')
-        if (!session) return
-        const saved = await createChatMessage({session_id: session.id, role: 'assistant', content: text, image_url: null})
-        if (saved) {
-          if (voiceTempAiMsgId.current) {
-            setMessages(prev => prev.map(m => m.id === voiceTempAiMsgId.current ? saved : m))
-          } else {
-            setMessages(prev => [...prev, saved])
-          }
-          voiceTempAiMsgId.current = null
-        }
-      })
-
-      const rm = Taro.getRecorderManager()
-      rm.onFrameRecorded?.((res: any) => {
-        if (res.frameBuffer) ws.sendAudio(res.frameBuffer)
-      })
-      rm.start({duration: 600000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
-      recorderManager.current = rm
-    } catch {
-      setVoiceState('idle')
-      Taro.hideToast()
-      Taro.showToast({title: '语音连接失败，请重试', icon: 'none'})
-    }
-  }, [ensureSession, isOnline, voiceState])
-
-  const handleStopVoiceCall = useCallback(() => {
-    recorderManager.current?.stop()
-    const ws = getAiWebSocket()
-    ws.disconnect()
-    setVoiceState('idle')
-    voiceTempUserMsgId.current = null
-    voiceTempAiMsgId.current = null
-    voiceSessionRef.current = null
-    Taro.showToast({title: '通话已结束', icon: 'none'})
-  }, [])
-
-  const handleVoiceMicToggle = useCallback(() => {
-    if (isRecording) {
-      recorderManager.current?.stop()
-      return
-    }
-
-    const doStartRecord = () => {
-      const rm = Taro.getRecorderManager()
-      recorderManager.current = rm
-      rm.onStart(() => setIsRecording(true))
-      rm.onStop(async (res) => {
-        setIsRecording(false)
-        if (!res.tempFilePath) return
-        try {
-          const {base64} = await readAudioAsBase64(res.tempFilePath)
-          const buffer = Taro.base64ToArrayBuffer(base64)
-          const ws = getAiWebSocket()
-          await ws.connect({mode: 'default', userId: user!.id})
-          ws.sendAudio(buffer)
-          const text = await new Promise<string>((resolve, reject) => {
-            const timeout = setTimeout(() => { unsub(); reject(new Error('timeout')) }, 15000)
-            const unsub = ws.onMessage('asr-final', (data) => {
-              clearTimeout(timeout)
-              unsub()
-              resolve(data as string)
-            })
-          })
-          ws.disconnect()
-          if (text.trim()) {
-            sendMessage(`🎙 ${text.trim()}`)
-          } else {
-            Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
-          }
-        } catch {
-          Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
-        }
-      })
-      rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
-    }
-
+  const ensureRecordPermission = useCallback((): Promise<boolean> => {
     const showSettingGuide = () => {
       Taro.showModal({
         title: '需要麦克风权限',
@@ -633,80 +592,177 @@ function ChatPage() {
       })
     }
 
-    Taro.getSetting({
-      success: (settingRes: any) => {
-        const status = settingRes?.authSetting?.['scope.record']
-        if (status === true) {
-          doStartRecord()
-        } else if (status === false) {
-          showSettingGuide()
-        } else {
+    return new Promise((resolve) => {
+      Taro.getSetting({
+        success: (settingRes: any) => {
+          const status = settingRes?.authSetting?.['scope.record']
+          if (status === true) {
+            resolve(true)
+          } else if (status === false) {
+            showSettingGuide()
+            resolve(false)
+          } else {
+            Taro.authorize({
+              scope: 'scope.record',
+              success: () => resolve(true),
+              fail: () => {
+                showSettingGuide()
+                resolve(false)
+              }
+            })
+          }
+        },
+        fail: () => {
           Taro.authorize({
             scope: 'scope.record',
-            success: () => doStartRecord(),
-            fail: () => showSettingGuide()
+            success: () => resolve(true),
+            fail: () => {
+              showSettingGuide()
+              resolve(false)
+            }
           })
         }
-      },
-      fail: () => {
-        Taro.authorize({
-          scope: 'scope.record',
-          success: () => doStartRecord(),
-          fail: () => showSettingGuide()
-        })
-      }
+      })
     })
-  }, [isRecording, sendMessage])
+  }, [])
 
-  const handleImageUpload = async () => {
-    try {
-      const res = await Taro.chooseMedia({count: 1, mediaType: ['image']})
-      if (!res.tempFiles?.[0]) return
-      const localPath = res.tempFiles[0].tempFilePath
-      const image = await readImageAsBase64(localPath)
-      setPendingImage({localPath, base64: image.base64, ext: image.ext})
-    } catch (err) {
-      if (isUserCancelError(err)) return
-      if (isPrivacyScopeError(err)) {
-        console.warn('图片选择隐私配置缺失:', err)
-        showPrivacyScopeDeclarationTip('相册/摄像头')
-        return
-      }
-      Taro.showToast({title: '选取图片失败', icon: 'none'})
-    }
-  }
-
-  const handleSendWithImage = async () => {
-    if (isUploadingImage || isLoading) return
-    if (!pendingImage) {
-      if (inputText.trim()) sendMessage(inputText)
+  const startVoiceRecording = useCallback(async () => {
+    if (isRecording || voiceRecordStartingRef.current) return
+    voiceRecordStartingRef.current = true
+    if (!await ensureRecordPermission()) {
+      voiceRecordStartingRef.current = false
       return
     }
-    setIsUploadingImage(true)
-    let loadingShown = false
-    Taro.showLoading({title: '上传中...'})
-    loadingShown = true
-    try {
-      const {uploadToSupabase} = await import('@/utils/upload')
-      const result = await uploadToSupabase(
-        {tempFilePath: pendingImage.localPath} as any,
-        {bucket: 'chat-images', userId: user!.id}
-      )
-      Taro.hideLoading()
-      loadingShown = false
-      if (result.success && result.data) {
-        const {data: urlData} = supabase.storage.from('chat-images').getPublicUrl(result.data.path)
-        setPendingImage(null)
-        sendMessage(inputText || '请分析这张图片中的食物', urlData.publicUrl, pendingImage.base64, pendingImage.ext)
-      } else {
-        Taro.showToast({title: '图片上传失败', icon: 'none'})
-      }
-    } catch {
-      if (loadingShown) Taro.hideLoading()
-      Taro.showToast({title: '图片上传失败', icon: 'none'})
-    } finally {
-      setIsUploadingImage(false)
+    if (!voicePressingRef.current) {
+      voiceRecordStartingRef.current = false
+      return
     }
+
+    const doStartRecord = () => {
+      const rm = Taro.getRecorderManager()
+      recorderManager.current = rm
+      voiceCancelRef.current = false
+      setIsRecordingCanceling(false)
+      rm.onStart(() => {
+        voiceRecordStartingRef.current = false
+        if (!voicePressingRef.current) {
+          recorderManager.current?.stop()
+          return
+        }
+        voiceRecordStartedAtRef.current = Date.now()
+        setIsRecording(true)
+      })
+      rm.onStop(async (res) => {
+        voiceRecordStartingRef.current = false
+        setIsRecording(false)
+        setIsVoicePressing(false)
+        setIsRecordingCanceling(false)
+        if (voiceCancelRef.current) {
+          voiceCancelRef.current = false
+          voiceRecordStartedAtRef.current = 0
+          Taro.showToast({title: '已取消发送', icon: 'none'})
+          return
+        }
+        if (!res.tempFilePath) return
+        const recordDurationMs = voiceRecordStartedAtRef.current ? Date.now() - voiceRecordStartedAtRef.current : 0
+        voiceRecordStartedAtRef.current = 0
+        if (recordDurationMs < MIN_VOICE_RECORD_MS) {
+          Taro.showToast({title: '说话时间太短', icon: 'none'})
+          return
+        }
+        const ws = createAiWebSocket()
+        const session = await ensureSession('语音对话')
+        if (!session) return
+        const placeholder = createLocalChatMessage(session.id, 'user', `${VOICE_MESSAGE_PREFIX}正在识别...`)
+        setMessages(prev => [...prev, placeholder])
+        try {
+          const {base64} = await readAudioAsBase64(res.tempFilePath)
+          const buffer = Taro.base64ToArrayBuffer(base64)
+          const playableVoiceUrl = await writePcmVoiceToWavFile(buffer)
+          if (playableVoiceUrl) {
+            setMessages(prev => prev.map(message => message.id === placeholder.id ? {...message, audio_url: playableVoiceUrl} : message))
+          }
+          await ws.connect({mode: 'default', agentProfile: 'voice-ptt', userId: user!.id})
+          const text = await new Promise<string>((resolve, reject) => {
+            const timeout = setTimeout(() => { unsub(); reject(new Error('timeout')) }, 15000)
+            const unsub = ws.onMessage('asr-final', (data) => {
+              clearTimeout(timeout)
+              unsub()
+              resolve(data as string)
+            })
+            void (async () => {
+              await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
+              await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
+              await ws.sendAudio(buffer)
+              await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
+            })().catch((error) => {
+              clearTimeout(timeout)
+              unsub()
+              reject(error)
+            })
+          })
+          if (text.trim()) {
+            const voiceContent = `${VOICE_MESSAGE_PREFIX}${text.trim()}`
+            setMessages(prev => prev.map(message => message.id === placeholder.id ? {...message, content: voiceContent} : message))
+            ws.disconnect()
+            await new Promise(resolve => setTimeout(resolve, 120))
+            await sendMessage(voiceContent, {skipUserBubble: true, session})
+          } else {
+            setMessages(prev => prev.filter(message => message.id !== placeholder.id))
+            Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
+          }
+        } catch {
+          setMessages(prev => prev.filter(message => message.id !== placeholder.id))
+          Taro.showToast({title: '语音识别失败，请重试', icon: 'none'})
+        } finally {
+          ws.disconnect()
+        }
+      })
+      rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+    }
+
+    doStartRecord()
+  }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
+
+  const handleVoiceTouchStart = useCallback((event: any) => {
+    unlockRtcAudioPlayback('voice-touch')
+    if (isLoading) interruptActiveChatResponse('voice-touch')
+    voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
+    voiceCancelRef.current = false
+    voicePressingRef.current = true
+    setIsVoicePressing(true)
+    setIsRecordingCanceling(false)
+    if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
+    voicePressTimerRef.current = setTimeout(() => {
+      voicePressTimerRef.current = null
+      void startVoiceRecording()
+    }, VOICE_LONG_PRESS_MS)
+  }, [interruptActiveChatResponse, isLoading, startVoiceRecording])
+
+  const handleVoiceTouchMove = useCallback((event: any) => {
+    if (!isRecording) return
+    const currentY = event?.touches?.[0]?.clientY || voiceTouchStartYRef.current
+    const shouldCancel = voiceTouchStartYRef.current - currentY > 48
+    voiceCancelRef.current = shouldCancel
+    setIsRecordingCanceling(shouldCancel)
+  }, [isRecording])
+
+  const handleVoiceTouchEnd = useCallback(() => {
+    voicePressingRef.current = false
+    setIsVoicePressing(false)
+    if (voicePressTimerRef.current) {
+      clearTimeout(voicePressTimerRef.current)
+      voicePressTimerRef.current = null
+      setIsRecordingCanceling(false)
+      return
+    }
+    recorderManager.current?.stop()
+  }, [])
+
+  const handleSend = () => {
+    if (isLoading || !inputText.trim()) return
+    unlockRtcAudioPlayback('send-button')
+    void sendMessage(inputText)
   }
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -720,11 +776,26 @@ function ChatPage() {
     }, 50)
   }, [messages, isLoading])
 
-  const inputBarHeight = pendingImage ? 98 : 54
-  const messageBottomPadding = inputBarHeight + 10
+  const inputBarHeight = 68
+  const messageBottomPadding = inputBarHeight + 24
+  const formatRtcClock = (seconds: number) => new Date(seconds * 1000).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  const formatRtcGroupTime = (group: RtcHistoryGroup) => {
+    const start = new Date(group.startTime * 1000)
+    const end = new Date(group.endTime * 1000)
+    const date = end.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})
+    if (start.toDateString() === end.toDateString()) {
+      return `${date} ${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
+    }
+    return `${date} 截止 ${formatRtcClock(group.endTime)}`
+  }
+  const hasAnyHistory = rtcHistoryGroups.length > 0
+  const isVoiceButtonActive = isRecording || isVoicePressing
 
   return (
-    <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden">
+    <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
       {/* 顶栏 */}
       <div className="flex items-center gap-3 px-4 py-3 bg-card border-b border-border">
         <div
@@ -814,7 +885,11 @@ function ChatPage() {
                   key={q}
                   className="px-4 py-2 rounded-[20px] text-xl text-foreground"
                   style={{backgroundColor: '#F2F2F2'}}
-                  onClick={() => sendMessage(q)}
+                  onTouchStart={() => unlockRtcAudioPlayback('suggestion-touch')}
+                  onClick={() => {
+                    unlockRtcAudioPlayback('suggestion')
+                    sendMessage(q)
+                  }}
                 >
                   {q}
                 </div>
@@ -851,15 +926,30 @@ function ChatPage() {
                             />
                           </div>
                         )}
-                        {msg.content.startsWith('🎙 ') ? (
-                          <div className="flex items-center gap-2">
-                            <div className="flex items-end gap-0.5 flex-shrink-0" style={{height: '18px'}}>
-                              {[0,1,2,3].map(i => (
-                                <div key={i} className="rounded-full bg-white/80 animate-soundwave"
-                                  style={{width: '3px', height: `${6 + (i % 3) * 4}px`, animationDelay: `${i * 0.12}s`}} />
-                              ))}
+                        {isVoiceMessage(msg.content) ? (
+                          <div
+                            className="flex items-center gap-3 active:opacity-80"
+                          style={{minWidth: '168px'}}
+                          onClick={() => handlePlayAudio(msg)}
+                          >
+                            <div className="flex items-center justify-center rounded-full flex-shrink-0"
+                              style={{width: '30px', height: '30px', backgroundColor: 'rgba(255,255,255,0.18)'}}>
+                              <div className={`${playingAudioId === msg.id ? 'i-mdi-pause' : 'i-mdi-play'} text-xl text-white`} />
                             </div>
-                            <p className="text-xl leading-relaxed">{msg.content.slice(3)}</p>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <div className="flex items-end gap-0.5 flex-shrink-0" style={{height: '16px'}}>
+                                  {[0,1,2,3,4].map(i => (
+                                    <div key={i} className="rounded-full bg-white/85 animate-soundwave"
+                                      style={{width: '3px', height: `${5 + (i % 3) * 4}px`, animationDelay: `${i * 0.1}s`}} />
+                                  ))}
+                                </div>
+                                <span style={{fontSize: '11px', color: 'rgba(255,255,255,0.72)'}}>语音消息</span>
+                              </div>
+                              <p className="mt-1" style={{fontSize: '11px', lineHeight: '14px', color: 'rgba(255,255,255,0.72)'}}>
+                                {msg.audio_url ? (playingAudioId === msg.id ? '正在播放' : '点击播放') : '正在处理'}
+                              </p>
+                            </div>
                           </div>
                         ) : (
                           msg.content && <p className="text-xl leading-relaxed">{msg.content}</p>
@@ -885,6 +975,7 @@ function ChatPage() {
                           type="button"
                           className="flex items-center justify-center leading-none gap-1 px-2 active:opacity-60"
                           style={{height: '24px'}}
+                          onTouchStart={() => unlockRtcAudioPlayback('assistant-audio-touch')}
                           onClick={() => handlePlayAudio(msg)}
                         >
                           <div className={`${playingAudioId === msg.id ? 'i-mdi-pause-circle-outline' : 'i-mdi-volume-high'} text-xl text-muted-foreground`} />
@@ -921,152 +1012,117 @@ function ChatPage() {
 
       {/* 输入区 */}
       <div
-        className="flex-shrink-0 bg-card border-t border-border fixed left-0 right-0"
+        className="flex-shrink-0 border-t border-border fixed left-0 right-0"
         style={{
-          padding: '6px 12px',
-          bottom: '0',
+          padding: '8px 12px',
+          bottom: keyboardHeight > 0 ? `${keyboardHeight}px` : '0',
           zIndex: 50,
-          transform: 'translateZ(0)'
+          transform: 'translateZ(0)',
+          backgroundColor: '#F7F7F7'
         }}
       >
-        {isRecording && (
-          <div
-            className="absolute left-0 right-0 flex flex-col items-center justify-center gap-3 bg-card rounded-t-2xl"
-            style={{bottom: '100%', padding: '20px 0 16px', boxShadow: '0 -4px 20px rgba(0,0,0,0.08)', zIndex: 10}}
-          >
-            <div className="relative flex items-center justify-center">
-              <div className="absolute rounded-full bg-destructive/10 animate-pulse" style={{width: '72px', height: '72px'}} />
-              <div className="relative flex items-center justify-center rounded-full bg-destructive" style={{width: '56px', height: '56px'}}>
-                <div className="i-mdi-microphone text-3xl text-white" />
-              </div>
-            </div>
-            <div className="flex items-end gap-1" style={{height: '28px'}}>
-              {[0,1,2,3,4,5,6].map(i => (
-                <div
-                  key={i}
-                  className="rounded-full bg-destructive animate-soundwave"
-                  style={{width: '4px', height: `${10 + (i % 4) * 5}px`, animationDelay: `${i * 0.1}s`}}
-                />
-              ))}
-            </div>
-            <p className="text-xl text-muted-foreground">松开发送 · 上滑取消</p>
-          </div>
-        )}
-
-        {voiceState === 'active' ? (
-          <div className="flex items-center justify-between gap-4 py-2">
-            <div className="flex items-center gap-2 flex-1">
-              <div className="i-mdi-robot text-2xl text-primary flex-shrink-0" />
-              <span className="text-xl text-foreground">AI 正在倾听...</span>
-              <div className="flex items-end gap-0.5" style={{height: '20px'}}>
-                {[0,1,2,3,4].map(i => (
-                  <div key={i} className="rounded-full bg-primary animate-soundwave"
-                    style={{width: '3px', height: `${8 + (i % 3) * 5}px`, animationDelay: `${i * 0.12}s`}} />
-                ))}
-              </div>
-            </div>
-            <button type="button" className="flex-shrink-0 flex items-center justify-center leading-none rounded-full"
-              style={{width: '44px', height: '44px', backgroundColor: '#EF4444'}} onClick={handleStopVoiceCall}>
-              <div className="i-mdi-phone-hangup text-2xl text-white" />
-            </button>
-          </div>
-        ) : voiceMode ? (
+        {voiceMode ? (
           <div className="flex items-center gap-3">
             <button type="button" className="flex-shrink-0 flex items-center justify-center"
               style={{width: '44px', height: '44px'}} onClick={() => setVoiceMode(false)}>
               <div className="i-mdi-keyboard text-2xl text-muted-foreground" />
             </button>
             <div
-              className="flex-1 flex items-center justify-center rounded-full border-2 transition-colors"
+              className="flex-1 flex items-center justify-center border transition-colors"
               style={{
                 height: '44px',
-                borderColor: isRecording ? '#EF4444' : 'hsl(var(--border))',
-                backgroundColor: isRecording ? '#FEF2F2' : 'hsl(var(--background))',
+                borderRadius: '6px',
+                position: 'relative',
+                overflow: 'hidden',
+                borderColor: isVoiceButtonActive ? (isRecordingCanceling ? '#F97316' : '#EF4444') : 'hsl(var(--border))',
+                backgroundColor: isVoiceButtonActive ? (isRecordingCanceling ? '#FFF7ED' : '#EF4444') : '#FFFFFF',
               }}
-              onTouchStart={() => { if (!isRecording) handleVoiceMicToggle() }}
-              onTouchEnd={() => { if (isRecording) recorderManager.current?.stop() }}
+              onTouchStart={handleVoiceTouchStart}
+              onTouchMove={handleVoiceTouchMove}
+              onTouchCancel={handleVoiceTouchEnd}
+              onTouchEnd={handleVoiceTouchEnd}
             >
-              <div className="flex items-center gap-2">
-                <div className={`i-mdi-microphone text-xl ${isRecording ? 'text-destructive' : 'text-muted-foreground'}`} />
-                <span className={`text-xl ${isRecording ? 'text-destructive' : 'text-muted-foreground'}`}>
-                  {isRecording ? '录音中...' : '按住说话'}
-                </span>
-              </div>
+              {isVoiceButtonActive ? (
+                <>
+                {!isRecordingCanceling && (
+                  <>
+                    <div className="absolute rounded-full" style={{
+                      width: '120px',
+                      height: '120px',
+                      border: '1px solid rgba(255,255,255,0.45)',
+                      animation: 'voiceRipple 1.15s ease-out infinite',
+                    }} />
+                    <div className="absolute rounded-full" style={{
+                      width: '120px',
+                      height: '120px',
+                      border: '1px solid rgba(255,255,255,0.32)',
+                      animation: 'voiceRipple 1.15s ease-out infinite',
+                      animationDelay: '0.36s',
+                    }} />
+                  </>
+                )}
+                <div className="flex items-center gap-2">
+                    <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
+                    <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
+                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
+                    </span>
+                    <div className="flex items-end gap-0.5" style={{height: '16px'}}>
+                      {[0,1,2,3,4].map(i => (
+                        <div key={i} className={`rounded-full animate-soundwave ${isRecordingCanceling ? 'bg-orange-500' : 'bg-white'}`}
+                          style={{width: '3px', height: `${5 + (i % 3) * 4}px`, animationDelay: `${i * 0.1}s`}} />
+                      ))}
+                    </div>
+                </div>
+                </>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <div className="i-mdi-microphone text-xl text-muted-foreground" />
+                  <span className="text-xl text-muted-foreground">按住说话</span>
+                </div>
+              )}
             </div>
-            <button type="button" className="flex-shrink-0 flex items-center justify-center leading-none rounded-full"
-              style={{width: '44px', height: '44px', backgroundColor: voiceState === 'connecting' ? '#F97316' : '#4A7C59'}}
-              onClick={voiceState === 'idle' ? handleStartVoiceCall : undefined}>
-              {voiceState === 'connecting'
-                ? <div className="i-mdi-loading text-xl text-white" style={{animation: 'spin 1s linear infinite'}} />
-                : <div className="i-mdi-robot text-xl text-white" />}
-            </button>
           </div>
         ) : (
-          <div className="flex flex-col" style={{gap: '6px'}}>
-            {pendingImage && (
-              <div className="flex items-center gap-2 px-1">
-                <div className="relative flex-shrink-0" style={{width: '56px', height: '56px'}}>
-                  <Image
-                    src={pendingImage.localPath}
-                    mode="aspectFill"
-                    style={{width: '56px', height: '56px', borderRadius: '8px', display: 'block'}}
-                  />
-                  {isUploadingImage && (
-                    <div className="absolute inset-0 flex items-center justify-center rounded-lg"
-                      style={{backgroundColor: 'rgba(0,0,0,0.4)'}}>
-                      <div className="i-mdi-loading text-xl text-white" style={{animation: 'spin 1s linear infinite'}} />
-                    </div>
-                  )}
-                  <div
-                    className="absolute flex items-center justify-center rounded-full bg-foreground"
-                    style={{width: '18px', height: '18px', top: '-6px', right: '-6px'}}
-                    onClick={() => setPendingImage(null)}
-                  >
-                    <div className="i-mdi-close text-white" style={{fontSize: '12px'}} />
-                  </div>
-                </div>
-                <span className="text-xl text-muted-foreground">已选图片，点发送上传</span>
-              </div>
-            )}
             <div className="flex items-end" style={{gap: '8px'}}>
               <button type="button" className="flex-shrink-0 flex items-center justify-center"
-                style={{width: '40px', height: '40px'}} onClick={() => setVoiceMode(true)}>
+                style={{width: '44px', height: '44px'}}
+                onTouchStart={() => unlockRtcAudioPlayback('voice-mode-touch')}
+                onClick={() => setVoiceMode(true)}>
                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
               </button>
               <div className="flex items-center bg-white"
-                style={{flex: 1, minWidth: 0, borderRadius: '18px', border: '1px solid #E5E5E5', minHeight: '38px', padding: '0 10px', gap: '8px'}}>
+                style={{flex: 1, minWidth: 0, borderRadius: '6px', border: '1px solid #E5E5E5', minHeight: '44px', padding: '10px 12px'}}>
                 <Textarea
                   className="flex-1 text-xl bg-transparent outline-none leading-normal"
                   placeholder="输入健康问题..."
+                  placeholderStyle="line-height:24px;color:#999999;"
                   value={inputText}
-                  adjustPosition
+                  adjustPosition={false}
                   showConfirmBar={false}
-                  cursorSpacing={0}
-                  style={{minWidth: 0, height: `${inputHeight}px`, maxHeight: '88px', resize: 'none', color: '#333333', lineHeight: '20px', display: 'block', overflowY: 'hidden', padding: '5px 0', boxSizing: 'border-box'}}
+                  cursorSpacing={16}
+                  style={{minWidth: 0, height: `${inputHeight}px`, maxHeight: '96px', resize: 'none', color: '#333333', lineHeight: '24px', display: 'block', overflowY: 'hidden', padding: 0, boxSizing: 'border-box'}}
+                  onKeyboardHeightChange={(e) => setKeyboardHeight(Math.max(0, Number((e as any).detail?.height || 0)))}
+                  onBlur={() => setKeyboardHeight(0)}
                   onInput={(e) => {
                     const ev = e as any
                     const nextValue = ev.detail?.value ?? ev.target?.value ?? ''
                     setInputText(nextValue)
                     const lineCount = Math.min(Math.max(nextValue.split('\n').length, 1), 4)
-                    setInputHeight(Math.min(88, Math.max(32, 10 + lineCount * 20)))
+                    setInputHeight(Math.min(96, lineCount * 24))
                   }}
                 />
-                <div className="flex-shrink-0 flex items-center justify-center" style={{width: '28px', height: '28px'}}
-                  onClick={handleImageUpload}>
-                  <div className={`i-mdi-image-outline text-2xl ${pendingImage ? 'text-primary' : 'text-muted-foreground'}`} />
-                </div>
               </div>
               <button
                 type="button"
                 className="flex-shrink-0 flex items-center justify-center leading-none rounded-full transition-colors duration-200"
-                style={{width: '40px', height: '40px', backgroundColor: (inputText.trim() || pendingImage) && !isLoading && !isUploadingImage ? '#4A7C59' : '#E5E5E5'}}
-                onClick={handleSendWithImage}
+                style={{width: '44px', height: '44px', backgroundColor: inputText.trim() && !isLoading ? '#4A7C59' : '#E5E5E5'}}
+                onTouchStart={() => unlockRtcAudioPlayback('send-button-touch')}
+                onClick={handleSend}
               >
                 <div className="i-mdi-arrow-up text-2xl"
-                  style={{color: (inputText.trim() || pendingImage) && !isLoading && !isUploadingImage ? '#ffffff' : '#999999'}} />
+                  style={{color: inputText.trim() && !isLoading ? '#ffffff' : '#999999'}} />
               </button>
             </div>
-          </div>
         )}
       </div>
 
@@ -1086,7 +1142,10 @@ function ChatPage() {
               <div className="rounded-full" style={{width: '40px', height: '4px', backgroundColor: '#DDDDDD'}} />
             </div>
             <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
-              <span className="text-2xl font-semibold text-foreground">对话历史</span>
+              <div>
+                <p className="text-2xl font-semibold text-foreground">对话历史</p>
+                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按 30 分钟自动分段</p>
+              </div>
               <div className="flex items-center gap-4">
                 <button
                   type="button"
@@ -1104,7 +1163,7 @@ function ChatPage() {
               {rtcHistoryLoading ? (
                 <div className="flex flex-col items-center justify-center py-12 gap-2">
                   <div className="i-mdi-loading text-5xl text-muted-foreground" style={{animation: 'spin 1s linear infinite'}} />
-                  <p className="text-xl text-muted-foreground">正在加载云端历史...</p>
+                  <p className="text-xl text-muted-foreground">正在加载 RTC 云端历史...</p>
                 </div>
               ) : rtcHistoryError ? (
                 <div className="flex flex-col items-center justify-center py-12 gap-3 px-6">
@@ -1119,12 +1178,19 @@ function ChatPage() {
                     重试
                   </button>
                 </div>
-              ) : rtcHistoryGroups.length === 0 ? (
+              ) : !hasAnyHistory ? (
                 <div className="flex flex-col items-center justify-center py-12 gap-2">
                   <div className="i-mdi-chat-outline text-5xl text-muted-foreground" />
-                  <p className="text-xl text-muted-foreground">暂无云端对话历史</p>
+                  <p className="text-xl text-muted-foreground">暂无 RTC 云端对话历史</p>
                 </div>
-              ) : rtcHistoryGroups.map(group => (
+              ) : (
+                <>
+                  {rtcHistoryGroups.length > 0 && (
+                    <div>
+                      <div className="px-4 py-2 bg-secondary/60 border-b border-border">
+                        <p className="text-xl font-semibold text-foreground">最近 10 个历史对话</p>
+                      </div>
+                      {rtcHistoryGroups.map(group => (
                   <div
                     key={group.id}
                     className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
@@ -1137,12 +1203,16 @@ function ChatPage() {
                         {group.title}
                       </p>
                       <p className="text-xl text-muted-foreground">
-                        {new Date(group.endTime * 1000).toLocaleDateString('zh-CN')}
+                        {formatRtcGroupTime(group)}
                       </p>
                     </div>
                     <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
                   </div>
-              ))}
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
             <div className="px-4 pt-3 pb-tabbar flex-shrink-0">
               <button
@@ -1160,6 +1230,124 @@ function ChatPage() {
       )}
     </div>
   )
+}
+
+type PcmStreamPlayer = {
+  append: (buffer: ArrayBuffer) => void
+  finish: () => void
+  stop: () => void
+}
+
+function createPcmStreamPlayer(): PcmStreamPlayer | null {
+  const context = getSharedRtcAudioContext()
+  if (!context?.createBuffer || !context?.createBufferSource || !context?.destination) {
+    console.warn('RTC TTS 实时播放不可用：当前环境不支持 createWebAudioContext')
+    return null
+  }
+
+  let closed = false
+  let nextStartAt = 0
+  let cleanupTimer: ReturnType<typeof setTimeout> | null = null
+  let loggedFirstFrame = false
+  let pendingBytes = new Uint8Array(0)
+  const activeSources = new Set<any>()
+  const sampleRate = 16000
+  const targetChunkBytes = 5120
+
+  const clearCleanupTimer = () => {
+    if (cleanupTimer) clearTimeout(cleanupTimer)
+    cleanupTimer = null
+  }
+
+  unlockRtcAudioPlayback('stream-player-create')
+
+  const schedulePcm = (bytes: Uint8Array) => {
+    const evenLength = bytes.byteLength - (bytes.byteLength % 2)
+    if (closed || evenLength < 2) return
+    const sampleCount = evenLength / 2
+    const audioBuffer = context.createBuffer(1, sampleCount, sampleRate)
+    const channel = audioBuffer.getChannelData(0)
+    const view = new DataView(bytes.buffer, bytes.byteOffset, evenLength)
+    for (let i = 0; i < sampleCount; i += 1) {
+      channel[i] = Math.max(-1, Math.min(1, view.getInt16(i * 2, true) / 32768))
+    }
+
+    const source = context.createBufferSource()
+    source.buffer = audioBuffer
+    source.connect(context.destination)
+    activeSources.add(source)
+    source.onended = () => activeSources.delete(source)
+    const currentTime = Number(context.currentTime || 0)
+    if (nextStartAt < currentTime + 0.03) nextStartAt = currentTime + 0.04
+    source.start(nextStartAt)
+    if (!loggedFirstFrame) {
+      loggedFirstFrame = true
+      console.info('RTC TTS 实时播放已调度首帧', {
+        currentTime,
+        startAt: nextStartAt,
+        startupDelayMs: Math.max(0, Math.round((nextStartAt - currentTime) * 1000)),
+        chunkBytes: evenLength,
+        contextState: context.state,
+      })
+    }
+    nextStartAt += audioBuffer.duration || sampleCount / sampleRate
+  }
+
+  const flushPending = (force: boolean) => {
+    while (pendingBytes.byteLength >= targetChunkBytes) {
+      schedulePcm(pendingBytes.slice(0, targetChunkBytes))
+      pendingBytes = pendingBytes.slice(targetChunkBytes)
+    }
+    if (force && pendingBytes.byteLength >= 2) {
+      schedulePcm(pendingBytes.slice(0, pendingBytes.byteLength - (pendingBytes.byteLength % 2)))
+      pendingBytes = new Uint8Array(0)
+    }
+  }
+
+  return {
+    append(buffer: ArrayBuffer) {
+      if (closed || buffer.byteLength < 2) return
+      try {
+        unlockRtcAudioPlayback('stream-audio-frame')
+        const incoming = new Uint8Array(buffer)
+        const merged = new Uint8Array(pendingBytes.byteLength + incoming.byteLength)
+        merged.set(pendingBytes)
+        merged.set(incoming, pendingBytes.byteLength)
+        pendingBytes = merged
+        flushPending(false)
+      } catch (err: any) {
+        closed = true
+        clearCleanupTimer()
+        console.warn('RTC TTS 流式播放不可用，已降级为完整文件播放:', err?.message || err)
+      }
+    },
+    finish() {
+      if (closed) return
+      try {
+        flushPending(true)
+      } catch (err: any) {
+        console.warn('RTC TTS 尾帧播放失败:', err?.message || err)
+      }
+      const currentTime = Number(context.currentTime || 0)
+      const delayMs = Math.max(300, Math.ceil((nextStartAt - currentTime + 0.3) * 1000))
+      clearCleanupTimer()
+      cleanupTimer = setTimeout(() => {
+        closed = true
+        cleanupTimer = null
+      }, delayMs)
+    },
+    stop() {
+      closed = true
+      clearCleanupTimer()
+      activeSources.forEach((source) => {
+        try {
+          source.stop?.()
+        } catch {}
+      })
+      activeSources.clear()
+      pendingBytes = new Uint8Array(0)
+    },
+  }
 }
 
 export default withRouteGuard(ChatPage)

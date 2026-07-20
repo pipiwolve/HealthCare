@@ -1,2 +1,11 @@
 [auth.email]
 enable_confirmations = false
+
+[functions.wechat_miniapp_login]
+verify_jwt = false
+
+[functions.wechat-notification-dispatch]
+verify_jwt = false
+
+[functions.recipe-share]
+verify_jwt = false

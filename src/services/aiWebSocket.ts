@@ -3,7 +3,8 @@ import {supabase} from '../client/supabase'
 
 type MessageType = 'asr-interim' | 'asr-final' | 'llm-interim' | 'llm-final' | 'audio' | 'tts-start' | 'tts-end' | 'event'
 type Listener = (data: string | ArrayBuffer) => void
-type ConnectMode = 'cfg' | 'default'
+type ConnectMode = 'default'
+type AgentProfile = 'chat' | 'vision' | 'voice-realtime' | 'voice-ptt'
 type RequestKind = 'text' | 'image'
 
 type AiWebSocketMetrics = {
@@ -17,6 +18,10 @@ type AiWebSocketMetrics = {
   connectReadyMs?: number
   sendToFirstInterimMs?: number
   sendToFinalMs?: number
+  sendToTtsStartMs?: number
+  sendToFirstAudioMs?: number
+  audioChunkCount?: number
+  audioByteCount?: number
   imageUploadMs?: number
   totalMs?: number
   status?: 'connected' | 'final' | 'timeout' | 'error'
@@ -26,6 +31,7 @@ type WsCfg = Record<string, unknown>
 
 interface ConnectOptions {
   mode?: ConnectMode
+  agentProfile?: AgentProfile
   cfg?: WsCfg
   ac?: string
   userId?: string
@@ -55,6 +61,8 @@ interface SignResponse {
   url: string
   licenseKey?: string
   licenseDeviceId?: string
+  agentProfile?: AgentProfile
+  userId?: string
 }
 
 class AiWebSocketService {
@@ -102,7 +110,7 @@ class AiWebSocketService {
     this.socketTask = null
     this.socketTaskPromise = null
     this.metrics = {
-      mode: options.mode || 'cfg',
+      mode: options.mode || 'default',
       startedAt: Date.now(),
     }
     this.socketStartedAt = 0
@@ -111,14 +119,15 @@ class AiWebSocketService {
     this.licenseRequired = false
     this.licensePassed = false
 
-    console.log('[AiWebSocket] invoking ws-sign EF, mode=', options.mode || 'cfg')
+    console.log('[AiWebSocket] invoking ws-sign EF, mode=', options.mode || 'default', 'profile=', options.agentProfile || 'chat')
     let data: SignResponse | null = null
     try {
       const result = await supabase.functions.invoke<SignResponse>('ws-sign', {
         body: {
-          mode: options.mode || 'cfg',
+          mode: options.mode || 'default',
+          agentProfile: options.agentProfile || 'chat',
           cfg: options.cfg,
-          ac: options.ac || 'raw16k'
+          ac: options.ac || 'raw16k',
         }
       })
       if (result.error) {
@@ -133,6 +142,9 @@ class AiWebSocketService {
         throw new Error('ws-sign returned empty url')
       }
       data = result.data
+      if (this.isConnectCancelled()) {
+        throw new Error('WebSocket connect cancelled')
+      }
       this.metrics.wsSignMs = Date.now() - this.metrics.startedAt
     } catch (err) {
       // 捕获网络超时等意外错误，确保 state 归位
@@ -143,7 +155,7 @@ class AiWebSocketService {
     console.log('[AiWebSocket] ws-sign OK, url prefix=', data.url.substring(0, 80))
     this.licenseKey = data.licenseKey || ''
     this.licenseDeviceId = data.licenseDeviceId || Taro.getStorageSync('brtc_license_device_id') || ''
-    this.userId = options.userId || ''
+    this.userId = data.userId || options.userId || ''
 
     return new Promise((resolve, reject) => {
       this.readyResolve = resolve
@@ -249,6 +261,10 @@ class AiWebSocketService {
     this.licenseWaitTimer = null
   }
 
+  private isConnectCancelled(): boolean {
+    return this.state === 'disconnected' || !this.metrics
+  }
+
   private closeSocketTask() {
     const task = this.socketTask
     const hadPendingTask = !!this.socketTaskPromise
@@ -286,15 +302,24 @@ class AiWebSocketService {
     }
   }
 
-  sendText(text: string) {
-    void this.sendSocketData(`[T]:${text}`).catch((err) => {
+  sendText(text: string): Promise<void> {
+    return this.sendSocketData(`[T]:${text}`).catch((err) => {
       console.warn('[AiWebSocket] sendText failed:', err?.message || err)
+      throw err
     })
   }
 
-  sendAudio(buffer: ArrayBuffer) {
-    void this.sendSocketData(buffer).catch((err) => {
+  sendAudio(buffer: ArrayBuffer): Promise<void> {
+    return this.sendSocketData(buffer).catch((err) => {
       console.warn('[AiWebSocket] sendAudio failed:', err?.message || err)
+      throw err
+    })
+  }
+
+  sendControl(message: string): Promise<void> {
+    return this.sendSocketData(message).catch((err) => {
+      console.warn('[AiWebSocket] sendControl failed:', err?.message || err)
+      throw err
     })
   }
 
@@ -331,6 +356,7 @@ class AiWebSocketService {
       let interimText = ''
       let finalText = ''
       let ttsStarted = false
+      let ttsEnded = false
       let settled = false
       let ttsWaitTimer: ReturnType<typeof setTimeout> | null = null
       let audioIdleTimer: ReturnType<typeof setTimeout> | null = null
@@ -338,7 +364,7 @@ class AiWebSocketService {
       let audioChunkCount = 0
       let audioByteCount = 0
       const ttsNoAudioGraceMs = 15000
-      const ttsNotStartedGraceMs = 1200
+      const ttsNotStartedGraceMs = 6000
       const audioIdleMs = 1200
       const timeout = setTimeout(() => {
         if (settled) return
@@ -385,12 +411,13 @@ class AiWebSocketService {
           finish(finalText)
           return
         }
-        if (audioChunkCount > 0) {
+        if (audioChunkCount > 0 || ttsEnded) {
           if (audioIdleTimer) clearTimeout(audioIdleTimer)
           audioIdleTimer = setTimeout(() => {
             console.info('[AiWebSocket] RTC TTS audio idle, finishing response', {
               audioChunkCount,
               audioByteCount,
+              ttsEnded,
             })
             notifyAudioComplete()
             finish(finalText)
@@ -409,6 +436,7 @@ class AiWebSocketService {
 
       const unsubFinal = this.onMessage('llm-final', (data) => {
         finalText = data as string
+        if (finalText.trim()) opts?.onInterim?.(finalText.trim())
         clearTimeout(timeout)
         scheduleFinishAfterFinal()
       })
@@ -421,26 +449,51 @@ class AiWebSocketService {
 
       const unsubAudio = this.onMessage('audio', (data) => {
         if (!(data instanceof ArrayBuffer)) return
+        if (!opts?.onAudio && !opts?.onTtsEnd) return
         audioChunkCount += 1
         audioByteCount += data.byteLength
-        console.log('[AiWebSocket] audio chunk received', {
-          size: data.byteLength,
-          audioChunkCount,
-          audioByteCount,
-        })
+        if (this.metrics) {
+          this.metrics.audioChunkCount = audioChunkCount
+          this.metrics.audioByteCount = audioByteCount
+          if (this.metrics.sendToFirstAudioMs === undefined && this.requestStartedAt) {
+            this.metrics.sendToFirstAudioMs = Date.now() - this.requestStartedAt
+          }
+        }
+        if (audioChunkCount === 1 || audioChunkCount % 50 === 0) {
+          console.log('[AiWebSocket] audio chunk received', {
+            size: data.byteLength,
+            audioChunkCount,
+            audioByteCount,
+            sinceRequestMs: this.requestStartedAt ? Date.now() - this.requestStartedAt : undefined,
+            finalTextReceived: Boolean(finalText),
+          })
+        }
         opts?.onAudio?.(data)
         scheduleFinishAfterFinal()
       })
 
       const unsubTtsStart = this.onMessage('tts-start', () => {
         ttsStarted = true
+        if (this.metrics && this.metrics.sendToTtsStartMs === undefined && this.requestStartedAt) {
+          this.metrics.sendToTtsStartMs = Date.now() - this.requestStartedAt
+        }
+        console.info('[AiWebSocket] RTC TTS start', {
+          sinceRequestMs: this.requestStartedAt ? Date.now() - this.requestStartedAt : undefined,
+          interimLength: interimText.length,
+          finalTextReceived: Boolean(finalText),
+        })
         opts?.onTtsStart?.()
         scheduleFinishAfterFinal()
       })
 
       const unsubTtsEnd = this.onMessage('tts-end', () => {
-        notifyAudioComplete()
-        if (finalText) finish(finalText)
+        ttsEnded = true
+        console.info('[AiWebSocket] RTC TTS end received; waiting for trailing audio', {
+          audioChunkCount,
+          audioByteCount,
+          finalTextReceived: Boolean(finalText),
+        })
+        scheduleFinishAfterFinal()
       })
 
       void this.sendSocketData(`[T]:${text}`).catch((err) => {
@@ -508,6 +561,7 @@ class AiWebSocketService {
 
       const unsubFinal = this.onMessage('llm-final', (data) => {
         if (!imageSent) return
+        if ((data as string).trim()) options.onInterim?.((data as string).trim())
         cleanup()
         this.markFinalResponse('final')
         resolve(data as string)
@@ -613,6 +667,10 @@ class AiWebSocketService {
     } else if (msg.startsWith('[E]:[TTS_END_SPEAKING]')) {
       this.emit('tts-end', msg)
       this.emit('event', msg)
+    } else if (msg.startsWith('[Q]:[M]:[C]:')) {
+      this.emit('asr-interim', msg.slice(12))
+    } else if (msg.startsWith('[Q]:[C]:')) {
+      this.emit('asr-final', msg.slice(8))
     } else if (msg.startsWith('[Q]:[M]:')) {
       this.emit('asr-interim', msg.slice(8))
     } else if (msg.startsWith('[Q]:')) {
@@ -680,7 +738,7 @@ class AiWebSocketService {
   private beginRequest(kind: RequestKind, promptLength: number) {
     if (!this.metrics) {
       this.metrics = {
-        mode: 'cfg',
+        mode: 'default',
         startedAt: Date.now(),
       }
     }
@@ -689,6 +747,10 @@ class AiWebSocketService {
     this.metrics.promptLength = promptLength
     this.metrics.sendToFirstInterimMs = undefined
     this.metrics.sendToFinalMs = undefined
+    this.metrics.sendToTtsStartMs = undefined
+    this.metrics.sendToFirstAudioMs = undefined
+    this.metrics.audioChunkCount = undefined
+    this.metrics.audioByteCount = undefined
     this.metrics.imageUploadMs = undefined
     this.metrics.totalMs = undefined
   }
@@ -696,6 +758,9 @@ class AiWebSocketService {
   private markFirstInterim() {
     if (!this.metrics || !this.requestStartedAt || this.metrics.sendToFirstInterimMs !== undefined) return
     this.metrics.sendToFirstInterimMs = Date.now() - this.requestStartedAt
+    console.info('[AiWebSocket] first text chunk', {
+      sinceRequestMs: this.metrics.sendToFirstInterimMs,
+    })
   }
 
   private markFinalResponse(status: 'final' | 'timeout') {
@@ -720,6 +785,10 @@ class AiWebSocketService {
       connectReadyMs: this.metrics.connectReadyMs,
       sendToFirstInterimMs: this.metrics.sendToFirstInterimMs,
       sendToFinalMs: this.metrics.sendToFinalMs,
+      sendToTtsStartMs: this.metrics.sendToTtsStartMs,
+      sendToFirstAudioMs: this.metrics.sendToFirstAudioMs,
+      audioChunkCount: this.metrics.audioChunkCount,
+      audioByteCount: this.metrics.audioByteCount,
       imageUploadMs: this.metrics.imageUploadMs,
       totalMs: this.metrics.totalMs,
     })
@@ -737,4 +806,8 @@ export function getAiWebSocket(): AiWebSocketService {
   return instance
 }
 
-export type {ConnectOptions, ImageRequestOptions, MessageType, WsCfg }
+export function createAiWebSocket(): AiWebSocketService {
+  return new AiWebSocketService()
+}
+
+export type {AgentProfile, ConnectOptions, ImageRequestOptions, MessageType, WsCfg }

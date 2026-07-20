@@ -6,6 +6,7 @@ import {useAuth} from '@/contexts/AuthContext'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {getFamilyMember, createFamilyMember, updateFamilyMember} from '@/db/api'
 import {useAppStore} from '@/store/appStore'
+import {uploadWechatAvatar} from '@/services/wechatAuth'
 import {getAvatarByGender} from '@/utils/avatarUtils'
 import type {FamilyMember, GenderType} from '@/db/types'
 
@@ -22,6 +23,8 @@ function FamilyEditPage() {
     nickname: '', gender: 'unknown', chronic_diseases: [], allergens: []
   })
   const [saving, setSaving] = useState(false)
+  const [avatarPreviewPath, setAvatarPreviewPath] = useState('')
+  const [uploadingAvatar, setUploadingAvatar] = useState(false)
 
   const loadMember = useCallback(async () => {
     if (!memberId) return
@@ -31,8 +34,25 @@ function FamilyEditPage() {
 
   useEffect(() => { loadMember() }, [loadMember])
 
+  const handleChooseAvatar = async (event: any) => {
+    const localPath = event?.detail?.avatarUrl
+    if (!localPath || uploadingAvatar) return
+    setAvatarPreviewPath(localPath)
+    setUploadingAvatar(true)
+    try {
+      const avatarUrl = await uploadWechatAvatar(localPath)
+      setForm(prev => ({...prev, avatar_url: avatarUrl}))
+      Taro.showToast({title: '头像已上传', icon: 'success'})
+    } catch (error) {
+      setAvatarPreviewPath('')
+      Taro.showToast({title: error instanceof Error ? error.message : '头像上传失败', icon: 'none'})
+    } finally {
+      setUploadingAvatar(false)
+    }
+  }
+
   const handleSave = async () => {
-    if (!user) return
+    if (!user || uploadingAvatar) return
     if (!form.nickname?.trim()) {
       Taro.showToast({title: '请输入成员昵称', icon: 'none'})
       return
@@ -45,7 +65,7 @@ function FamilyEditPage() {
         await createFamilyMember({
           user_id: user.id,
           nickname: form.nickname!.trim(),
-          avatar_url: null,
+          avatar_url: form.avatar_url || null,
           gender: form.gender || 'unknown',
           age: form.age || null,
           height: form.height || null,
@@ -83,19 +103,22 @@ function FamilyEditPage() {
   return (
     <div className="min-h-screen bg-background pb-10">
       <div className="px-4 py-4 flex flex-col gap-4">
-        {/* 头像区 — 根据性别动态显示卡通头像，预留点击上传框架 */}
+        {/* 头像区 */}
         <div className="flex flex-col items-center py-4">
-          <div
-            className="w-20 h-20 rounded-full overflow-hidden flex items-center justify-center mb-2"
+          <button
+            type="button"
+            disabled={uploadingAvatar}
+            {...({openType: 'chooseAvatar', onChooseAvatar: handleChooseAvatar} as any)}
+            className="w-20 h-20 rounded-full overflow-hidden flex items-center justify-center mb-2 border-2 border-primary/20 disabled:opacity-60"
             style={{backgroundColor: '#E8F5E9'}}
           >
             <Image
-              src={getAvatarByGender(form.gender)}
+              src={avatarPreviewPath || form.avatar_url || getAvatarByGender(form.gender)}
               mode="aspectFill"
               style={{width: '80px', height: '80px'}}
             />
-          </div>
-          <span className="text-xl text-muted-foreground">头像随性别自动切换</span>
+          </button>
+          <span className="text-xl text-muted-foreground">{uploadingAvatar ? '头像上传中...' : '点击修改头像'}</span>
         </div>
 
         {/* 基础信息 */}

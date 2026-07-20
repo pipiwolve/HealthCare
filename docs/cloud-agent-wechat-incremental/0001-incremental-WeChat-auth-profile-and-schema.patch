@@ -1,0 +1,2651 @@
+From a2a4a4fd5f1d8e24a426062075f72ae379457d82 Mon Sep 17 00:00:00 2001
+From: Codex Incremental Patch Generator <codex-incremental@local>
+Date: Thu, 16 Jul 2026 15:42:32 +0800
+Subject: [PATCH 1/4] incremental: WeChat auth profile and schema
+
+---
+ src/app.config.ts                             |   3 +
+ src/assets/avatars/avatar-female.png          | Bin 0 -> 28885 bytes
+ src/assets/avatars/avatar-male.png            | Bin 0 -> 28348 bytes
+ src/client/supabase.ts                        |  23 +-
+ src/components/RouteGuard.tsx                 |   8 +-
+ src/contexts/AuthContext.tsx                  |  61 +++--
+ src/pages/account-settings/index.config.ts    |   1 +
+ src/pages/account-settings/index.tsx          |  68 +++++
+ src/pages/login/index.tsx                     | 242 ++++++++++++++++--
+ src/pages/profile-onboarding/index.config.ts  |   1 +
+ src/pages/profile-onboarding/index.tsx        |  95 +++++++
+ src/pages/profile/index.tsx                   |   1 +
+ src/services/wechatAuth.ts                    |  87 +++++++
+ src/utils/authRedirect.ts                     |  41 +++
+ src/utils/avatarUtils.ts                      |  11 +-
+ supabase/config.toml                          |   9 +
+ supabase/functions/_shared/common.ts          |  62 +++++
+ supabase/functions/_shared/wechat.ts          | 154 +++++++++++
+ supabase/functions/upload-avatar/index.ts     |  29 +++
+ .../functions/wechat_miniapp_login/index.ts   | 207 +++++++++------
+ ...echat_auth_notifications_recipe_shares.sql | 133 ++++++++++
+ supabase/secrets/required.json                |   2 +-
+ 22 files changed, 1098 insertions(+), 140 deletions(-)
+ create mode 100644 src/assets/avatars/avatar-female.png
+ create mode 100644 src/assets/avatars/avatar-male.png
+ create mode 100644 src/pages/account-settings/index.config.ts
+ create mode 100644 src/pages/account-settings/index.tsx
+ create mode 100644 src/pages/profile-onboarding/index.config.ts
+ create mode 100644 src/pages/profile-onboarding/index.tsx
+ create mode 100644 src/services/wechatAuth.ts
+ create mode 100644 src/utils/authRedirect.ts
+ create mode 100644 supabase/functions/_shared/common.ts
+ create mode 100644 supabase/functions/_shared/wechat.ts
+ create mode 100644 supabase/functions/upload-avatar/index.ts
+ create mode 100644 supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql
+
+diff --git a/src/app.config.ts b/src/app.config.ts
+index d9873822fa62299170cb3c249a1e6f7a1a1fe89d..83b7c50ac74724d92766dc889d3ad495ad86fbd3 100644
+--- a/src/app.config.ts
++++ b/src/app.config.ts
+@@ -7,9 +7,12 @@ export default defineAppConfig({
+     'pages/device-manager/index',
+     'pages/device-add/index',
+     'pages/personal-info/index',
++    'pages/account-settings/index',
++    'pages/profile-onboarding/index',
+     'pages/family/index',
+     'pages/family-edit/index',
+     'pages/recipe/index',
++    'pages/recipe-share/index',
+     'pages/reminder-settings/index',
+     'pages/login/index',
+     'pages/agreement/index',
+diff --git a/src/assets/avatars/avatar-female.png b/src/assets/avatars/avatar-female.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..300543c67444545a3b710528aa8620643129e964
+GIT binary patch
+literal 28885
+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
+WHRAIGDxoa^0000<MNUMnLSTYoJb-8b
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/assets/avatars/avatar-male.png b/src/assets/avatars/avatar-male.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..81bcd8f306e940a3ce5c6f2dedb76e116c2b71d5
+GIT binary patch
+literal 28348
+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
+Bl`Q}O
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/client/supabase.ts b/src/client/supabase.ts
+index 1631b713e3558b7f5f632bd40b4e3535ea7f59b2..2bad4a711bb49f885dc4143e4ee9c5fa1be69067 100644
+--- a/src/client/supabase.ts
++++ b/src/client/supabase.ts
+@@ -7,6 +7,23 @@ const supabaseUrl: string = process.env.TARO_APP_SUPABASE_URL!
+ const supabaseAnonKey: string = process.env.TARO_APP_SUPABASE_ANON_KEY || 'TOKEN'
+ const appId: string = process.env.TARO_APP_APP_ID!
+ 
++const taroAuthStorage = {
++  getItem: async (key: string): Promise<string | null> => {
++    try {
++      const value = Taro.getStorageSync(key)
++      return typeof value === 'string' && value ? value : null
++    } catch {
++      return null
++    }
++  },
++  setItem: async (key: string, value: string): Promise<void> => {
++    Taro.setStorageSync(key, value)
++  },
++  removeItem: async (key: string): Promise<void> => {
++    Taro.removeStorageSync(key)
++  }
++}
++
+ let noticed = false
+ const normalizeRequestUrl = (input: RequestInfo | URL): string => {
+   if (typeof input === 'string') return input
+@@ -75,6 +92,10 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+     fetch: customFetch
+   },
+   auth: {
+-    storageKey: `${appId}-auth-token`
++    storageKey: `${appId}-auth-token`,
++    storage: taroAuthStorage,
++    persistSession: true,
++    autoRefreshToken: true,
++    detectSessionInUrl: false
+   }
+ })
+diff --git a/src/components/RouteGuard.tsx b/src/components/RouteGuard.tsx
+index ebf47b03274231d42f74f3d132469961adc48292..2c8519951ee91d856f46bb41dcbcc005bcb0a70e 100644
+--- a/src/components/RouteGuard.tsx
++++ b/src/components/RouteGuard.tsx
+@@ -2,15 +2,13 @@ import {useCallback, useEffect, useState} from 'react'
+ import Taro, {useDidShow} from '@tarojs/taro'
+ import type {TabBarItem} from '@tarojs/taro'
+ import {useAuth} from '@/contexts/AuthContext'
++import {buildCurrentRouteUrl, STORAGE_KEY_REDIRECT_PATH} from '@/utils/authRedirect'
+ 
+ // Public pages that don't require authentication
+-const PUBLIC_PAGE_PATHS = ['/pages/login/index']
++const PUBLIC_PAGE_PATHS = ['/pages/login/index', '/pages/recipe-share/index']
+ 
+ const LOGIN_PAGE_PATH = '/pages/login/index'
+ 
+-// Storage key for saving redirect path after login
+-export const STORAGE_KEY_REDIRECT_PATH = 'loginRedirectPath'
+-
+ function getTabBarPages(): string[] {
+   const app = Taro.getApp()
+   const tabBarList = app?.config?.tabBar?.list || []
+@@ -56,7 +54,7 @@ function RouteGuard({children}: {children: React.ReactNode}) {
+       return
+     }
+ 
+-    const currentPath: string = Taro.getCurrentInstance()?.router?.path || ''
++    const currentPath = buildCurrentRouteUrl()
+ 
+     // Allow access if user is authenticated or page is public
+     const isPublic = PUBLIC_PAGE_PATHS.some((publicPath) => currentPath?.includes(publicPath))
+diff --git a/src/contexts/AuthContext.tsx b/src/contexts/AuthContext.tsx
+index c2e2afa15ab3a905d2ef5e51b0a6ac16bcb099c7..ca96334f9c0ee14bffb8407567897ef3e0f6afbb 100644
+--- a/src/contexts/AuthContext.tsx
++++ b/src/contexts/AuthContext.tsx
+@@ -1,11 +1,13 @@
+ import {createContext, useCallback, useContext, useEffect, useState, type ReactNode} from 'react'
+-import Taro from '@tarojs/taro'
+ import {supabase} from '@/client/supabase'
+ import type {User} from '@supabase/supabase-js'
+-
+-export interface Profile {
+-   [key: string]: unknown;
+-}
++import type {Profile} from '@/db/types'
++import {
++  bindWechatAccount,
++  registerWechatAccount,
++  startWechatLogin,
++  type WechatStartResult
++} from '@/services/wechatAuth'
+ 
+ export async function getProfile(userId: string): Promise<Profile | null> {
+   const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle()
+@@ -26,7 +28,9 @@ interface AuthContextType {
+   signUpWithPhone: (phone: string, password: string) => Promise<{error: Error | null}>
+   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
+   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
+-  signInWithWechat: () => Promise<{error: Error | null}>
++  startWechatSignIn: () => Promise<{data: WechatStartResult | null; error: Error | null}>
++  registerWechatSignIn: (ticket: string, phoneCode?: string) => Promise<{error: Error | null}>
++  bindWechatSignIn: (ticket: string) => Promise<{error: Error | null}>
+   signOut: () => Promise<void>
+   refreshProfile: () => Promise<void>
+ }
+@@ -150,33 +154,26 @@ export function AuthProvider({children}: {children: ReactNode}) {
+     }
+   }
+ 
+-  const signInWithWechat = async () => {
++  const startWechatSignIn = async () => {
+     try {
+-      // Check if running in WeChat Mini Program environment
+-      if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) {
+-        throw new Error('仅支持微信小程序登录，网页端请使用用户名密码登录')
+-      }
+-
+-      // Get WeChat login code
+-      const loginResult = await Taro.login()
+-
+-      // Call backend Edge Function for login
+-      const {data, error} = await supabase.functions.invoke('wechat_miniapp_login', {
+-        body: {code: loginResult?.code}
+-      })
+-
+-      if (error) {
+-        const errorMsg = (await error?.context?.text?.()) || error.message
+-        throw new Error(errorMsg)
+-      }
++      return {data: await startWechatLogin(), error: null}
++    } catch (error) {
++      return {data: null, error: error as Error}
++    }
++  }
+ 
+-      // Verify OTP token
+-      const {error: verifyError} = await supabase.auth.verifyOtp({
+-        token_hash: data.token,
+-        type: 'magiclink'
+-      })
++  const registerWechatSignIn = async (ticket: string, phoneCode?: string) => {
++    try {
++      await registerWechatAccount(ticket, phoneCode)
++      return {error: null}
++    } catch (error) {
++      return {error: error as Error}
++    }
++  }
+ 
+-      if (verifyError) throw verifyError
++  const bindWechatSignIn = async (ticket: string) => {
++    try {
++      await bindWechatAccount(ticket)
+       return {error: null}
+     } catch (error) {
+       return {error: error as Error}
+@@ -200,7 +197,9 @@ export function AuthProvider({children}: {children: ReactNode}) {
+         signUpWithPhone,
+         signInWithPhone,
+         verifyPhoneOtp,
+-        signInWithWechat,
++        startWechatSignIn,
++        registerWechatSignIn,
++        bindWechatSignIn,
+         signOut,
+         refreshProfile
+       }}>
+diff --git a/src/pages/account-settings/index.config.ts b/src/pages/account-settings/index.config.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..027233f2f60f195fa5c092acba52d29e551b0f02
+--- /dev/null
++++ b/src/pages/account-settings/index.config.ts
+@@ -0,0 +1 @@
++export default definePageConfig({navigationBarTitleText: '账号与微信'})
+diff --git a/src/pages/account-settings/index.tsx b/src/pages/account-settings/index.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..43f4117618d788db3efb8c3a603049abc00124ed
+--- /dev/null
++++ b/src/pages/account-settings/index.tsx
+@@ -0,0 +1,68 @@
++import {useCallback, useState} from 'react'
++import Taro, {useDidShow} from '@tarojs/taro'
++import {withRouteGuard} from '@/components/RouteGuard'
++import {bindWechatAccount, getWechatAccountStatus, prepareWechatBinding, type WechatAccountStatus} from '@/services/wechatAuth'
++
++function AccountSettingsPage() {
++  const [status, setStatus] = useState<WechatAccountStatus | null>(null)
++  const [loading, setLoading] = useState(false)
++
++  const loadStatus = useCallback(async () => {
++    try {
++      setStatus(await getWechatAccountStatus())
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '账号状态加载失败', icon: 'none'})
++    }
++  }, [])
++
++  useDidShow(() => { void loadStatus() })
++
++  const handleBind = async () => {
++    setLoading(true)
++    try {
++      const ticket = await prepareWechatBinding()
++      await bindWechatAccount(ticket)
++      await loadStatus()
++      Taro.showToast({title: '微信绑定成功', icon: 'success'})
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '微信绑定失败', icon: 'none'})
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  return (
++    <div className="min-h-screen bg-background px-4 py-4">
++      <div className="bg-card border border-border rounded-xl px-4 py-4">
++        <div className="flex items-center gap-3 mb-4">
++          <div className="i-mdi-wechat text-3xl text-green-600" />
++          <div className="flex-1">
++            <p className="text-xl font-semibold text-foreground">微信账号</p>
++            <p className="text-xl text-muted-foreground">{status?.bound ? '已绑定' : '未绑定'}</p>
++          </div>
++          <div className={`text-xl font-medium ${status?.bound ? 'text-primary' : 'text-muted-foreground'}`}>
++            {status?.bound ? '已连接' : '未连接'}
++          </div>
++        </div>
++        {status?.phoneMasked && (
++          <div className="flex items-center justify-between py-3 border-t border-border">
++            <span className="text-xl text-muted-foreground">授权手机号</span>
++            <span className="text-xl text-foreground">{status.phoneMasked}</span>
++          </div>
++        )}
++        {!status?.bound && (
++          <button
++            type="button"
++            disabled={loading}
++            className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl mt-3 disabled:opacity-50"
++            style={{height: '48px'}}
++            onClick={handleBind}
++          >{loading ? '绑定中...' : '绑定当前微信'}</button>
++        )}
++      </div>
++      <p className="text-xl text-muted-foreground mt-3 px-1">为保护健康数据，本期不支持在小程序内自动合并或解绑账号。</p>
++    </div>
++  )
++}
++
++export default withRouteGuard(AccountSettingsPage)
+diff --git a/src/pages/login/index.tsx b/src/pages/login/index.tsx
+index 418d9e0c74ba1f2e58c145d3f6542410140ba149..fad3594d6464cdfce39d86b4119eb64fa882fe9f 100644
+--- a/src/pages/login/index.tsx
++++ b/src/pages/login/index.tsx
+@@ -1,15 +1,37 @@
+ // @title 登录
+-import {useState} from 'react'
++
++import {Image} from '@tarojs/components'
+ import Taro from '@tarojs/taro'
++import {useState} from 'react'
++import {supabase} from '@/client/supabase'
+ import {useAuth} from '@/contexts/AuthContext'
++import {getFamilyMembers, updateFamilyMember, updateProfile} from '@/db/api'
++import {uploadWechatAvatar} from '@/services/wechatAuth'
++import {useAppStore} from '@/store/appStore'
++import {completeLoginRedirect} from '@/utils/authRedirect'
++
++type WechatStep = 'idle' | 'choice' | 'bind'
+ 
+ export default function LoginPage() {
+-  const {signInWithUsername, signUpWithUsername, signInWithWechat} = useAuth()
++  const {
++    signInWithUsername,
++    signUpWithUsername,
++    startWechatSignIn,
++    registerWechatSignIn,
++    bindWechatSignIn,
++    signOut,
++    refreshProfile
++  } = useAuth()
++  const {refreshMembers} = useAppStore()
+   const [tab, setTab] = useState<'login' | 'register'>('login')
+   const [username, setUsername] = useState('')
+   const [password, setPassword] = useState('')
+   const [agreed, setAgreed] = useState(false)
+   const [loading, setLoading] = useState(false)
++  const [wechatStep, setWechatStep] = useState<WechatStep>('idle')
++  const [wechatTicket, setWechatTicket] = useState('')
++  const [wechatNickname, setWechatNickname] = useState('')
++  const [wechatAvatarPath, setWechatAvatarPath] = useState('')
+ 
+   const isWeApp = Taro.getEnv() === Taro.ENV_TYPE.WEAPP
+ 
+@@ -33,14 +55,7 @@ export default function LoginPage() {
+       if (error) {
+         Taro.showToast({title: error.message || '操作失败', icon: 'none'})
+       } else {
+-        const redirectPath = Taro.getStorageSync('loginRedirectPath') || '/pages/home/index'
+-        Taro.removeStorageSync('loginRedirectPath')
+-        const tabBarPaths = ['/pages/home/index', '/pages/chat/index', '/pages/stats/index', '/pages/profile/index']
+-        if (tabBarPaths.includes(redirectPath)) {
+-          Taro.switchTab({url: redirectPath})
+-        } else {
+-          Taro.redirectTo({url: redirectPath})
+-        }
++        completeLoginRedirect()
+       }
+     } finally {
+       setLoading(false)
+@@ -54,19 +69,82 @@ export default function LoginPage() {
+     }
+     setLoading(true)
+     try {
+-      const {error} = await signInWithWechat()
++      const {data, error} = await startWechatSignIn()
+       if (error) {
+         Taro.showToast({title: error.message || '微信登录失败', icon: 'none'})
++      } else if (data?.status === 'authenticated') {
++        completeLoginRedirect()
+       } else {
+-        const redirectPath = Taro.getStorageSync('loginRedirectPath') || '/pages/home/index'
+-        Taro.removeStorageSync('loginRedirectPath')
+-        const tabBarPaths = ['/pages/home/index', '/pages/chat/index', '/pages/stats/index', '/pages/profile/index']
+-        if (tabBarPaths.includes(redirectPath)) {
+-          Taro.switchTab({url: redirectPath})
+-        } else {
+-          Taro.redirectTo({url: redirectPath})
+-        }
++        setWechatTicket(data?.status === 'unbound' ? data.registrationTicket : '')
++        setWechatStep('choice')
++      }
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  const saveWechatProfile = async () => {
++    const {data: {user}} = await supabase.auth.getUser()
++    if (!user) throw new Error('微信账号登录状态未就绪')
++    const avatarUrl = wechatAvatarPath ? await uploadWechatAvatar(wechatAvatarPath) : undefined
++    const updates = {
++      ...(wechatNickname.trim() ? {nickname: wechatNickname.trim()} : {}),
++      ...(avatarUrl ? {avatar_url: avatarUrl} : {})
++    }
++    if (Object.keys(updates).length === 0) return
++    if (!await updateProfile(user.id, updates)) throw new Error('微信资料保存失败')
++    const members = await getFamilyMembers(user.id)
++    const primary = members.find(member => member.is_primary)
++    if (primary) await updateFamilyMember(primary.id, updates)
++    await Promise.all([refreshProfile(), refreshMembers(user.id)])
++  }
++
++  const finishWechatRegistration = async (phoneCode?: string) => {
++    if (!wechatTicket) return
++    setLoading(true)
++    try {
++      const {error} = await registerWechatSignIn(wechatTicket, phoneCode)
++      if (error) {
++        Taro.showToast({title: error.message || '微信账号创建失败', icon: 'none'})
++        return
++      }
++      await saveWechatProfile()
++      completeLoginRedirect()
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '微信登录失败', icon: 'none'})
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  const handlePhoneRegistration = (event: any) => {
++    const phoneCode = event?.detail?.code
++    if (!phoneCode) {
++      Taro.showToast({title: '未授权手机号，可选择跳过', icon: 'none'})
++      return
++    }
++    void finishWechatRegistration(phoneCode)
++  }
++
++  const handleBindExisting = async () => {
++    if (!username.trim() || password.length < 6) {
++      Taro.showToast({title: '请输入已有账号和密码', icon: 'none'})
++      return
++    }
++    setLoading(true)
++    try {
++      const {error: loginError} = await signInWithUsername(username.trim(), password)
++      if (loginError) {
++        Taro.showToast({title: loginError.message || '已有账号登录失败', icon: 'none'})
++        return
++      }
++      const {error: bindError} = await bindWechatSignIn(wechatTicket)
++      if (bindError) {
++        await signOut()
++        Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
++        return
+       }
++      completeLoginRedirect()
+     } finally {
+       setLoading(false)
+     }
+@@ -164,7 +242,7 @@ export default function LoginPage() {
+         </button>
+ 
+         {/* 微信登录 */}
+-        {isWeApp && (
++        {isWeApp && wechatStep === 'idle' && (
+           <button
+             type="button"
+             className="w-full flex items-center justify-center leading-none gap-3 text-xl font-semibold rounded-xl border-2 border-border bg-card text-foreground"
+@@ -176,6 +254,130 @@ export default function LoginPage() {
+           </button>
+         )}
+       </div>
++
++      {wechatStep !== 'idle' && (
++        <div className="fixed inset-0 flex flex-col justify-end" style={{zIndex: 1000}}>
++          <div
++            className="absolute inset-0"
++            style={{backgroundColor: 'rgba(0,0,0,0.45)'}}
++            onClick={() => !loading && setWechatStep('idle')}
++          />
++          <div
++            className="relative bg-white px-6 pt-3 safe-area-bottom"
++            style={{borderRadius: '16px 16px 0 0', paddingBottom: 'calc(20px + env(safe-area-inset-bottom, 0px))'}}
++          >
++            <div className="flex justify-center pb-3">
++              <div className="rounded-full" style={{width: '40px', height: '4px', backgroundColor: '#D8D8D8'}} />
++            </div>
++            <div className="flex items-center justify-between mb-5">
++              <div>
++                <p className="text-2xl font-semibold text-foreground">
++                  {wechatStep === 'choice' ? '完善微信资料' : '绑定已有账号'}
++                </p>
++                <p className="text-xl text-muted-foreground mt-1">
++                  {wechatStep === 'choice' ? '头像、昵称和手机号均可跳过' : '登录后将微信身份绑定到当前账号'}
++                </p>
++              </div>
++              <button
++                type="button"
++                className="flex items-center justify-center"
++                style={{width: '40px', height: '40px'}}
++                onClick={() => !loading && setWechatStep('idle')}
++              >
++                <div className="i-mdi-close text-2xl text-muted-foreground" />
++              </button>
++            </div>
++
++            {wechatStep === 'choice' ? (
++              <>
++                <div className="flex flex-col items-center mb-5">
++                  <button
++                    type="button"
++                    {...({openType: 'chooseAvatar', onChooseAvatar: (event: any) => {
++                      const path = event?.detail?.avatarUrl
++                      if (path) setWechatAvatarPath(path)
++                    }} as any)}
++                    className="overflow-hidden border-2 border-primary/30 bg-primary/10 flex items-center justify-center"
++                    style={{width: '84px', height: '84px', borderRadius: '50%'}}
++                  >
++                    {wechatAvatarPath
++                      ? <Image src={wechatAvatarPath} mode="aspectFill" style={{width: '84px', height: '84px'}} />
++                      : <div className="i-mdi-account text-5xl text-primary" />}
++                  </button>
++                  <span className="text-xl text-muted-foreground mt-2">选择头像</span>
++                </div>
++                <div className="border border-input rounded-xl px-4 bg-card mb-4 flex items-center" style={{height: '50px'}}>
++                  <input
++                    type="nickname"
++                    value={wechatNickname}
++                    placeholder="填写微信昵称（可跳过）"
++                    className="w-full text-xl text-foreground bg-transparent outline-none"
++                    onInput={(event) => {
++                      const value = (event as any).detail?.value ?? (event as any).target?.value ?? ''
++                      setWechatNickname(value)
++                    }}
++                  />
++                </div>
++                <button
++                  type="button"
++                  disabled={loading}
++                  className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50 mb-3"
++                  style={{height: '50px'}}
++                  onClick={() => void finishWechatRegistration()}
++                >{loading ? '登录中...' : '微信快捷登录'}</button>
++                <button
++                  type="button"
++                  disabled={loading}
++                  {...({openType: 'getPhoneNumber', onGetPhoneNumber: handlePhoneRegistration} as any)}
++                  className="w-full flex items-center justify-center text-xl font-medium border border-primary text-primary rounded-xl disabled:opacity-50 mb-2"
++                  style={{height: '48px'}}
++                >授权手机号并登录</button>
++                <button
++                  type="button"
++                  className="w-full flex items-center justify-center text-xl text-muted-foreground"
++                  style={{height: '42px'}}
++                  onClick={() => setWechatStep('bind')}
++                >已有账号，去绑定</button>
++              </>
++            ) : (
++              <>
++                <div className="flex flex-col gap-3 mb-4">
++                  <div className="border border-input rounded-xl px-4 bg-card flex items-center" style={{height: '50px'}}>
++                    <input
++                      className="w-full text-xl text-foreground bg-transparent outline-none"
++                      placeholder="已有用户名"
++                      value={username}
++                      onInput={(e) => { const ev = e as any; setUsername(ev.detail?.value ?? ev.target?.value ?? '') }}
++                    />
++                  </div>
++                  <div className="border border-input rounded-xl px-4 bg-card flex items-center" style={{height: '50px'}}>
++                    <input
++                      type="password"
++                      className="w-full text-xl text-foreground bg-transparent outline-none"
++                      placeholder="已有账号密码"
++                      value={password}
++                      onInput={(e) => { const ev = e as any; setPassword(ev.detail?.value ?? ev.target?.value ?? '') }}
++                    />
++                  </div>
++                </div>
++                <button
++                  type="button"
++                  disabled={loading}
++                  className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50 mb-2"
++                  style={{height: '50px'}}
++                  onClick={handleBindExisting}
++                >{loading ? '绑定中...' : '登录并绑定微信'}</button>
++                <button
++                  type="button"
++                  className="w-full flex items-center justify-center text-xl text-muted-foreground"
++                  style={{height: '42px'}}
++                  onClick={() => setWechatStep('choice')}
++                >返回微信快捷登录</button>
++              </>
++            )}
++          </div>
++        </div>
++      )}
+     </div>
+   )
+ }
+diff --git a/src/pages/profile-onboarding/index.config.ts b/src/pages/profile-onboarding/index.config.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9aa598e43b3b0bb6f4261109ee1d5a1eecf8b49
+--- /dev/null
++++ b/src/pages/profile-onboarding/index.config.ts
+@@ -0,0 +1 @@
++export default definePageConfig({navigationBarTitleText: '完善资料'})
+diff --git a/src/pages/profile-onboarding/index.tsx b/src/pages/profile-onboarding/index.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a794025f80b13e2068a0ed9ff2a531d43e329b9c
+--- /dev/null
++++ b/src/pages/profile-onboarding/index.tsx
+@@ -0,0 +1,95 @@
++import {useState} from 'react'
++import Taro from '@tarojs/taro'
++import {Image} from '@tarojs/components'
++import {useAuth} from '@/contexts/AuthContext'
++import {getFamilyMembers, updateFamilyMember, updateProfile} from '@/db/api'
++import {useAppStore} from '@/store/appStore'
++import {uploadWechatAvatar} from '@/services/wechatAuth'
++import {completeLoginRedirect} from '@/utils/authRedirect'
++import {withRouteGuard} from '@/components/RouteGuard'
++
++function ProfileOnboardingPage() {
++  const {user, refreshProfile} = useAuth()
++  const {refreshMembers} = useAppStore()
++  const [nickname, setNickname] = useState('')
++  const [avatarPath, setAvatarPath] = useState('')
++  const [saving, setSaving] = useState(false)
++
++  const handleChooseAvatar = (event: any) => {
++    const path = event?.detail?.avatarUrl
++    if (path) setAvatarPath(path)
++  }
++
++  const handleSave = async () => {
++    if (!user) return
++    setSaving(true)
++    try {
++      const avatarUrl = avatarPath ? await uploadWechatAvatar(avatarPath) : undefined
++      const updates = {
++        ...(nickname.trim() ? {nickname: nickname.trim()} : {}),
++        ...(avatarUrl ? {avatar_url: avatarUrl} : {})
++      }
++      if (Object.keys(updates).length > 0) {
++        const saved = await updateProfile(user.id, updates)
++        if (!saved) throw new Error('资料保存失败')
++        const members = await getFamilyMembers(user.id)
++        const primary = members.find(member => member.is_primary)
++        if (primary) await updateFamilyMember(primary.id, updates)
++        await Promise.all([refreshProfile(), refreshMembers(user.id)])
++      }
++      completeLoginRedirect()
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '资料保存失败', icon: 'none'})
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  return (
++    <div className="min-h-screen bg-background px-6 pt-10">
++      <div className="flex flex-col items-center mb-8">
++        <button
++          type="button"
++          {...({openType: 'chooseAvatar', onChooseAvatar: handleChooseAvatar} as any)}
++          className="overflow-hidden border-2 border-primary/30 bg-primary/10 flex items-center justify-center"
++          style={{width: '96px', height: '96px', borderRadius: '50%'}}
++        >
++          {avatarPath
++            ? <Image src={avatarPath} mode="aspectFill" style={{width: '96px', height: '96px'}} />
++            : <div className="i-mdi-account text-5xl text-primary" />}
++        </button>
++        <p className="text-xl text-muted-foreground mt-3">选择头像</p>
++      </div>
++      <div className="mb-6">
++        <p className="text-xl text-muted-foreground mb-2">昵称</p>
++        <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
++          <input
++            type="nickname"
++            value={nickname}
++            placeholder="填写微信昵称"
++            className="w-full text-xl text-foreground bg-transparent outline-none"
++            onInput={(event) => {
++              const value = (event as any).detail?.value ?? (event as any).target?.value ?? ''
++              setNickname(value)
++            }}
++          />
++        </div>
++      </div>
++      <button
++        type="button"
++        disabled={saving}
++        className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50"
++        style={{height: '52px'}}
++        onClick={handleSave}
++      >{saving ? '保存中...' : '保存并继续'}</button>
++      <button
++        type="button"
++        className="w-full flex items-center justify-center text-xl text-muted-foreground mt-3"
++        style={{height: '44px'}}
++        onClick={completeLoginRedirect}
++      >暂时跳过</button>
++    </div>
++  )
++}
++
++export default withRouteGuard(ProfileOnboardingPage)
+diff --git a/src/pages/profile/index.tsx b/src/pages/profile/index.tsx
+index d7d35d89f9d99eb2505a8662915fc14bf27f8762..c83dc02e79eb48f4a1f552cd3f541c17584ce00d 100644
+--- a/src/pages/profile/index.tsx
++++ b/src/pages/profile/index.tsx
+@@ -40,6 +40,7 @@ function ProfilePage() {
+   const menuItems = [
+     {icon: 'i-mdi-bluetooth', label: '设备管理', desc: `${devices.length}台设备`, url: '/pages/device-manager/index'},
+     {icon: 'i-mdi-account-edit', label: '个人资料', desc: activeMember?.nickname || '未设置', url: '/pages/personal-info/index'},
++    {icon: 'i-mdi-shield-account', label: '账号与微信', desc: '登录与绑定', url: '/pages/account-settings/index'},
+     {icon: 'i-mdi-account-group', label: '家庭成员', desc: familyMembers.length > 0 ? `${familyMembers.length}位成员` : '未配置', url: '/pages/family/index'},
+     {icon: 'i-mdi-bell-outline', label: '提醒设置', desc: '餐前&饮水提醒', url: '/pages/reminder-settings/index'},
+     {icon: 'i-mdi-help-circle-outline', label: '使用帮助', desc: '使用指引', url: '/pages/device-add/index'},
+diff --git a/src/services/wechatAuth.ts b/src/services/wechatAuth.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..20f5dd93c3a2f6b0286c6260650defb2b2c82aff
+--- /dev/null
++++ b/src/services/wechatAuth.ts
+@@ -0,0 +1,87 @@
++import Taro from '@tarojs/taro'
++import {supabase} from '@/client/supabase'
++
++export type WechatStartResult =
++  | {status: 'authenticated'}
++  | {status: 'unbound'; registrationTicket: string}
++
++export interface WechatAccountStatus {
++  bound: boolean
++  phoneMasked: string | null
++}
++
++async function getFunctionError(error: any, fallback: string): Promise<Error> {
++  try {
++    const text = await error?.context?.text?.()
++    if (text) {
++      const parsed = JSON.parse(text)
++      return new Error(parsed.message || parsed.error || fallback)
++    }
++  } catch {}
++  return new Error(error?.message || fallback)
++}
++
++async function verifyMagicLink(token: string): Promise<void> {
++  const {error} = await supabase.auth.verifyOtp({token_hash: token, type: 'magiclink'})
++  if (error) throw error
++}
++
++async function invokeWechat(body: Record<string, unknown>): Promise<any> {
++  const {data, error} = await supabase.functions.invoke('wechat_miniapp_login', {body})
++  if (error) throw await getFunctionError(error, '微信登录服务不可用')
++  if (!data || typeof data !== 'object') throw new Error('微信登录服务返回异常')
++  return data
++}
++
++export async function startWechatLogin(): Promise<WechatStartResult> {
++  if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) throw new Error('仅支持微信小程序登录')
++  const {code} = await Taro.login()
++  if (!code) throw new Error('未获取到微信登录凭证')
++  // 同时发送 code，兼容尚未升级到分阶段协议的云端函数。
++  const data = await invokeWechat({action: 'start', loginCode: code, code})
++  if (data.token && (!data.status || data.status === 'authenticated')) {
++    await verifyMagicLink(data.token)
++    return {status: 'authenticated'}
++  }
++  if (data.status === 'unbound' && data.registrationTicket) {
++    return {status: 'unbound', registrationTicket: data.registrationTicket}
++  }
++  throw new Error('微信登录状态异常')
++}
++
++export async function registerWechatAccount(registrationTicket: string, phoneCode?: string): Promise<void> {
++  const data = await invokeWechat({action: 'register', registrationTicket, phoneCode: phoneCode || undefined})
++  if (!data.token) throw new Error('微信账号创建失败')
++  await verifyMagicLink(data.token)
++}
++
++export async function bindWechatAccount(registrationTicket: string): Promise<void> {
++  const data = await invokeWechat({action: 'bind', registrationTicket})
++  if (data.status !== 'bound') throw new Error('微信账号绑定失败')
++}
++
++export async function prepareWechatBinding(): Promise<string> {
++  if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) throw new Error('仅支持微信小程序绑定')
++  const {code} = await Taro.login()
++  if (!code) throw new Error('未获取到微信登录凭证')
++  const data = await invokeWechat({action: 'prepare-bind', loginCode: code})
++  if (!data.registrationTicket) throw new Error('微信绑定凭证获取失败')
++  return data.registrationTicket
++}
++
++export async function getWechatAccountStatus(): Promise<WechatAccountStatus> {
++  const data = await invokeWechat({action: 'status'})
++  return {bound: !!data.bound, phoneMasked: data.phoneMasked || null}
++}
++
++export async function uploadWechatAvatar(localPath: string): Promise<string> {
++  const fs = Taro.getFileSystemManager()
++  const base64 = fs.readFileSync(localPath, 'base64') as string
++  const extension = localPath.split('.').pop()?.toLowerCase() || 'jpg'
++  const {data, error} = await supabase.functions.invoke('upload-avatar', {
++    body: {image: base64, ext: extension}
++  })
++  if (error) throw await getFunctionError(error, '头像上传失败')
++  if (!data?.url) throw new Error('头像上传返回异常')
++  return data.url
++}
+diff --git a/src/utils/authRedirect.ts b/src/utils/authRedirect.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d06dd84961a99625db1a653e75c7ff336658cfc
+--- /dev/null
++++ b/src/utils/authRedirect.ts
+@@ -0,0 +1,41 @@
++import Taro from '@tarojs/taro'
++
++export const STORAGE_KEY_REDIRECT_PATH = 'loginRedirectPath'
++const DEFAULT_REDIRECT = '/pages/home/index'
++const TAB_BAR_PATHS = new Set([
++  '/pages/home/index',
++  '/pages/chat/index',
++  '/pages/stats/index',
++  '/pages/profile/index'
++])
++
++export function buildCurrentRouteUrl(): string {
++  const router = Taro.getCurrentInstance()?.router
++  const path = router?.path ? `/${router.path.replace(/^\//, '')}` : ''
++  if (!path) return ''
++
++  const query = Object.entries(router?.params || {})
++    .filter(([key, value]) => key !== '$taroTimestamp' && value !== undefined && value !== null && value !== '')
++    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
++    .join('&')
++  return query ? `${path}?${query}` : path
++}
++
++export function getStoredRedirect(): string {
++  return Taro.getStorageSync(STORAGE_KEY_REDIRECT_PATH) || DEFAULT_REDIRECT
++}
++
++export function clearStoredRedirect(): void {
++  Taro.removeStorageSync(STORAGE_KEY_REDIRECT_PATH)
++}
++
++export function completeLoginRedirect(): void {
++  const target = getStoredRedirect()
++  clearStoredRedirect()
++  const path = target.split('?')[0]
++  if (TAB_BAR_PATHS.has(path)) {
++    Taro.switchTab({url: path})
++  } else {
++    Taro.redirectTo({url: target})
++  }
++}
+diff --git a/src/utils/avatarUtils.ts b/src/utils/avatarUtils.ts
+index 1c4b886d923a9666a9716bb173dad362e7f4a8fa..80720969737bec59f134f3e9ab1b2361318bf8e9 100644
+--- a/src/utils/avatarUtils.ts
++++ b/src/utils/avatarUtils.ts
+@@ -1,9 +1,10 @@
+-// 头像资源工具 — 按性别返回对应卡通头像 URL
+-export const AVATAR_MALE_URL =
+-  'https://miaoda-conversation-file.cdn.bcebos.com/user-c3jta90r2ebk/app-c6x1q6fsddz5/20260609/avatar_male_1781009961206.png'
++import {supabase} from '@/client/supabase'
+ 
+-export const AVATAR_FEMALE_URL =
+-  'https://miaoda-conversation-file.cdn.bcebos.com/user-c3jta90r2ebk/app-c6x1q6fsddz5/20260609/avatar_female_1781009961205.png'
++const avatarBucket = supabase.storage.from('avatars')
++
++// 带内容哈希的固定路径避免覆盖和版本串用；本地 PNG 仅作为部署上传源。
++export const AVATAR_MALE_URL = avatarBucket.getPublicUrl('defaults/avatar-male-1e8f1423eb6c.png').data.publicUrl
++export const AVATAR_FEMALE_URL = avatarBucket.getPublicUrl('defaults/avatar-female-8ffc792d31b6.png').data.publicUrl
+ 
+ /**
+  * 根据性别返回对应头像 URL
+diff --git a/supabase/config.toml b/supabase/config.toml
+index a06e62b242ca522d9944dfd8d6685544934510d8..e0afa8ebda0c94e922c2b7dc94103c0706e7c894 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -1,2 +1,11 @@
+ [auth.email]
+ enable_confirmations = false
++
++[functions.wechat_miniapp_login]
++verify_jwt = false
++
++[functions.wechat-notification-dispatch]
++verify_jwt = false
++
++[functions.recipe-share]
++verify_jwt = false
+diff --git a/supabase/functions/_shared/common.ts b/supabase/functions/_shared/common.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7991e546dca8923e1467ea5dfa5aa48b56dd598c
+--- /dev/null
++++ b/supabase/functions/_shared/common.ts
+@@ -0,0 +1,62 @@
++import {createClient, type SupabaseClient} from 'jsr:@supabase/supabase-js'
++
++export const corsHeaders = {
++  'Access-Control-Allow-Origin': '*',
++  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
++  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-dispatch-secret',
++}
++
++export class HttpError extends Error {
++  constructor(public status: number, message: string) {
++    super(message)
++  }
++}
++
++export function json(data: unknown, status = 200): Response {
++  return new Response(JSON.stringify(data), {
++    status,
++    headers: {...corsHeaders, 'Content-Type': 'application/json'}
++  })
++}
++
++export function getSupabaseAdmin(): SupabaseClient {
++  const url = Deno.env.get('APP_SUPABASE_URL') || Deno.env.get('SUPABASE_URL') || ''
++  const key = Deno.env.get('APP_SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
++  if (!url || !key) throw new HttpError(500, 'Supabase service configuration is missing')
++  return createClient(url, key, {auth: {persistSession: false, autoRefreshToken: false}})
++}
++
++export async function getAuthUserId(req: Request, required = true): Promise<string | null> {
++  const auth = req.headers.get('Authorization') || ''
++  const token = auth.replace(/^Bearer\s+/i, '')
++  if (!token) {
++    if (required) throw new HttpError(401, '请先登录')
++    return null
++  }
++  const {data, error} = await getSupabaseAdmin().auth.getUser(token)
++  if (error || !data.user?.id) {
++    if (required) throw new HttpError(401, '登录状态已失效')
++    return null
++  }
++  return data.user.id
++}
++
++export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
++  const controller = new AbortController()
++  const timer = setTimeout(() => controller.abort(), timeoutMs)
++  try {
++    return await fetch(url, {...init, signal: controller.signal})
++  } catch (error) {
++    if (error instanceof DOMException && error.name === 'AbortError') throw new HttpError(504, '微信服务响应超时')
++    throw error
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++export function handleError(error: unknown, scope: string): Response {
++  const status = error instanceof HttpError ? error.status : 500
++  const message = error instanceof Error ? error.message : 'Internal error'
++  console.error(`[${scope}] failed`, {status, message})
++  return json({message: status >= 500 ? '服务暂时不可用，请稍后重试' : message}, status)
++}
+diff --git a/supabase/functions/_shared/wechat.ts b/supabase/functions/_shared/wechat.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..05e2b650f949c2d6340109eb3f0378e9e1ed7aa0
+--- /dev/null
++++ b/supabase/functions/_shared/wechat.ts
+@@ -0,0 +1,154 @@
++import {fetchWithTimeout, getSupabaseAdmin, HttpError} from './common.ts'
++import type {ReminderKind, WechatTemplateConfig} from './notification-payload.ts'
++
++export type {ReminderKind, WechatTemplateConfig} from './notification-payload.ts'
++
++const encoder = new TextEncoder()
++const decoder = new TextDecoder()
++
++function bytesToBase64Url(bytes: Uint8Array): string {
++  let binary = ''
++  bytes.forEach(byte => { binary += String.fromCharCode(byte) })
++  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
++}
++
++function base64UrlToBytes(value: string): Uint8Array {
++  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
++  const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='))
++  return Uint8Array.from(binary, char => char.charCodeAt(0))
++}
++
++async function importTicketKey(): Promise<CryptoKey> {
++  const secret = Deno.env.get('WECHAT_LOGIN_TICKET_SECRET') || ''
++  if (secret.length < 32) throw new HttpError(500, 'WeChat login ticket secret is missing')
++  return crypto.subtle.importKey('raw', encoder.encode(secret), {name: 'HMAC', hash: 'SHA-256'}, false, ['sign', 'verify'])
++}
++
++export interface WechatTicketPayload {
++  openid: string
++  unionid?: string
++  exp: number
++  nonce: string
++}
++
++export async function createLoginTicket(identity: {openid: string; unionid?: string}): Promise<string> {
++  const payload: WechatTicketPayload = {
++    openid: identity.openid,
++    ...(identity.unionid ? {unionid: identity.unionid} : {}),
++    exp: Math.floor(Date.now() / 1000) + 10 * 60,
++    nonce: crypto.randomUUID()
++  }
++  const encoded = bytesToBase64Url(encoder.encode(JSON.stringify(payload)))
++  const signature = await crypto.subtle.sign('HMAC', await importTicketKey(), encoder.encode(encoded))
++  return `${encoded}.${bytesToBase64Url(new Uint8Array(signature))}`
++}
++
++export async function verifyLoginTicket(ticket: unknown): Promise<WechatTicketPayload> {
++  if (typeof ticket !== 'string' || !ticket.includes('.')) throw new HttpError(400, '微信登录凭证无效')
++  const [encoded, signature] = ticket.split('.')
++  const valid = await crypto.subtle.verify('HMAC', await importTicketKey(), base64UrlToBytes(signature), encoder.encode(encoded))
++  if (!valid) throw new HttpError(400, '微信登录凭证无效')
++  const payload = JSON.parse(decoder.decode(base64UrlToBytes(encoded))) as WechatTicketPayload
++  if (!payload.openid || payload.exp < Math.floor(Date.now() / 1000)) throw new HttpError(400, '微信登录凭证已过期，请重试')
++  return payload
++}
++
++export async function codeToSession(code: unknown): Promise<{openid: string; unionid?: string}> {
++  if (typeof code !== 'string' || !code.trim()) throw new HttpError(400, '缺少微信登录凭证')
++  const appId = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_ID') || ''
++  const secret = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_SECRET') || ''
++  if (!appId || !secret) throw new HttpError(500, 'WeChat login configuration is missing')
++  const query = new URLSearchParams({appid: appId, secret, js_code: code, grant_type: 'authorization_code'})
++  const response = await fetchWithTimeout(`https://api.weixin.qq.com/sns/jscode2session?${query.toString()}`, {method: 'GET'})
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.openid) {
++    const message = data.errcode === 40029 || data.errcode === 40163 ? '微信登录凭证已失效，请重试' : '微信身份校验失败'
++    throw new HttpError(data.errcode === 40029 || data.errcode === 40163 ? 400 : 502, message)
++  }
++  return {openid: data.openid, ...(data.unionid ? {unionid: data.unionid} : {})}
++}
++
++export async function sha256(value: string): Promise<string> {
++  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(value))
++  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
++}
++
++export async function getWechatAccessToken(): Promise<string> {
++  const admin = getSupabaseAdmin()
++  const now = new Date()
++  const {data: cached} = await admin
++    .from('wechat_access_tokens')
++    .select('access_token, expires_at')
++    .eq('token_key', 'miniapp')
++    .maybeSingle()
++  if (cached?.access_token && new Date(cached.expires_at).getTime() > now.getTime() + 120_000) return cached.access_token
++
++  const appId = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_ID') || ''
++  const secret = Deno.env.get('WECHAT_MINIPROGRAM_LOGIN_APP_SECRET') || ''
++  if (!appId || !secret) throw new HttpError(500, 'WeChat login configuration is missing')
++  const response = await fetchWithTimeout('https://api.weixin.qq.com/cgi-bin/stable_token', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/json'},
++    body: JSON.stringify({grant_type: 'client_credential', appid: appId, secret, force_refresh: false})
++  })
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.access_token) throw new HttpError(502, '微信服务令牌获取失败')
++  const expiresAt = new Date(now.getTime() + Math.max(300, Number(data.expires_in || 7200) - 120) * 1000).toISOString()
++  await admin.from('wechat_access_tokens').upsert({token_key: 'miniapp', access_token: data.access_token, expires_at: expiresAt})
++  return data.access_token
++}
++
++export async function getPhoneNumber(phoneCode: unknown): Promise<string> {
++  if (typeof phoneCode !== 'string' || !phoneCode.trim()) throw new HttpError(400, '手机号授权凭证无效')
++  const token = await getWechatAccessToken()
++  const response = await fetchWithTimeout(`https://api.weixin.qq.com/wxa/business/getuserphonenumber?access_token=${encodeURIComponent(token)}`, {
++    method: 'POST',
++    headers: {'Content-Type': 'application/json'},
++    body: JSON.stringify({code: phoneCode})
++  })
++  const data = await response.json().catch(() => ({}))
++  if (!response.ok || data.errcode || !data.phone_info?.phoneNumber) throw new HttpError(400, '手机号授权已失效，可选择跳过')
++  return String(data.phone_info.phoneNumber)
++}
++
++export function maskPhone(phone: string | null | undefined): string | null {
++  if (!phone) return null
++  return phone.replace(/^(\d{3})\d+(\d{4})$/, '$1****$2')
++}
++
++export function getSubscribeTemplates(): Partial<Record<ReminderKind, WechatTemplateConfig>> {
++  const raw = Deno.env.get('WECHAT_SUBSCRIBE_TEMPLATES_JSON') || ''
++  if (!raw) return {}
++  try {
++    const parsed = JSON.parse(raw) as Record<string, any>
++    const result: Partial<Record<ReminderKind, WechatTemplateConfig>> = {}
++    for (const kind of ['breakfast', 'lunch', 'dinner', 'water'] as ReminderKind[]) {
++      const item = parsed[kind]
++      const base = {
++        templateId: String(item?.templateId || ''),
++        page: typeof item?.page === 'string' ? item.page : '/pages/home/index'
++      }
++      if (!base.templateId) continue
++      if (kind === 'water' && item?.fields?.tip && item?.fields?.drinkTime) {
++        result[kind] = {
++          ...base,
++          mode: 'water',
++          fields: {tip: String(item.fields.tip), drinkTime: String(item.fields.drinkTime)}
++        }
++      } else if (kind !== 'water' && item?.fields?.menu && item?.fields?.date && item?.fields?.checkInTime) {
++        result[kind] = {
++          ...base,
++          mode: 'meal',
++          fields: {
++            menu: String(item.fields.menu),
++            date: String(item.fields.date),
++            checkInTime: String(item.fields.checkInTime)
++          }
++        }
++      }
++    }
++    return result
++  } catch {
++    throw new HttpError(500, 'WeChat subscribe template configuration is invalid')
++  }
++}
+diff --git a/supabase/functions/upload-avatar/index.ts b/supabase/functions/upload-avatar/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..62d2c14d6254f20b954f4a05dace011fafa55b58
+--- /dev/null
++++ b/supabase/functions/upload-avatar/index.ts
+@@ -0,0 +1,29 @@
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++
++function decodeBase64(value: string): Uint8Array {
++  const raw = value.includes(',') ? value.split(',')[1] : value
++  const binary = atob(raw)
++  return Uint8Array.from(binary, char => char.charCodeAt(0))
++}
++
++Deno.serve(async (req: Request) => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const userId = await getAuthUserId(req)
++    const {image, ext = 'jpg'} = await req.json().catch(() => ({}))
++    if (typeof image !== 'string' || !image) throw new HttpError(400, '缺少头像图片')
++    const safeExt = String(ext).toLowerCase() === 'png' ? 'png' : String(ext).toLowerCase() === 'webp' ? 'webp' : 'jpg'
++    const bytes = decodeBase64(image)
++    if (bytes.byteLength > 2 * 1024 * 1024) throw new HttpError(400, '头像不能超过 2MB')
++    const path = `${userId}/${crypto.randomUUID()}.${safeExt}`
++    const contentType = safeExt === 'jpg' ? 'image/jpeg' : `image/${safeExt}`
++    const admin = getSupabaseAdmin()
++    const {error} = await admin.storage.from('avatars').upload(path, bytes, {contentType, upsert: false})
++    if (error) throw error
++    const {data} = admin.storage.from('avatars').getPublicUrl(path)
++    return json({url: data.publicUrl})
++  } catch (error) {
++    return handleError(error, 'upload-avatar')
++  }
++})
+diff --git a/supabase/functions/wechat_miniapp_login/index.ts b/supabase/functions/wechat_miniapp_login/index.ts
+index 57d4c6fba0e64303a41118e06aca5b628e70695a..435fca881898babf431d0f3d38474b9e330d4b61 100644
+--- a/supabase/functions/wechat_miniapp_login/index.ts
++++ b/supabase/functions/wechat_miniapp_login/index.ts
+@@ -1,94 +1,147 @@
+-// wechat_miniapp_login — 微信小程序登录 EF
+-// 1. 用微信 code 换取 openid
+-// 2. 自动创建/复用 Supabase 用户
+-// 3. 生成 magiclink token 返回给客户端
+-import { createClient } from 'jsr:@supabase/supabase-js'
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++import {codeToSession, createLoginTicket, getPhoneNumber, maskPhone, sha256, verifyLoginTicket} from '../_shared/wechat.ts'
+ 
+-const SUPABASE_URL = Deno.env.get("APP_SUPABASE_URL") || Deno.env.get("SUPABASE_URL")!
+-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("APP_SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
++const PROVIDER = 'wechat_miniapp'
+ 
+-const corsHeaders = {
+-  'Access-Control-Allow-Origin': '*',
+-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
++async function findIdentity(openid: string) {
++  const admin = getSupabaseAdmin()
++  const {data, error} = await admin
++    .from('wechat_identities')
++    .select('user_id, openid, unionid, phone_number')
++    .eq('provider', PROVIDER)
++    .eq('openid', openid)
++    .maybeSingle()
++  if (error) throw error
++  if (data) return data
++
++  const {data: legacy, error: legacyError} = await admin
++    .from('profiles')
++    .select('id, openid')
++    .eq('openid', openid)
++    .maybeSingle()
++  if (legacyError) throw legacyError
++  if (!legacy) return null
++  const {data: migrated, error: migrateError} = await admin
++    .from('wechat_identities')
++    .upsert({provider: PROVIDER, user_id: legacy.id, openid}, {onConflict: 'provider,openid'})
++    .select('user_id, openid, unionid, phone_number')
++    .single()
++  if (migrateError) throw migrateError
++  return migrated
+ }
+ 
+-Deno.serve(async (req) => {
+-  if (req.method === 'OPTIONS') {
+-    return new Response(null, { status: 204, headers: corsHeaders })
+-  }
++async function generateLoginToken(userId: string): Promise<string> {
++  const admin = getSupabaseAdmin()
++  const {data: userData, error: userError} = await admin.auth.admin.getUserById(userId)
++  const email = userData.user?.email
++  if (userError || !email) throw new HttpError(500, '账号登录信息不完整')
++  const {data, error} = await admin.auth.admin.generateLink({type: 'magiclink', email})
++  const token = data?.properties?.hashed_token
++  if (error || !token) throw new HttpError(500, '无法生成登录凭证')
++  return token
++}
+ 
+-  try {
+-    const { code } = await req.json().catch(() => ({}))
+-    if (!code) {
+-      return new Response(JSON.stringify({ message: '缺少code' }), {
+-        status: 400,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleStart(loginCode: unknown) {
++  const session = await codeToSession(loginCode)
++  const identity = await findIdentity(session.openid)
++  if (identity) return json({status: 'authenticated', token: await generateLoginToken(identity.user_id)})
++  return json({status: 'unbound', registrationTicket: await createLoginTicket(session)})
++}
+ 
+-    const APP_ID = Deno.env.get("WECHAT_MINIPROGRAM_LOGIN_APP_ID")
+-    const APP_SECRET = Deno.env.get("WECHAT_MINIPROGRAM_LOGIN_APP_SECRET")
++async function handleLegacy(code: unknown) {
++  const session = await codeToSession(code)
++  const identity = await findIdentity(session.openid)
++  if (identity) return json({token: await generateLoginToken(identity.user_id), openid: session.openid})
++  return handleRegister(await createLoginTicket(session), undefined)
++}
+ 
+-    const wxRes = await fetch(
+-      `https://api.weixin.qq.com/sns/jscode2session?appid=${APP_ID}&secret=${APP_SECRET}&js_code=${code}&grant_type=authorization_code`
+-    )
+-    const wxData = await wxRes.json()
++async function handlePrepareBind(req: Request, loginCode: unknown) {
++  const currentUserId = await getAuthUserId(req)
++  const session = await codeToSession(loginCode)
++  const identity = await findIdentity(session.openid)
++  if (identity && identity.user_id !== currentUserId) throw new HttpError(409, '该微信已绑定其他账号')
++  return json({registrationTicket: await createLoginTicket(session)})
++}
+ 
+-    if (wxData.errcode) {
+-      return new Response(JSON.stringify({ message: `微信接口错误: ${wxData.errmsg}` }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleRegister(registrationTicket: unknown, phoneCode: unknown) {
++  const ticket = await verifyLoginTicket(registrationTicket)
++  const existing = await findIdentity(ticket.openid)
++  if (existing) return json({status: 'authenticated', token: await generateLoginToken(existing.user_id)})
+ 
+-    const { openid } = wxData
+-    const email = `${openid}@wechat.login`
++  const admin = getSupabaseAdmin()
++  const phone = phoneCode ? await getPhoneNumber(phoneCode) : null
++  const email = `wx_${(await sha256(ticket.openid)).slice(0, 40)}@wechat.login`
++  const {data: created, error: createError} = await admin.auth.admin.createUser({
++    email,
++    email_confirm: true,
++    user_metadata: {from: 'wechat', openid: ticket.openid}
++  })
++  if (createError || !created.user) throw new HttpError(500, '微信账号创建失败')
+ 
+-    // 若用户不存在则创建；忽略"已注册"错误
+-    const { error: createError } = await supabaseAdmin.auth.admin.createUser({
+-      email,
+-      email_confirm: true,
+-      user_metadata: { from: 'wechat', openid },
+-    })
+-    if (createError && !createError.message.includes('already been registered')) {
+-      return new Response(JSON.stringify({ message: createError.message }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++  const {error: identityError} = await admin.from('wechat_identities').insert({
++    provider: PROVIDER,
++    user_id: created.user.id,
++    openid: ticket.openid,
++    unionid: ticket.unionid || null,
++    phone_number: phone
++  })
++  if (identityError) {
++    await admin.auth.admin.deleteUser(created.user.id)
++    const raced = await findIdentity(ticket.openid)
++    if (raced) return json({status: 'authenticated', token: await generateLoginToken(raced.user_id)})
++    throw new HttpError(409, '微信账号创建冲突，请重试')
++  }
++  return json({status: 'authenticated', token: await generateLoginToken(created.user.id)})
++}
+ 
+-    const { data: magicLinkData, error: magicLinkError } =
+-      await supabaseAdmin.auth.admin.generateLink({
+-        type: 'magiclink',
+-        email,
+-        options: { data: { from: 'wechat', openid } },
+-      })
++async function handleBind(req: Request, registrationTicket: unknown) {
++  const userId = await getAuthUserId(req)
++  const ticket = await verifyLoginTicket(registrationTicket)
++  const admin = getSupabaseAdmin()
++  const existing = await findIdentity(ticket.openid)
++  if (existing && existing.user_id !== userId) throw new HttpError(409, '该微信已绑定其他账号')
++  if (!existing) {
++    const {error} = await admin.from('wechat_identities').insert({
++      provider: PROVIDER,
++      user_id: userId,
++      openid: ticket.openid,
++      unionid: ticket.unionid || null
++    })
++    if (error?.code === '23505') throw new HttpError(409, '该账号或微信已存在绑定关系')
++    if (error) throw error
++  }
++  await admin.from('profiles').update({openid: ticket.openid}).eq('id', userId).is('openid', null)
++  return json({status: 'bound'})
++}
+ 
+-    if (magicLinkError) {
+-      return new Response(JSON.stringify({ message: magicLinkError.message }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
+-    }
++async function handleStatus(req: Request) {
++  const userId = await getAuthUserId(req)
++  const {data, error} = await getSupabaseAdmin()
++    .from('wechat_identities')
++    .select('phone_number')
++    .eq('provider', PROVIDER)
++    .eq('user_id', userId)
++    .maybeSingle()
++  if (error) throw error
++  return json({bound: !!data, phoneMasked: maskPhone(data?.phone_number)})
++}
+ 
+-    const hashedToken = magicLinkData?.properties?.hashed_token ?? ''
+-    if (!hashedToken) {
+-      return new Response(JSON.stringify({ message: '无法生成token' }), {
+-        status: 500,
+-        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-      })
++Deno.serve(async (req: Request) => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const body = await req.json().catch(() => ({}))
++    switch (body.action) {
++      case 'start': return await handleStart(body.loginCode)
++      case 'prepare-bind': return await handlePrepareBind(req, body.loginCode)
++      case 'register': return await handleRegister(body.registrationTicket, body.phoneCode)
++      case 'bind': return await handleBind(req, body.registrationTicket)
++      case 'status': return await handleStatus(req)
++      default:
++        if (body.code) return await handleLegacy(body.code)
++        throw new HttpError(400, '未知的微信账号操作')
+     }
+-
+-    return new Response(JSON.stringify({ token: hashedToken, openid }), {
+-      status: 200,
+-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-    })
+   } catch (error) {
+-    return new Response(JSON.stringify({ message: error.message }), {
+-      status: 500,
+-      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+-    })
++    return handleError(error, 'wechat_miniapp_login')
+   }
+ })
+diff --git a/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql b/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..0dad9593319dc315318e425ac931a7efcf95a8ce
+--- /dev/null
++++ b/supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql
+@@ -0,0 +1,133 @@
++-- 微信身份、一次性订阅通知、菜谱分享快照。
++-- 生产执行前先运行文末的重复 openid 审计查询。
++
++create table if not exists public.wechat_identities (
++  id uuid primary key default gen_random_uuid(),
++  provider text not null default 'wechat_miniapp',
++  user_id uuid not null references public.profiles(id) on delete cascade,
++  openid text not null,
++  unionid text,
++  phone_number text,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now(),
++  constraint wechat_identities_provider_openid_key unique (provider, openid),
++  constraint wechat_identities_provider_user_key unique (provider, user_id)
++);
++
++insert into public.wechat_identities (provider, user_id, openid)
++select 'wechat_miniapp', id, openid
++from public.profiles
++where openid is not null and btrim(openid) <> ''
++on conflict do nothing;
++
++create table if not exists public.wechat_access_tokens (
++  token_key text primary key,
++  access_token text not null,
++  expires_at timestamptz not null,
++  updated_at timestamptz not null default now()
++);
++
++create table if not exists public.notification_jobs (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references public.profiles(id) on delete cascade,
++  kind text not null check (kind in ('breakfast', 'lunch', 'dinner', 'water')),
++  template_id text not null,
++  scheduled_at timestamptz not null,
++  status text not null default 'pending' check (status in ('pending', 'processing', 'sent', 'cancelled', 'failed')),
++  attempts integer not null default 0,
++  wechat_msg_id text,
++  last_error text,
++  locked_at timestamptz,
++  sent_at timestamptz,
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now()
++);
++
++create unique index if not exists notification_jobs_one_active_kind_idx
++  on public.notification_jobs(user_id, kind)
++  where status in ('pending', 'processing', 'failed');
++create index if not exists notification_jobs_due_idx
++  on public.notification_jobs(status, scheduled_at);
++
++create table if not exists public.recipe_shares (
++  id uuid primary key default gen_random_uuid(),
++  owner_id uuid not null references public.profiles(id) on delete cascade,
++  title text not null,
++  recipe_content text not null,
++  ingredients jsonb not null default '[]'::jsonb,
++  expires_at timestamptz not null default (now() + interval '90 days'),
++  revoked_at timestamptz,
++  created_at timestamptz not null default now()
++);
++
++create index if not exists recipe_shares_owner_created_idx on public.recipe_shares(owner_id, created_at desc);
++create index if not exists recipe_shares_expiry_idx on public.recipe_shares(expires_at);
++
++alter table public.wechat_identities enable row level security;
++alter table public.wechat_access_tokens enable row level security;
++alter table public.notification_jobs enable row level security;
++alter table public.recipe_shares enable row level security;
++
++-- 以上表只允许 service_role 通过 Edge Functions 访问，不创建 anon/authenticated policy。
++
++drop trigger if exists wechat_identities_updated_at on public.wechat_identities;
++create trigger wechat_identities_updated_at
++  before update on public.wechat_identities
++  for each row execute function public.update_updated_at();
++
++drop trigger if exists notification_jobs_updated_at on public.notification_jobs;
++create trigger notification_jobs_updated_at
++  before update on public.notification_jobs
++  for each row execute function public.update_updated_at();
++
++create or replace function public.claim_due_notification_jobs(batch_size integer default 50)
++returns setof public.notification_jobs
++language plpgsql
++security definer
++set search_path = public
++as $$
++begin
++  return query
++  with due as (
++    select id
++    from public.notification_jobs
++    where (
++        status in ('pending', 'failed')
++        or (status = 'processing' and locked_at < now() - interval '5 minutes')
++      )
++      and scheduled_at <= now()
++      and attempts < 3
++      and (locked_at is null or locked_at < now() - interval '5 minutes')
++    order by scheduled_at asc
++    limit greatest(1, least(batch_size, 100))
++    for update skip locked
++  )
++  update public.notification_jobs jobs
++  set status = 'processing', locked_at = now(), attempts = jobs.attempts + 1, updated_at = now()
++  from due
++  where jobs.id = due.id
++  returning jobs.*;
++end;
++$$;
++
++revoke all on function public.claim_due_notification_jobs(integer) from public, anon, authenticated;
++grant execute on function public.claim_due_notification_jobs(integer) to service_role;
++
++insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
++values ('avatars', 'avatars', true, 2097152, array['image/jpeg', 'image/png', 'image/webp'])
++on conflict (id) do update
++set public = excluded.public,
++    file_size_limit = excluded.file_size_limit,
++    allowed_mime_types = excluded.allowed_mime_types;
++
++drop policy if exists avatars_public_read on storage.objects;
++create policy avatars_public_read on storage.objects
++  for select to public using (bucket_id = 'avatars');
++
++grant select, insert, update, delete on public.wechat_identities to service_role;
++grant select, insert, update, delete on public.wechat_access_tokens to service_role;
++grant select, insert, update, delete on public.notification_jobs to service_role;
++grant select, insert, update, delete on public.recipe_shares to service_role;
++
++-- Preflight audit: this query must return zero rows before applying the migration.
++-- select openid, count(*) from public.profiles where openid is not null group by openid having count(*) > 1;
+diff --git a/supabase/secrets/required.json b/supabase/secrets/required.json
+index 76b7f2794377aa402ebdffca9972958a575f22cb..ba9dc46bd2ec458af74dfcb1d13ff00b3d34ca25 100644
+--- a/supabase/secrets/required.json
++++ b/supabase/secrets/required.json
+@@ -1 +1 @@
+-{"required_secrets": ["BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_QIANFAN_API_KEY", "BAIDU_AK", "BAIDU_SK", "BAIDU_QIANFAN_API_KEY", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_ASR_APP_KEY", "BAIDU_ASR_APP_SECRET", "BAIDU_ASR_APP_KEY", "BAIDU_ASR_APP_SECRET", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_BRTC_AK", "BAIDU_BRTC_SK", "BAIDU_BRTC_LICENSE_KEY", "BAIDU_BRTC_APPID"]}
++{"required_secrets":["BAIDU_BRTC_AK","BAIDU_BRTC_SK","BAIDU_QIANFAN_API_KEY","BAIDU_AK","BAIDU_SK","BAIDU_ASR_APP_KEY","BAIDU_ASR_APP_SECRET","BAIDU_BRTC_LICENSE_KEY","BAIDU_BRTC_APPID","WECHAT_MINIPROGRAM_LOGIN_APP_ID","WECHAT_MINIPROGRAM_LOGIN_APP_SECRET","WECHAT_LOGIN_TICKET_SECRET","WECHAT_SUBSCRIBE_TEMPLATES_JSON","WECHAT_NOTIFICATION_DISPATCH_SECRET"]}

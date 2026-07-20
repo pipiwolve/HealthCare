@@ -11,20 +11,56 @@ import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
 import {createWeighingRecord, getDevices, getWeighingRecords, updateProfile } from '@/db/api'
 import type {Ingredient, WeighingRecord } from '@/db/types'
-import {getAiWebSocket} from '@/services/aiWebSocket'
+import {getAiWebSocket, type AgentProfile} from '@/services/aiWebSocket'
 import {useAppStore} from '@/store/appStore'
 import {buildFamilyHealthContext, checkAllergens, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
 import {buildFoodRecognitionPrompt, parseRecognizedFoods} from '@/utils/aiPromptHelpers'
+import {stripLeadingJsonMetadata} from '@/utils/markdownText'
+import {extractNutritionValues, NUTRITION_RECORDS_UPDATED} from '@/utils/nutrition'
 import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
 import {bleMockService} from '@/utils/bleMock'
 import type {WeightUnit} from '@/utils/bleService'
 import {bleService} from '@/utils/bleService'
 
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+function formatNumber(value: number | null, digits = 1): string {
+  if (value == null || !Number.isFinite(value)) return '--'
+  return Number.isInteger(value) ? String(value) : value.toFixed(digits).replace(/\.0$/, '')
+}
+
+function buildAnalysisFallbackMarkdown(params: {
+  nutrition: ReturnType<typeof extractNutritionValues>
+  personCount: number
+  memberNames: string[]
+}): string {
+  const {nutrition, personCount, memberNames} = params
+  const perPerson = {
+    calories: nutrition.calories == null ? null : nutrition.calories / personCount,
+    protein: nutrition.protein == null ? null : nutrition.protein / personCount,
+    fat: nutrition.fat == null ? null : nutrition.fat / personCount,
+    carbs: nutrition.carbs == null ? null : nutrition.carbs / personCount,
+  }
+  const names = memberNames.length > 0 ? memberNames : ['本餐成员']
+  return [
+    '## 营养总览',
+    `| 项目 | 整餐总量 | 人均（${personCount}人平摊） |`,
+    '| --- | --- | --- |',
+    `| 热量 | 约 ${formatNumber(nutrition.calories, 0)} 千卡 | 约 ${formatNumber(perPerson.calories, 0)} 千卡 |`,
+    `| 蛋白质 | 约 ${formatNumber(nutrition.protein)} 克 | 约 ${formatNumber(perPerson.protein)} 克 |`,
+    `| 脂肪 | 约 ${formatNumber(nutrition.fat)} 克 | 约 ${formatNumber(perPerson.fat)} 克 |`,
+    `| 碳水 | 约 ${formatNumber(nutrition.carbs)} 克 | 约 ${formatNumber(perPerson.carbs)} 克 |`,
+    '',
+    '## 综合建议',
+    ...names.map(name => `- **${name}**：本次 AI 仅返回了营养数据，建议结合个人健康档案控制总量，并继续关注过敏源、慢性病和用药相关饮食禁忌。`),
+  ].join('\n')
+}
+
 function HomePage() {
   const {user, profile, refreshProfile} = useAuth()
   const {
     activeMember, familyMembers, refreshMembers,
-    bleStatus, setBLEStatus, batteryLevel, setBatteryLevel,
+    bleStatus, setBLEStatus, setConnectedDevice, batteryLevel, setBatteryLevel,
     currentWeight, setCurrentWeight, weightUnit, setWeightUnit,
     isWeightStable, setIsWeightStable,
     ingredients, addIngredient, removeIngredient, clearIngredients,
@@ -97,6 +133,7 @@ function HomePage() {
     // 仅当 disclaimer 已确认后才尝试连接设备，避免与隐私弹窗同时触发系统权限弹窗
     if (!disclaimerConfirmedRef.current) return
     const devices = await getDevices(user.id)
+    setConnectedDevice(devices[0] || null)
     // 监听未运行时启动监听（不受 bleStatus 限制）
     if (!bleService.isListening) {
       if (devices.length > 0) {
@@ -119,9 +156,6 @@ function HomePage() {
       onConnectionChange: (connected) => {
         setBLEStatus(connected ? 'connected' : 'disconnected')
       },
-      onDeviceNameUpdate: (name) => {
-        if (name) setConnectedDeviceName(name)
-      },
     })
     loadData()
   })
@@ -141,9 +175,6 @@ function HomePage() {
       },
       onConnectionChange: (connected) => {
         setBLEStatus(connected ? 'connected' : 'disconnected')
-      },
-      onDeviceNameUpdate: (name) => {
-        if (name) setConnectedDeviceName(name)
       },
     })
     if (isMock) {
@@ -253,6 +284,24 @@ function HomePage() {
     })
   }
 
+  const connectDefaultAgent = async (ws: ReturnType<typeof getAiWebSocket>, agentProfile: AgentProfile, attempts = 2) => {
+    let lastError: unknown
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await ws.connect({mode: 'default', agentProfile, userId: user?.id})
+        return
+      } catch (err) {
+        lastError = err
+        ws.disconnect()
+        if (attempt < attempts) {
+          console.warn('AI WebSocket 连接失败，准备重试:', (err as any)?.message || err)
+          await wait(500)
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('AI WebSocket connect failed')
+  }
+
   const handleVoiceInput = () => {
     if (!isOnline) {
       Taro.showToast({title: '需要网络连接', icon: 'none'})
@@ -268,16 +317,25 @@ function HomePage() {
       setRecognizing(true)
       const ws = getAiWebSocket()
       try {
-        await ws.connect({mode: 'default'})
+        await connectDefaultAgent(ws, 'voice-ptt')
         const {base64} = await readFileAsBase64(res.tempFilePath)
         const buffer = Taro.base64ToArrayBuffer(base64)
-        ws.sendAudio(buffer)
         const text = await new Promise<string>((resolve, reject) => {
           const timeout = setTimeout(() => { unsub(); reject(new Error('ASR timeout')) }, 15000)
           const unsub = ws.onMessage('asr-final', (data) => {
             clearTimeout(timeout)
             unsub()
             resolve(data as string)
+          })
+          void (async () => {
+            await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
+            await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
+            await ws.sendAudio(buffer)
+            await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
+          })().catch((error) => {
+            clearTimeout(timeout)
+            unsub()
+            reject(error)
           })
         })
         if (text.trim()) {
@@ -309,6 +367,8 @@ function HomePage() {
     try {
       const res = await Taro.chooseMedia({count: 1, mediaType: ['image'], sourceType: ['album', 'camera']})
       if (!res.tempFiles?.[0]) return
+      const localPreviewPath = res.tempFiles[0].tempFilePath
+      setCurrentIngredientImageUrl(localPreviewPath)
       setRecognizing(true)
 
       // Step 1: 压缩图片
@@ -332,15 +392,17 @@ function HomePage() {
       const ws = getAiWebSocket()
       const [recognizeResult, uploadResult] = await Promise.allSettled([
         (async () => {
-          await ws.connect({mode: 'default'})
-          const result = await ws.requestImageResponse({
-            triggerText: buildFoodRecognitionPrompt('trigger'),
-            imageBase64: base64Image,
-            fileName: `food.${ext}`,
-            finalText: buildFoodRecognitionPrompt('final')
-          })
-          ws.disconnect()
-          return result
+          try {
+            await connectDefaultAgent(ws, 'vision')
+            return await ws.requestImageResponse({
+              triggerText: buildFoodRecognitionPrompt('trigger'),
+              imageBase64: base64Image,
+              fileName: `food.${ext}`,
+              finalText: buildFoodRecognitionPrompt('final')
+            })
+          } finally {
+            ws.disconnect()
+          }
         })(),
         supabase.functions.invoke('upload-food-image', {body: {image: base64Image, ext}})
       ])
@@ -362,8 +424,13 @@ function HomePage() {
       const foods = parseRecognizedFoods(raw)
       if (foods.length > 0) {
         setFoodName(foods[0])
-        setCurrentIngredientImageUrl(uploadedImageUrl)
-        Taro.showToast({title: `识别到：${foods.slice(0, 3).join('、')}`, icon: 'none'})
+        setCurrentIngredientImageUrl(uploadedImageUrl || localPreviewPath)
+        Taro.showToast({
+          title: uploadedImageUrl
+            ? `识别到：${foods.slice(0, 3).join('、')}`
+            : '识别成功，图片仅在本机临时显示',
+          icon: 'none'
+        })
       } else {
         setCurrentIngredientImageUrl(null)
         Taro.showToast({title: '未识别到食材，请光线充足正面拍摄', icon: 'none'})
@@ -407,49 +474,35 @@ function HomePage() {
 
     try {
       const ws = getAiWebSocket()
-      await ws.connect({mode: 'default'})
-      const result = await ws.requestResponse(prompt, {
-        onInterim: (text) => {
-          setAnalysisResult(text.replace(/```json[\s\S]*?```\s*/g, '').trimStart())
-        }
-      })
-      ws.disconnect()
-      const cleanResult = result.replace(/```json[\s\S]*?```\s*/g, '').trimStart()
-      setAnalysisResult(cleanResult)
-
-      let parsed: {calories?: number; protein?: number; fat?: number; carbs?: number} = {}
-
-      const jsonBlock = result.match(/```json\s*([\s\S]*?)```/)
-      if (jsonBlock) {
-        try {
-          parsed = JSON.parse(jsonBlock[1].trim())
-        } catch {
-          parsed = {}
-        }
+      let result = ''
+      try {
+        await connectDefaultAgent(ws, 'chat')
+        result = await ws.requestResponse(prompt, {
+          onInterim: (text) => {
+            const interimResult = stripLeadingJsonMetadata(text)
+            if (interimResult) setAnalysisResult(interimResult)
+          }
+        })
+      } finally {
+        ws.disconnect()
       }
 
-      const caloriesRe = /(?:热量|总热量|能量)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*(?:kcal|千卡|大卡|Cal|cal)/i
-      const proteinRe = /(?:蛋白质)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
-      const fatRe = /(?:脂肪|脂坊)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
-      const carbsRe = /(?:碳水[化合物]?|碳水)[线\s|：:\uff1a]*(?:约\s*)?([\d.]+)\s*g/i
-
-      const caloriesMatch = !parsed.calories ? result.match(caloriesRe) : null
-      const proteinMatch = !parsed.protein ? result.match(proteinRe) : null
-      const fatMatch = !parsed.fat ? result.match(fatRe) : null
-      const carbsMatch = !parsed.carbs ? result.match(carbsRe) : null
-      const totalCalories = parsed.calories ?? (caloriesMatch ? parseFloat(caloriesMatch[1]) : null)
-      const totalProtein = parsed.protein ?? (proteinMatch ? parseFloat(proteinMatch[1]) : null)
-      const totalFat = parsed.fat ?? (fatMatch ? parseFloat(fatMatch[1]) : null)
-      const totalCarbs = parsed.carbs ?? (carbsMatch ? parseFloat(carbsMatch[1]) : null)
+      const nutrition = extractNutritionValues(result)
+      const cleanResult = stripLeadingJsonMetadata(result) || buildAnalysisFallbackMarkdown({
+        nutrition,
+        personCount: analysisPersonCount,
+        memberNames: analysisMembers.map(member => member.nickname),
+      })
+      setAnalysisResult(cleanResult)
       const perPersonNutrition = {
-        total_calories: totalCalories == null ? null : totalCalories / analysisPersonCount,
-        protein: totalProtein == null ? null : totalProtein / analysisPersonCount,
-        fat: totalFat == null ? null : totalFat / analysisPersonCount,
-        carbs: totalCarbs == null ? null : totalCarbs / analysisPersonCount,
+        total_calories: nutrition.calories == null ? null : nutrition.calories / analysisPersonCount,
+        protein: nutrition.protein == null ? null : nutrition.protein / analysisPersonCount,
+        fat: nutrition.fat == null ? null : nutrition.fat / analysisPersonCount,
+        carbs: nutrition.carbs == null ? null : nutrition.carbs / analysisPersonCount,
       }
 
       const recordMembers = analysisMembers.length > 0 ? analysisMembers : [null]
-      await Promise.all(recordMembers.map(member => createWeighingRecord({
+      const savedRecords = await Promise.all(recordMembers.map(member => createWeighingRecord({
           user_id: user!.id,
           member_id: member?.id || null,
           ingredients: list,
@@ -458,9 +511,14 @@ function HomePage() {
           ...perPersonNutrition,
         })
       ))
+      if (savedRecords.every(record => !record)) {
+        Taro.showToast({title: '分析完成，但记录保存失败', icon: 'none'})
+        console.warn('营养分析记录未能保存，统计页不会更新', {nutrition: perPersonNutrition})
+      }
 
       const records = await getWeighingRecords(user!.id, activeMember?.id)
       setHistory(records)
+      Taro.eventCenter.trigger(NUTRITION_RECORDS_UPDATED)
     } catch (err: any) {
       console.error('AI分析失败:', err?.message || err)
       Taro.showToast({title: '分析失败，请检查网络后重试', icon: 'none'})
@@ -618,6 +676,28 @@ function HomePage() {
                 <div className="i-mdi-camera text-2xl text-primary" />
               </div>
             </div>
+
+            {currentIngredientImageUrl && (
+              <div className="flex items-center gap-3 px-3 py-2 bg-secondary rounded-xl">
+                <Image
+                  src={currentIngredientImageUrl}
+                  mode="aspectFill"
+                  style={{width: '52px', height: '52px', borderRadius: '8px', flexShrink: 0}}
+                />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xl font-medium text-foreground truncate">{foodName || '正在识别食材'}</p>
+                  <p className="text-xl text-muted-foreground">图片已就绪</p>
+                </div>
+                <button
+                  type="button"
+                  className="flex items-center justify-center flex-shrink-0"
+                  style={{width: '36px', height: '36px'}}
+                  onClick={() => setCurrentIngredientImageUrl(null)}
+                >
+                  <div className="i-mdi-close text-2xl text-muted-foreground" />
+                </button>
+              </div>
+            )}
 
             {/* 重量输入（设备未连接时显示） */}
             {bleStatus !== 'connected' && (

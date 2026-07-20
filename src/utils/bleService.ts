@@ -32,6 +32,17 @@ export interface BLEDevice {
   RSSI: number
 }
 
+export const SUPPORTED_BLE_DEVICE_NAME = 'Bai'
+export const STRONG_BLE_SIGNAL_RSSI = -60
+
+export function isSupportedBLEDeviceName(name: string): boolean {
+  return name.trim() === SUPPORTED_BLE_DEVICE_NAME
+}
+
+export function isStrongSupportedBLEDevice(device: BLEDevice): boolean {
+  return isSupportedBLEDeviceName(device.name) && device.RSSI > STRONG_BLE_SIGNAL_RSSI
+}
+
 // 心跳超时：超过此时间无有效包则标记为已断开
 const HEARTBEAT_TIMEOUT_MS = 5000
 
@@ -130,10 +141,14 @@ class BLEService {
     Taro.onBluetoothDeviceFound(({devices}) => {
       for (const d of devices) {
         if (!d.deviceId || found.has(d.deviceId)) continue
+        const name = [(d as any).localName, d.name]
+          .map(value => String(value || '').trim())
+          .find(isSupportedBLEDeviceName) || ''
+        if (!isSupportedBLEDeviceName(name)) continue
         found.add(d.deviceId)
         onFound({
           deviceId: d.deviceId,
-          name: d.name || (d as any).localName || '未知设备',
+          name,
           RSSI: d.RSSI || -100
         })
       }
@@ -179,7 +194,8 @@ class BLEService {
       const targetId = this.listeningDeviceId
       if (!targetId) return
       for (const d of devices) {
-        const nameMatch = d.name === 'Bai' || (d as any).localName === 'Bai'
+        const nameMatch = [(d as any).localName, d.name]
+          .some(value => isSupportedBLEDeviceName(String(value || '')))
         if (d.deviceId !== targetId && !nameMatch) continue
         // 上报设备名：优先 localName（广播中的完整名称），次选 name
         const realName = (d as any).localName || d.name || ''

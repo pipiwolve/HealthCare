@@ -2,14 +2,12 @@ import {useCallback, useEffect, useState} from 'react'
 import Taro, {useDidShow} from '@tarojs/taro'
 import type {TabBarItem} from '@tarojs/taro'
 import {useAuth} from '@/contexts/AuthContext'
+import {buildCurrentRouteUrl, STORAGE_KEY_REDIRECT_PATH} from '@/utils/authRedirect'
 
 // Public pages that don't require authentication
-const PUBLIC_PAGE_PATHS = ['/pages/login/index']
+const PUBLIC_PAGE_PATHS = ['/pages/login/index', '/pages/recipe-share/index']
 
 const LOGIN_PAGE_PATH = '/pages/login/index'
-
-// Storage key for saving redirect path after login
-export const STORAGE_KEY_REDIRECT_PATH = 'loginRedirectPath'
 
 function getTabBarPages(): string[] {
   const app = Taro.getApp()
@@ -56,7 +54,7 @@ function RouteGuard({children}: {children: React.ReactNode}) {
       return
     }
 
-    const currentPath: string = Taro.getCurrentInstance()?.router?.path || ''
+    const currentPath = buildCurrentRouteUrl()
 
     // Allow access if user is authenticated or page is public
     const isPublic = PUBLIC_PAGE_PATHS.some((publicPath) => currentPath?.includes(publicPath))
