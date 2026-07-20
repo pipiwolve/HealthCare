@@ -1,0 +1,496 @@
+diff --git a/src/pages/recipe-share/index.config.ts b/src/pages/recipe-share/index.config.ts
+new file mode 100644
+index 0000000..3bbe1ae
+--- /dev/null
++++ b/src/pages/recipe-share/index.config.ts
+@@ -0,0 +1 @@
++export default definePageConfig({navigationBarTitleText: '好友分享的菜谱', enableShareAppMessage: true})
+diff --git a/src/pages/recipe-share/index.tsx b/src/pages/recipe-share/index.tsx
+new file mode 100644
+index 0000000..787c8fd
+--- /dev/null
++++ b/src/pages/recipe-share/index.tsx
+@@ -0,0 +1,56 @@
++import {useEffect, useMemo, useState} from 'react'
++import Taro, {useShareAppMessage, useShareTimeline} from '@tarojs/taro'
++import {MarkdownRenderer} from '@/components/MarkdownRenderer'
++import {getRecipeShare, type RecipeShareSnapshot} from '@/services/recipeShare'
++
++export default function RecipeSharePage() {
++  const shareId = useMemo(() => String(Taro.getCurrentInstance().router?.params?.id || ''), [])
++  const [share, setShare] = useState<RecipeShareSnapshot | null>(null)
++  const [error, setError] = useState('')
++
++  useShareAppMessage(() => ({
++    title: share?.title || '好友分享的 AI 菜谱',
++    path: `/pages/recipe-share/index?id=${encodeURIComponent(shareId)}`
++  }))
++  useShareTimeline(() => ({
++    title: share?.title || '好友分享的 AI 菜谱',
++    query: `id=${encodeURIComponent(shareId)}`
++  }))
++
++  useEffect(() => {
++    getRecipeShare(shareId).then(setShare).catch(reason => setError(reason instanceof Error ? reason.message : '菜谱加载失败'))
++  }, [shareId])
++
++  if (error) {
++    return (
++      <div className="min-h-screen bg-background flex flex-col items-center justify-center px-8 gap-4">
++        <div className="i-mdi-link-off text-5xl text-muted-foreground" />
++        <p className="text-2xl font-semibold text-foreground">{error}</p>
++        <button type="button" className="px-5 bg-primary text-white rounded-xl text-xl" style={{height: '44px'}} onClick={() => Taro.reLaunch({url: '/pages/home/index'})}>进入智能健康助手</button>
++      </div>
++    )
++  }
++  if (!share) return <div className="min-h-screen bg-background flex items-center justify-center text-xl text-muted-foreground">菜谱加载中...</div>
++
++  return (
++    <div className="min-h-screen bg-background pb-safe-4">
++      <div className="bg-primary px-5 py-6">
++        <p className="text-3xl font-bold text-white">{share.title}</p>
++        <p className="text-xl text-white/80 mt-2">好友分享的 AI 营养菜谱</p>
++      </div>
++      <div className="px-4 py-4">
++        <div className="bg-card border border-border rounded-xl p-4">
++          <MarkdownRenderer content={share.recipeContent} />
++        </div>
++        {share.ingredients.length > 0 && (
++          <div className="mt-4">
++            <p className="text-xl font-semibold text-foreground mb-2">使用食材</p>
++            <div className="flex flex-wrap gap-2">
++              {share.ingredients.map((item, index) => <span key={index} className="text-xl bg-secondary rounded-lg px-3 py-1">{item.name} {item.weight}{item.unit}</span>)}
++            </div>
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/recipe/index.tsx b/src/pages/recipe/index.tsx
+index 78738ba..a73dd94 100644
+--- a/src/pages/recipe/index.tsx
++++ b/src/pages/recipe/index.tsx
+@@ -1,28 +1,39 @@
+ // @title 菜谱推荐
+ 
+-import Taro, {useShareAppMessage, useShareTimeline} from '@tarojs/taro'
++import Taro, {useShareAppMessage} from '@tarojs/taro'
+ import {useCallback, useEffect, useMemo, useState } from 'react'
++import {Canvas} from '@tarojs/components'
+ import {DisclaimerFooter} from '@/components/AllergenBanner'
+ import {MarkdownRenderer} from '@/components/MarkdownRenderer'
+ import {withRouteGuard} from '@/components/RouteGuard'
++import {useAuth} from '@/contexts/AuthContext'
+ import type {Ingredient} from '@/db/types'
+ import {getAiWebSocket} from '@/services/aiWebSocket'
++import {createRecipeShare} from '@/services/recipeShare'
+ import {useAppStore} from '@/store/appStore'
+ import {buildHealthContext, enrichIngredientsWithAllergens} from '@/utils/allergenUtils'
+ import {normalizeAiMarkdown} from '@/utils/markdownText'
++import {generateRecipePosterAssets, type RecipePosterAssets} from '@/utils/recipePoster'
+ 
+ function RecipePage() {
++  const {user} = useAuth()
+   const {activeMember, isOnline, ingredients: storeIngredients} = useAppStore()
+   const routeParams = useMemo(() => Taro.getCurrentInstance().router?.params || {}, [])
+ 
+-  // 分享启用
+-  useShareAppMessage(() => ({title: recipeTitle || '查看AI推荐菜谱'}))
+-  useShareTimeline(() => ({title: recipeTitle || '查看AI推荐菜谱'}))
+-
+   const [recipeContent, setRecipeContent] = useState('')
+   const [recipeTitle, setRecipeTitle] = useState('')
+   const [loading, setLoading] = useState(false)
+   const [allergenWarning, setAllergenWarning] = useState('')
++  const [sharePath, setSharePath] = useState('')
++  const [shareAssets, setShareAssets] = useState<RecipePosterAssets | null>(null)
++  const [sharePreparing, setSharePreparing] = useState(false)
++  const posterCanvasId = 'recipe-share-poster'
++
++  useShareAppMessage(() => ({
++    title: recipeTitle || '查看AI推荐菜谱',
++    path: sharePath || '/pages/home/index',
++    ...(shareAssets?.card ? {imageUrl: shareAssets.card} : {})
++  }))
+ 
+   // 解析传入的食材
+   const ingredients: Ingredient[] = useMemo(() => {
+@@ -48,6 +59,8 @@ function RecipePage() {
+ 
+     setLoading(true)
+     setRecipeContent('')
++    setSharePath('')
++    setShareAssets(null)
+ 
+     const healthCtx = buildHealthContext(activeMember)
+     const allergenList = activeMember?.allergens?.length ? `用户过敏源（须规避）：${activeMember.allergens.join('、')}。` : ''
+@@ -57,8 +70,9 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+ 
+ 要求：
+ 1. 不要使用含过敏原的食材
+-2. 必须使用简单 Markdown 输出，不要输出纯文本
+-3. 请严格按以下结构输出：
++2. 不得输出用户姓名、年龄、疾病、过敏源、用药等个人健康信息
++3. 必须使用简单 Markdown 输出，不要输出纯文本
++4. 请严格按以下结构输出：
+ # 菜名
+ ## 食材用量
+ - 食材：用量
+@@ -101,6 +115,43 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+     Taro.switchTab({url: '/pages/chat/index'})
+   }
+ 
++  const handleShareRecipe = async () => {
++    if (!user || !recipeContent || !recipeTitle || sharePreparing) return
++    setSharePreparing(true)
++    let assets = shareAssets
++    try {
++      let path = sharePath
++      if (!path) {
++        const shareId = await createRecipeShare(recipeTitle, recipeContent, ingredients)
++        path = `/pages/recipe-share/index?id=${encodeURIComponent(shareId)}`
++        setSharePath(path)
++      }
++      if (!assets) {
++        await new Promise(resolve => setTimeout(resolve, 120))
++        assets = await generateRecipePosterAssets(posterCanvasId, {title: recipeTitle, recipeContent, ingredients})
++        setShareAssets(assets)
++      }
++      if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) {
++        await Taro.previewImage({urls: [assets.poster], current: assets.poster})
++        return
++      }
++      await (Taro as any).showShareImageMenu({
++        path: assets.poster,
++        needShowEntrance: true,
++        entrancePath: path
++      })
++    } catch (error) {
++      console.warn('分享菜谱失败:', error instanceof Error ? error.message : error)
++      if (assets?.poster) {
++        await Taro.previewImage({urls: [assets.poster], current: assets.poster})
++      } else {
++        Taro.showToast({title: error instanceof Error ? error.message : '分享图片生成失败', icon: 'none'})
++      }
++    } finally {
++      setSharePreparing(false)
++    }
++  }
++
+   return (
+     <div className="min-h-screen bg-background pb-safe-4">
+       {/* 头部 */}
+@@ -182,15 +233,13 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+             {/* 分享按钮 */}
+             <button
+               type="button"
+-              {...(Taro.getEnv() === Taro.ENV_TYPE.WEAPP
+-                ? {openType: 'share'} as any
+-                : {onClick: () => Taro.showToast({title: '分享功能仅在微信小程序中可用', icon: 'none'})}
+-              )}
+               className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium border-2 border-primary/30 bg-primary/5 text-primary rounded-xl"
+               style={{height: '48px'}}
++              disabled={sharePreparing}
++              onClick={handleShareRecipe}
+             >
+               <div className="i-mdi-share-variant text-xl" />
+-              <span>分享菜谱给朋友</span>
++              <span>{sharePreparing ? '正在生成分享图片...' : '分享菜谱给朋友'}</span>
+             </button>
+           </div>
+         )}
+@@ -211,6 +260,10 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
+       </div>
+ 
+       <DisclaimerFooter />
++      <Canvas
++        canvasId={posterCanvasId}
++        style={{position: 'fixed', left: '-2000px', top: '-2000px', width: '1080px', height: '1440px'}}
++      />
+     </div>
+   )
+ }
+diff --git a/src/services/recipeShare.ts b/src/services/recipeShare.ts
+new file mode 100644
+index 0000000..17a8beb
+--- /dev/null
++++ b/src/services/recipeShare.ts
+@@ -0,0 +1,37 @@
++import {supabase} from '@/client/supabase'
++import type {Ingredient} from '@/db/types'
++
++export interface RecipeShareSnapshot {
++  id: string
++  title: string
++  recipeContent: string
++  ingredients: Ingredient[]
++  expiresAt: string
++  createdAt: string
++}
++
++async function invoke(body: Record<string, unknown>): Promise<any> {
++  const {data, error} = await supabase.functions.invoke('recipe-share', {body})
++  if (error) {
++    try {
++      const text = await error?.context?.text?.()
++      if (text) throw new Error(JSON.parse(text).message || '菜谱分享服务不可用')
++    } catch (parsed) {
++      if (parsed instanceof Error) throw parsed
++    }
++    throw new Error(error.message || '菜谱分享服务不可用')
++  }
++  return data
++}
++
++export async function createRecipeShare(title: string, recipeContent: string, ingredients: Ingredient[]): Promise<string> {
++  const data = await invoke({action: 'create', title, recipeContent, ingredients})
++  if (!data?.shareId) throw new Error('菜谱分享创建失败')
++  return data.shareId
++}
++
++export async function getRecipeShare(shareId: string): Promise<RecipeShareSnapshot> {
++  const data = await invoke({action: 'get', shareId})
++  if (!data?.share) throw new Error('菜谱分享不存在')
++  return data.share
++}
+diff --git a/src/utils/recipePoster.ts b/src/utils/recipePoster.ts
+new file mode 100644
+index 0000000..9155016
+--- /dev/null
++++ b/src/utils/recipePoster.ts
+@@ -0,0 +1,132 @@
++import Taro from '@tarojs/taro'
++import type {Ingredient} from '@/db/types'
++import {extractPosterSections} from '@/utils/recipeShareContent'
++
++export type PosterVariant = 'card' | 'timeline' | 'poster'
++export interface RecipePosterAssets {card: string; timeline: string; poster: string}
++interface PosterData {title: string; recipeContent: string; ingredients: Ingredient[]; backgroundImage?: string}
++
++const SIZES: Record<PosterVariant, {width: number; height: number}> = {
++  card: {width: 1000, height: 800},
++  timeline: {width: 1000, height: 1000},
++  poster: {width: 1080, height: 1440}
++}
++
++function wrapText(ctx: Taro.CanvasContext, text: string, maxWidth: number, maxLines: number): string[] {
++  const lines: string[] = []
++  let current = ''
++  for (const char of text) {
++    const next = current + char
++    if (ctx.measureText(next).width > maxWidth && current) {
++      lines.push(current)
++      current = char
++      if (lines.length === maxLines) break
++    } else {
++      current = next
++    }
++  }
++  if (lines.length < maxLines && current) lines.push(current)
++  if (lines.length === maxLines && lines.join('').length < text.length) lines[maxLines - 1] = `${lines[maxLines - 1].slice(0, -1)}…`
++  return lines
++}
++
++function drawRoundedRect(ctx: Taro.CanvasContext, x: number, y: number, width: number, height: number, radius: number) {
++  ctx.beginPath()
++  ctx.moveTo(x + radius, y)
++  ctx.lineTo(x + width - radius, y)
++  ctx.arc(x + width - radius, y + radius, radius, -Math.PI / 2, 0)
++  ctx.lineTo(x + width, y + height - radius)
++  ctx.arc(x + width - radius, y + height - radius, radius, 0, Math.PI / 2)
++  ctx.lineTo(x + radius, y + height)
++  ctx.arc(x + radius, y + height - radius, radius, Math.PI / 2, Math.PI)
++  ctx.lineTo(x, y + radius)
++  ctx.arc(x + radius, y + radius, radius, Math.PI, Math.PI * 1.5)
++  ctx.closePath()
++}
++
++function exportCanvas(canvasId: string, width: number, height: number): Promise<string> {
++  return new Promise((resolve, reject) => {
++    Taro.canvasToTempFilePath({
++      canvasId, x: 0, y: 0, width, height, destWidth: width, destHeight: height,
++      fileType: 'jpg', quality: 0.92,
++      success: result => resolve(result.tempFilePath),
++      fail: reject
++    })
++  })
++}
++
++export async function renderRecipePoster(canvasId: string, variant: PosterVariant, data: PosterData): Promise<string> {
++  const {width, height} = SIZES[variant]
++  const ctx = Taro.createCanvasContext(canvasId)
++  const sections = extractPosterSections(data.recipeContent)
++  const margin = variant === 'poster' ? 74 : 60
++  const contentWidth = width - margin * 2
++
++  if (data.backgroundImage) {
++    ctx.drawImage(data.backgroundImage, 0, 0, width, height)
++  } else {
++    ctx.setFillStyle('#F7F5EF')
++    ctx.fillRect(0, 0, width, height)
++  }
++  ctx.setFillStyle('#204E3A')
++  ctx.fillRect(0, 0, width, variant === 'poster' ? 250 : 210)
++  ctx.setFillStyle('#E05A47')
++  ctx.fillRect(margin, variant === 'poster' ? 218 : 182, 120, 10)
++  ctx.setFillStyle('#FFFFFF')
++  ctx.setFontSize(variant === 'poster' ? 62 : 54)
++  ctx.setTextAlign('left')
++  wrapText(ctx, data.title || 'AI 推荐菜谱', contentWidth, 2).forEach((line, index) => {
++    ctx.fillText(line, margin, 96 + index * 68)
++  })
++  ctx.setFontSize(26)
++  ctx.setFillStyle('#DCE9E2')
++  ctx.fillText('智能健康助手 · 营养菜谱', margin, variant === 'poster' ? 205 : 170)
++
++  const panelTop = variant === 'poster' ? 292 : 246
++  drawRoundedRect(ctx, margin, panelTop, contentWidth, height - panelTop - margin, 24)
++  ctx.setFillStyle('#FFFFFF')
++  ctx.fill()
++
++  let y = panelTop + 62
++  const drawSection = (label: string, items: string[], maxItems: number, maxLines = 1) => {
++    if (!items.length) return
++    ctx.setFillStyle('#204E3A')
++    ctx.setFontSize(32)
++    ctx.fillText(label, margin + 38, y)
++    y += 42
++    ctx.setFillStyle('#303734')
++    ctx.setFontSize(variant === 'poster' ? 27 : 25)
++    for (const item of items.slice(0, maxItems)) {
++      const lines = wrapText(ctx, `• ${item}`, contentWidth - 76, maxLines)
++      for (const line of lines) {
++        ctx.fillText(line, margin + 38, y)
++        y += variant === 'poster' ? 40 : 36
++      }
++    }
++    y += 24
++  }
++
++  const ingredientLines = data.ingredients.length
++    ? data.ingredients.map(item => `${item.name} ${item.weight}${item.unit}`)
++    : sections.ingredients
++  drawSection('主要食材', ingredientLines, variant === 'poster' ? 8 : variant === 'timeline' ? 6 : 4)
++  drawSection('烹饪步骤', sections.steps, variant === 'poster' ? 4 : variant === 'timeline' ? 3 : 2)
++  if (variant === 'poster') drawSection('营养亮点', sections.nutrition, 2)
++
++  ctx.setFillStyle('#6D756F')
++  ctx.setFontSize(24)
++  ctx.fillText('打开小程序查看完整做法', margin + 38, height - margin - 38)
++  ctx.setFillStyle('#E05A47')
++  ctx.fillRect(width - margin - 92, height - margin - 64, 54, 54)
++
++  await new Promise<void>(resolve => ctx.draw(false, resolve))
++  return exportCanvas(canvasId, width, height)
++}
++
++export async function generateRecipePosterAssets(canvasId: string, data: PosterData): Promise<RecipePosterAssets> {
++  return {
++    card: await renderRecipePoster(canvasId, 'card', data),
++    timeline: await renderRecipePoster(canvasId, 'timeline', data),
++    poster: await renderRecipePoster(canvasId, 'poster', data)
++  }
++}
+diff --git a/src/utils/recipeShareContent.ts b/src/utils/recipeShareContent.ts
+new file mode 100644
+index 0000000..b444c32
+--- /dev/null
++++ b/src/utils/recipeShareContent.ts
+@@ -0,0 +1,19 @@
++export function cleanRecipeLine(value: string): string {
++  return value.replace(/^#{1,6}\s*/, '').replace(/^[-*]\s*/, '').replace(/^\d+\.\s*/, '').replace(/[*_`]/g, '').trim()
++}
++
++export function extractPosterSections(markdown: string) {
++  const sections: Record<'ingredients' | 'steps' | 'nutrition', string[]> = {
++    ingredients: [], steps: [], nutrition: []
++  }
++  let current: keyof typeof sections | '' = ''
++  for (const raw of markdown.split('\n')) {
++    if (/^##\s*食材/.test(raw)) { current = 'ingredients'; continue }
++    if (/^##\s*烹饪/.test(raw)) { current = 'steps'; continue }
++    if (/^##\s*营养/.test(raw)) { current = 'nutrition'; continue }
++    if (/^##\s/.test(raw)) { current = ''; continue }
++    const line = cleanRecipeLine(raw)
++    if (current && line) sections[current].push(line)
++  }
++  return sections
++}
+diff --git a/supabase/functions/recipe-share/index.ts b/supabase/functions/recipe-share/index.ts
+new file mode 100644
+index 0000000..adf53fb
+--- /dev/null
++++ b/supabase/functions/recipe-share/index.ts
+@@ -0,0 +1,71 @@
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++
++function sanitizeIngredients(value: unknown): Array<{name: string; weight: number; unit: string}> {
++  if (!Array.isArray(value)) return []
++  return value.slice(0, 30).flatMap(item => {
++    if (!item || typeof item !== 'object') return []
++    const name = String((item as any).name || '').trim().slice(0, 40)
++    const weight = Number((item as any).weight)
++    const unit = String((item as any).unit || '').trim().slice(0, 10)
++    return name && Number.isFinite(weight) ? [{name, weight, unit}] : []
++  })
++}
++
++function sanitizeRecipeContent(value: unknown): string {
++  const sensitiveLine = /(手机号|身份证|姓名[：:]|用户年龄|家庭成员|正在服用|用户过敏源)/
++  return String(value || '')
++    .split('\n')
++    .filter(line => !sensitiveLine.test(line))
++    .join('\n')
++    .trim()
++}
++
++async function createShare(req: Request, body: any) {
++  const ownerId = await getAuthUserId(req)
++  const title = String(body.title || '').trim().slice(0, 80)
++  const recipeContent = sanitizeRecipeContent(body.recipeContent)
++  if (!title || !recipeContent) throw new HttpError(400, '菜谱内容不完整')
++  if (recipeContent.length > 20_000) throw new HttpError(400, '菜谱内容过长')
++  const {data, error} = await getSupabaseAdmin()
++    .from('recipe_shares')
++    .insert({owner_id: ownerId, title, recipe_content: recipeContent, ingredients: sanitizeIngredients(body.ingredients)})
++    .select('id, expires_at')
++    .single()
++  if (error) throw error
++  return json({shareId: data.id, expiresAt: data.expires_at})
++}
++
++async function getShare(body: any) {
++  const shareId = String(body.shareId || '')
++  if (!/^[0-9a-f-]{36}$/i.test(shareId)) throw new HttpError(400, '分享链接无效')
++  const {data, error} = await getSupabaseAdmin()
++    .from('recipe_shares')
++    .select('id, title, recipe_content, ingredients, expires_at, revoked_at, created_at')
++    .eq('id', shareId)
++    .maybeSingle()
++  if (error) throw error
++  if (!data || data.revoked_at || new Date(data.expires_at).getTime() <= Date.now()) throw new HttpError(404, '这份菜谱分享已失效')
++  return json({
++    share: {
++      id: data.id,
++      title: data.title,
++      recipeContent: data.recipe_content,
++      ingredients: sanitizeIngredients(data.ingredients),
++      expiresAt: data.expires_at,
++      createdAt: data.created_at
++    }
++  })
++}
++
++Deno.serve(async (req: Request) => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const body = await req.json().catch(() => ({}))
++    if (body.action === 'create') return await createShare(req, body)
++    if (body.action === 'get') return await getShare(body)
++    throw new HttpError(400, '未知的菜谱分享操作')
++  } catch (error) {
++    return handleError(error, 'recipe-share')
++  }
++})

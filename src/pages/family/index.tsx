@@ -1,11 +1,13 @@
 // @title 家庭成员
 import {useState, useCallback, useEffect} from 'react'
 import Taro, {useDidShow} from '@tarojs/taro'
+import {Image} from '@tarojs/components'
 import {useAuth} from '@/contexts/AuthContext'
 import {useAppStore} from '@/store/appStore'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {getFamilyMembers, deleteFamilyMember} from '@/db/api'
 import type {FamilyMember} from '@/db/types'
+import {getMemberAvatar} from '@/utils/avatarUtils'
 
 function FamilyPage() {
   const {user} = useAuth()
@@ -94,8 +96,12 @@ function FamilyPage() {
               className={`bg-card rounded-2xl p-4 shadow-elegant border-2 transition ${isActive ? 'border-primary' : 'border-transparent'}`}
             >
               <div className="flex items-center gap-4">
-                <div className={`w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0 ${isActive ? 'bg-gradient-primary' : 'bg-secondary'}`}>
-                  <div className={`i-mdi-account text-3xl ${isActive ? 'text-white' : 'text-muted-foreground'}`} />
+                <div className="w-14 h-14 rounded-2xl overflow-hidden flex-shrink-0 bg-secondary">
+                  <Image
+                    src={getMemberAvatar(member)}
+                    mode="aspectFill"
+                    style={{width: '56px', height: '56px'}}
+                  />
                 </div>
                 <div className="flex-1">
                   <div className="flex items-center gap-2">

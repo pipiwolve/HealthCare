@@ -1,27 +1,39 @@
 // @title 菜谱推荐
 
-import Taro, {useShareAppMessage, useShareTimeline} from '@tarojs/taro'
+import Taro, {useShareAppMessage} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useState } from 'react'
+import {Canvas} from '@tarojs/components'
 import {DisclaimerFooter} from '@/components/AllergenBanner'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
+import {useAuth} from '@/contexts/AuthContext'
 import type {Ingredient} from '@/db/types'
 import {getAiWebSocket} from '@/services/aiWebSocket'
+import {createRecipeShare} from '@/services/recipeShare'
 import {useAppStore} from '@/store/appStore'
 import {buildHealthContext, enrichIngredientsWithAllergens} from '@/utils/allergenUtils'
+import {normalizeAiMarkdown} from '@/utils/markdownText'
+import {generateRecipePosterAssets, type RecipePosterAssets} from '@/utils/recipePoster'
 
 function RecipePage() {
+  const {user} = useAuth()
   const {activeMember, isOnline, ingredients: storeIngredients} = useAppStore()
   const routeParams = useMemo(() => Taro.getCurrentInstance().router?.params || {}, [])
-
-  // 分享启用
-  useShareAppMessage(() => ({title: recipeTitle || '查看AI推荐菜谱'}))
-  useShareTimeline(() => ({title: recipeTitle || '查看AI推荐菜谱'}))
 
   const [recipeContent, setRecipeContent] = useState('')
   const [recipeTitle, setRecipeTitle] = useState('')
   const [loading, setLoading] = useState(false)
   const [allergenWarning, setAllergenWarning] = useState('')
+  const [sharePath, setSharePath] = useState('')
+  const [shareAssets, setShareAssets] = useState<RecipePosterAssets | null>(null)
+  const [sharePreparing, setSharePreparing] = useState(false)
+  const posterCanvasId = 'recipe-share-poster'
+
+  useShareAppMessage(() => ({
+    title: recipeTitle || '查看AI推荐菜谱',
+    path: sharePath || '/pages/home/index',
+    ...(shareAssets?.card ? {imageUrl: shareAssets.card} : {})
+  }))
 
   // 解析传入的食材
   const ingredients: Ingredient[] = useMemo(() => {
@@ -47,6 +59,8 @@ function RecipePage() {
 
     setLoading(true)
     setRecipeContent('')
+    setSharePath('')
+    setShareAssets(null)
 
     const healthCtx = buildHealthContext(activeMember)
     const allergenList = activeMember?.allergens?.length ? `用户过敏源（须规避）：${activeMember.allergens.join('、')}。` : ''
@@ -56,8 +70,9 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
 
 要求：
 1. 不要使用含过敏原的食材
-2. 必须使用简单 Markdown 输出，不要输出纯文本
-3. 请严格按以下结构输出：
+2. 不得输出用户姓名、年龄、疾病、过敏源、用药等个人健康信息
+3. 必须使用简单 Markdown 输出，不要输出纯文本
+4. 请严格按以下结构输出：
 # 菜名
 ## 食材用量
 - 食材：用量
@@ -68,15 +83,16 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
 
     try {
       const ws = getAiWebSocket()
-      await ws.connect({mode: 'default'})
+      await ws.connect({mode: 'default', agentProfile: 'chat'})
       const result = await ws.requestResponse(prompt, {
-        onInterim: (text) => setRecipeContent(text)
+        onInterim: (text) => setRecipeContent(normalizeAiMarkdown(text))
       })
       ws.disconnect()
-      setRecipeContent(result)
+      const cleanResult = normalizeAiMarkdown(result)
+      setRecipeContent(cleanResult)
 
       // 提取菜名
-      const titleMatch = result.match(/^#\s+(.+)$/m) || result.match(/菜名[：:]\s*(.+)/)
+      const titleMatch = cleanResult.match(/^#\s+(.+)$/m) || cleanResult.match(/菜名[：:]\s*(.+)/)
       if (titleMatch) setRecipeTitle(titleMatch[1].trim())
 
       // 检查过敏源
@@ -97,6 +113,43 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
 
   const handleContinueChat = () => {
     Taro.switchTab({url: '/pages/chat/index'})
+  }
+
+  const handleShareRecipe = async () => {
+    if (!user || !recipeContent || !recipeTitle || sharePreparing) return
+    setSharePreparing(true)
+    let assets = shareAssets
+    try {
+      let path = sharePath
+      if (!path) {
+        const shareId = await createRecipeShare(recipeTitle, recipeContent, ingredients)
+        path = `/pages/recipe-share/index?id=${encodeURIComponent(shareId)}`
+        setSharePath(path)
+      }
+      if (!assets) {
+        await new Promise(resolve => setTimeout(resolve, 120))
+        assets = await generateRecipePosterAssets(posterCanvasId, {title: recipeTitle, recipeContent, ingredients})
+        setShareAssets(assets)
+      }
+      if (Taro.getEnv() !== Taro.ENV_TYPE.WEAPP) {
+        await Taro.previewImage({urls: [assets.poster], current: assets.poster})
+        return
+      }
+      await (Taro as any).showShareImageMenu({
+        path: assets.poster,
+        needShowEntrance: true,
+        entrancePath: path
+      })
+    } catch (error) {
+      console.warn('分享菜谱失败:', error instanceof Error ? error.message : error)
+      if (assets?.poster) {
+        await Taro.previewImage({urls: [assets.poster], current: assets.poster})
+      } else {
+        Taro.showToast({title: error instanceof Error ? error.message : '分享图片生成失败', icon: 'none'})
+      }
+    } finally {
+      setSharePreparing(false)
+    }
   }
 
   return (
@@ -180,15 +233,13 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
             {/* 分享按钮 */}
             <button
               type="button"
-              {...(Taro.getEnv() === Taro.ENV_TYPE.WEAPP
-                ? {openType: 'share'} as any
-                : {onClick: () => Taro.showToast({title: '分享功能仅在微信小程序中可用', icon: 'none'})}
-              )}
               className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium border-2 border-primary/30 bg-primary/5 text-primary rounded-xl"
               style={{height: '48px'}}
+              disabled={sharePreparing}
+              onClick={handleShareRecipe}
             >
               <div className="i-mdi-share-variant text-xl" />
-              <span>分享菜谱给朋友</span>
+              <span>{sharePreparing ? '正在生成分享图片...' : '分享菜谱给朋友'}</span>
             </button>
           </div>
         )}
@@ -209,6 +260,10 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
       </div>
 
       <DisclaimerFooter />
+      <Canvas
+        canvasId={posterCanvasId}
+        style={{position: 'fixed', left: '-2000px', top: '-2000px', width: '1080px', height: '1440px'}}
+      />
     </div>
   )
 }

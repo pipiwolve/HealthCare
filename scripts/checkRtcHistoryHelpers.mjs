@@ -23,7 +23,7 @@ function assert(condition, message) {
 }
 
 const rows = [
-  {type: 'QUESTION', timestamp: 1000, text: '早餐怎么吃比较健康？'},
+  {type: 'QUESTION', timestamp: 1000, text: '你是专业健康饮食顾问。请直接、简洁、可执行。\\n\\n用户问题：早餐怎么吃比较健康？'},
   {type: 'ANSWER', timestamp: 1010, text: '优先选择全谷物、鸡蛋和蔬菜。'},
   {type: 'QUESTION', timestamp: 1700, text: '午餐呢？'},
   {type: 'ANSWER', timestamp: 1710, text: '保证蛋白质和蔬菜。'},
@@ -35,8 +35,29 @@ assert(groups.length === 2, 'messages more than 30 minutes apart should start a 
 assert(groups[0].title === '早餐怎么吃比较健康？', 'group title should use first question text')
 assert(groups[0].messages.length === 4, 'nearby question/answer rows should stay in one group')
 assert(groups[0].messages[0].role === 'user', 'QUESTION rows map to user messages')
+assert(groups[0].messages[0].content === '早餐怎么吃比较健康？', 'RTC history should strip system prompt before 用户问题 marker')
 assert(groups[0].messages[1].role === 'assistant', 'ANSWER rows map to assistant messages')
 assert(groups[1].id === 'rtc-3600-3600', 'group id should be stable from start and end timestamps')
+
+const halfWidthMarker = helpers.groupRtcDialogueRows([
+  {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。\\n\\n用户问题: 今天适合吃什么水果？'}
+])
+assert(halfWidthMarker[0].messages[0].content === '今天适合吃什么水果？', 'RTC history should also strip prompts before half-width 用户问题 marker')
+
+const hiddenPromptOnly = helpers.groupRtcDialogueRows([
+  {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。请直接、简洁、可执行。'},
+  {type: 'ANSWER', timestamp: 2, text: '你好'}
+])
+assert(hiddenPromptOnly.length === 0, 'prompt-only QUESTION rows and their paired answers should not be shown in RTC history')
+
+const nutritionAnalysisPrompt = helpers.groupRtcDialogueRows([
+  {type: 'QUESTION', timestamp: 1, text: '【本餐用餐成员健康档案】\\n【jaden】\\n慢性病：糖尿病\\n\\n请分析以下食材的营养成分'},
+  {type: 'ANSWER', timestamp: 2, text: '```json\\n{\"calories\": 4}\\n```'},
+  {type: 'QUESTION', timestamp: 3, text: '用户问题：今天吃什么比较健康？'},
+  {type: 'ANSWER', timestamp: 4, text: '优先吃蔬菜。'}
+])
+assert(nutritionAnalysisPrompt[0].messages.length === 2, 'nutrition analysis system prompts and paired answers should be removed from chat history')
+assert(nutritionAnalysisPrompt[0].messages[0].content === '今天吃什么比较健康？', 'visible chat questions should remain after hidden nutrition prompts')
 
 const fallback = helpers.groupRtcDialogueRows([
   {type: 'ANSWER', timestamp: 1, text: '你好'}
@@ -73,8 +94,15 @@ assert(
 assert(
   edgeSource.includes('DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60') &&
     edgeSource.includes('DEFAULT_PAGE_SIZE = 100') &&
-    edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60'),
-  'brtc-history edge function should default to 30 days, page size 100, and 30-minute grouping'
+    edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60') &&
+    edgeSource.includes('MAX_HISTORY_GROUPS = 10') &&
+    edgeSource.includes('normalizeQuestionText') &&
+    edgeSource.includes('skipAnswerForHiddenQuestion') &&
+    edgeSource.includes('请分析以下食材的营养成分') &&
+    edgeSource.includes('用户问题[:：]') &&
+    edgeSource.includes('groupRows(rows)') &&
+    edgeSource.includes('.slice(0, MAX_HISTORY_GROUPS)'),
+  'brtc-history edge function should default to 30 days, page size 100, 30-minute grouping, prompt filtering, and the latest 10 groups'
 )
 
 assert(

@@ -31,6 +31,38 @@ function mapRole(type: RtcDialogueType): RtcHistoryMessage['role'] {
   return type === 'QUESTION' ? 'user' : 'assistant'
 }
 
+export function normalizeRtcQuestionText(text: string): string {
+  const source = (text || '').replace(/\\n/g, '\n').trim()
+  if (!source) return ''
+
+  const markerMatch = source.match(/用户问题[:：]\s*([\s\S]+)$/)
+  if (markerMatch?.[1]) {
+    return markerMatch[1].trim()
+  }
+
+  const hiddenQuestionPrefixes = [
+    '你是专业健康饮食顾问',
+    '请用不超过',
+    '请使用简单 Markdown 输出',
+    '不要输出长篇食谱',
+    '不能给出医疗诊断',
+    '请先请求上传图片',
+    '图片已上传完成',
+    '识别图片中的食材',
+    '只输出食材名',
+    '【本餐用餐成员健康档案】',
+    '请分析以下食材',
+  ]
+  if (hiddenQuestionPrefixes.some(prefix => source.startsWith(prefix))) return ''
+  if (source.includes('请分析以下食材的营养成分')) return ''
+  return source
+}
+
+function normalizeDialogueText(row: RtcDialogueRow): string {
+  if (row.type === 'QUESTION') return normalizeRtcQuestionText(row.text || '')
+  return (row.text || '').trim()
+}
+
 function buildTitle(messages: RtcHistoryMessage[]): string {
   const firstQuestion = messages.find(message => message.role === 'user' && message.content.trim())
   const source = firstQuestion?.content.trim() || messages.find(message => message.content.trim())?.content.trim()
@@ -52,14 +84,27 @@ function toGroup(messages: RtcHistoryMessage[]): RtcHistoryGroup {
 }
 
 export function groupRtcDialogueRows(rows: RtcDialogueRow[], gapSeconds = DEFAULT_GAP_SECONDS): RtcHistoryGroup[] {
-  const sorted = [...rows]
-    .map(row => ({
-      role: mapRole(row.type),
-      content: row.text || '',
+  const sortedRows = [...rows].sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp))
+  const sorted: RtcHistoryMessage[] = []
+  let skipAnswerForHiddenQuestion = false
+
+  for (const row of sortedRows) {
+    const role = mapRole(row.type)
+    const content = normalizeDialogueText(row)
+    if (role === 'user') {
+      skipAnswerForHiddenQuestion = !content.trim()
+      if (!content.trim()) continue
+    } else if (skipAnswerForHiddenQuestion) {
+      skipAnswerForHiddenQuestion = false
+      continue
+    }
+    if (!content.trim()) continue
+    sorted.push({
+      role,
+      content,
       timestamp: normalizeTimestamp(row.timestamp),
-    }))
-    .filter(message => message.content.trim())
-    .sort((a, b) => a.timestamp - b.timestamp)
+    })
+  }
 
   const groups: RtcHistoryGroup[] = []
   let current: RtcHistoryMessage[] = []

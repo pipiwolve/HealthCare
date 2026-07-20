@@ -6,7 +6,7 @@ import {useAuth} from '@/contexts/AuthContext'
 import {useAppStore} from '@/store/appStore'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {getDevices} from '@/db/api'
-import {getAvatarByGender} from '@/utils/avatarUtils'
+import {getMemberAvatar} from '@/utils/avatarUtils'
 import type {Device} from '@/db/types'
 
 function ProfilePage() {
@@ -40,6 +40,7 @@ function ProfilePage() {
   const menuItems = [
     {icon: 'i-mdi-bluetooth', label: '设备管理', desc: `${devices.length}台设备`, url: '/pages/device-manager/index'},
     {icon: 'i-mdi-account-edit', label: '个人资料', desc: activeMember?.nickname || '未设置', url: '/pages/personal-info/index'},
+    {icon: 'i-mdi-shield-account', label: '账号与微信', desc: '登录与绑定', url: '/pages/account-settings/index'},
     {icon: 'i-mdi-account-group', label: '家庭成员', desc: familyMembers.length > 0 ? `${familyMembers.length}位成员` : '未配置', url: '/pages/family/index'},
     {icon: 'i-mdi-bell-outline', label: '提醒设置', desc: '餐前&饮水提醒', url: '/pages/reminder-settings/index'},
     {icon: 'i-mdi-help-circle-outline', label: '使用帮助', desc: '使用指引', url: '/pages/device-add/index'},
@@ -59,7 +60,7 @@ function ProfilePage() {
             style={{width: '80px', height: '80px', borderRadius: '50%', background: 'rgba(255,255,255,0.2)'}}
           >
             <Image
-              src={getAvatarByGender(activeMember?.gender)}
+              src={getMemberAvatar(activeMember)}
               mode="aspectFill"
               style={{width: '80px', height: '80px'}}
             />
@@ -84,11 +85,11 @@ function ProfilePage() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${bleStatus === 'connected' ? 'bg-primary/10' : 'bg-secondary'}`}>
-                <div className={`i-mdi-bluetooth text-2xl ${bleStatus === 'connected' ? 'text-primary' : 'text-muted-foreground'}`} />
+                <div className={`i-mdi-scale text-2xl ${bleStatus === 'connected' ? 'text-primary' : 'text-muted-foreground'}`} />
               </div>
               <div>
                 <p className="text-xl font-medium text-foreground">
-                  {bleStatus === 'connected' ? connectedDevice?.device_name || '营养秤' : '未连接设备'}
+                  {bleStatus === 'connected' ? connectedDevice?.device_name || devices[0]?.device_name || '营养秤' : '未连接设备'}
                 </p>
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${bleStatus === 'connected' ? 'bg-primary' : 'bg-muted-foreground'}`} />

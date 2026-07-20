@@ -1,0 +1,175 @@
+diff --git a/docs/recipe-poster-background-prompt.md b/docs/recipe-poster-background-prompt.md
+new file mode 100644
+index 0000000..8f75b69
+--- /dev/null
++++ b/docs/recipe-poster-background-prompt.md
+@@ -0,0 +1,17 @@
++# 菜谱海报底板生成 Prompt
++
++```text
++Use case: stylized-concept
++Asset type: WeChat mini-program recipe poster background
++Primary request: Create a polished 3:4 portrait background plate for a Chinese healthy-recipe sharing poster. The application will draw the recipe title, ingredients, cooking steps, nutrition highlights, and mini-program entry on top of this image later.
++Scene/backdrop: quiet contemporary kitchen and dining visual language, with subtle natural food textures and restrained culinary details placed only around the outer edges.
++Style/medium: premium editorial food illustration with lightly textured paper and clean modern composition; sophisticated rather than playful.
++Composition/framing: 1080 x 1440 portrait. Keep the central 78% of the canvas calm, bright, low-contrast, and free of objects for dynamic text. Place any herbs, ceramic tableware, linen, or ingredient silhouettes near the top and bottom edges only. Keep all important decoration inside a center-safe crop that also works at 5:4 and 1:1.
++Lighting/mood: fresh daylight, calm, trustworthy, appetizing.
++Color palette: warm off-white, deep natural green, charcoal, and one restrained tomato-red accent. Avoid a one-color green palette.
++Materials/textures: subtle uncoated paper grain, ceramic, linen, fresh herbs; no glossy advertising look.
++Constraints: no text, no letters, no numbers, no logos, no watermark, no QR code, no people, no phone mockup, no UI controls. No large food dish in the central text area. No gradients, bokeh, floating blobs, or decorative cards. The background must remain readable when white and dark Chinese text is overlaid.
++Avoid: busy ingredients, stock-photo appearance, dark moody lighting, beige-dominated palette, cartoon chef characters, Western restaurant branding.
++```
++
++建议输出 PNG，尺寸 `1080x1440`。生成后放入 `src/assets/recipe/recipe-poster-background.png`，再把该路径作为 `generateRecipePosterAssets` 的 `backgroundImage` 参数传入；不需要修改分享快照或落地页协议。
+diff --git a/docs/wechat-feature-deployment.md b/docs/wechat-feature-deployment.md
+new file mode 100644
+index 0000000..cd0aa90
+--- /dev/null
++++ b/docs/wechat-feature-deployment.md
+@@ -0,0 +1,72 @@
++# 微信登录、一次性提醒与菜谱分享部署清单
++
++本文件只描述云端配置和人工验收。不要把真实 AppSecret、service-role key、调度密钥或手机号写入仓库和补丁。
++
++## 1. 数据库
++
++先执行重复身份审计，结果必须为零行：
++
++```sql
++select openid, count(*)
++from public.profiles
++where openid is not null
++group by openid
++having count(*) > 1;
++```
++
++备份 schema 后执行 `supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql`。确认四张新表均启用 RLS，`avatars` bucket 为公开读，且 `claim_due_notification_jobs` 只授权给 service role。
++
++## 2. Secrets
++
++除既有 Supabase 变量外，配置：
++
++- `WECHAT_MINIPROGRAM_LOGIN_APP_ID`
++- `WECHAT_MINIPROGRAM_LOGIN_APP_SECRET`
++- `WECHAT_LOGIN_TICKET_SECRET`：至少 32 个随机字符
++- `WECHAT_NOTIFICATION_DISPATCH_SECRET`：独立随机值
++- `WECHAT_SUBSCRIBE_TEMPLATES_JSON`
++
++模板配置示例；字段名必须替换成微信公众平台审核模板中的真实关键词：
++
++```json
++{
++  "breakfast":{"templateId":"TEMPLATE_A","page":"/pages/home/index","fields":{"title":"thing1","time":"time2","remark":"thing3"}},
++  "lunch":{"templateId":"TEMPLATE_B","page":"/pages/home/index","fields":{"title":"thing1","time":"time2","remark":"thing3"}},
++  "dinner":{"templateId":"TEMPLATE_C","page":"/pages/home/index","fields":{"title":"thing1","time":"time2","remark":"thing3"}},
++  "water":{"templateId":"TEMPLATE_D","page":"/pages/home/index","fields":{"title":"thing1","time":"time2","remark":"thing3"}}
++}
++```
++
++四个一次性模板标题必须不同，否则微信客户端会过滤同名模板。
++
++## 3. Edge Functions
++
++部署或更新：
++
++- `wechat_miniapp_login`：公开入口，函数内部对绑定和状态操作校验用户 JWT。
++- `upload-avatar`
++- `wechat-notification-schedule`
++- `wechat-notification-dispatch`：公开入口，仅接受 dispatch secret。
++- `recipe-share`：公开读取，创建操作要求用户 JWT。
++
++确认 `supabase/config.toml` 中登录、通知调度和菜谱分享函数的 JWT 设置已生效。
++
++## 4. 调度器
++
++使用 Supabase Cron 或云平台调度器每分钟 POST 调用通知调度函数，请求头携带：
++
++```text
++x-dispatch-secret: <WECHAT_NOTIFICATION_DISPATCH_SECRET>
++```
++
++调度接口幂等领取到期任务；进程中断后的任务会在五分钟后重新领取，每条任务最多尝试三次。
++
++## 5. 微信后台和真机验收
++
++1. 确认小程序为已认证非个人主体，并有手机号快速验证额度。
++2. 配置四个一次性订阅模板和合法 request 域名。
++3. 验证旧微信用户登录、新用户跳过手机号、新用户授权手机号和用户名账号绑定。
++4. 同时预约四类提醒，至少接受一类，确认到点后服务通知送达且开关自动关闭。
++5. 分享好友卡片，未登录好友应打开同一份菜谱；再验证图片海报的小程序入口。
++
++正式 PNG 底板到位后，在海报渲染器的背景入口替换 Canvas 默认背景，不需要修改快照、分享路径或通知代码。
+diff --git a/scripts/checkWechatFeatures.mjs b/scripts/checkWechatFeatures.mjs
+new file mode 100644
+index 0000000..255cf9e
+--- /dev/null
++++ b/scripts/checkWechatFeatures.mjs
+@@ -0,0 +1,41 @@
++import {readFileSync} from 'node:fs'
++import {resolve} from 'node:path'
++
++const root = resolve(import.meta.dirname, '..')
++const read = path => readFileSync(resolve(root, path), 'utf8')
++const assert = (condition, message) => { if (!condition) throw new Error(message) }
++
++const supabaseClient = read('src/client/supabase.ts')
++const authContext = read('src/contexts/AuthContext.tsx')
++const loginPage = read('src/pages/login/index.tsx')
++const routeGuard = read('src/components/RouteGuard.tsx')
++const loginFunction = read('supabase/functions/wechat_miniapp_login/index.ts')
++const reminderPage = read('src/pages/reminder-settings/index.tsx')
++const scheduleFunction = read('supabase/functions/wechat-notification-schedule/index.ts')
++const dispatchFunction = read('supabase/functions/wechat-notification-dispatch/index.ts')
++const recipePage = read('src/pages/recipe/index.tsx')
++const recipeSharePage = read('src/pages/recipe-share/index.tsx')
++const poster = read('src/utils/recipePoster.ts')
++const migration = read('supabase/migrations/00005_wechat_auth_notifications_recipe_shares.sql')
++
++assert(supabaseClient.includes('storage: taroAuthStorage') && supabaseClient.includes('persistSession: true'), 'Supabase auth must persist through Taro storage')
++assert(routeGuard.includes('buildCurrentRouteUrl()') && routeGuard.includes('STORAGE_KEY_REDIRECT_PATH'), 'Route guard must retain the complete redirect URL')
++assert(authContext.includes('startWechatSignIn') && authContext.includes('registerWechatSignIn') && authContext.includes('bindWechatSignIn'), 'Auth context must expose the staged WeChat flow')
++assert(loginPage.includes("openType: 'getPhoneNumber'") && loginPage.includes('跳过手机号并创建') && loginPage.includes('绑定已有账号'), 'Login page must support optional phone and existing-account binding')
++assert(loginFunction.includes("case 'start'") && loginFunction.includes("case 'register'") && loginFunction.includes("case 'bind'") && loginFunction.includes('handleLegacy') && !loginFunction.includes('session_key'), 'Login function must support staged and legacy clients without returning session_key')
++assert(loginPage.includes('startWechatSignIn') && read('src/services/wechatAuth.ts').includes('loginCode: code, code'), 'Client must send both new and legacy WeChat code fields')
++
++assert(reminderPage.includes('requestSubscribeMessage') && reminderPage.includes('保存并预约') && !reminderPage.includes('placeholder-tmpl-id'), 'Reminder page must batch real configured templates on save')
++assert(scheduleFunction.includes('nextShanghaiOccurrence') && scheduleFunction.includes('notification_jobs'), 'Schedule function must create one-time jobs in Asia/Shanghai')
++assert(dispatchFunction.includes('claim_due_notification_jobs') && dispatchFunction.includes('subscribe/send') && dispatchFunction.includes('_enabled`]: false'), 'Dispatcher must claim, send and close reservations')
++
++assert(recipePage.includes('createRecipeShare') && recipePage.includes('generateRecipePosterAssets') && recipePage.includes('showShareImageMenu') && recipePage.includes('onClick={handleShareRecipe}'), 'Recipe page must generate and share the poster from one button')
++assert(recipeSharePage.includes('getRecipeShare') && recipeSharePage.includes('useShareTimeline'), 'Public recipe page must load and support onward sharing')
++assert(poster.includes('card: {width: 1000, height: 800}') && poster.includes('poster: {width: 1080, height: 1440}'), 'Poster renderer must expose the required dimensions')
++
++for (const table of ['wechat_identities', 'wechat_access_tokens', 'notification_jobs', 'recipe_shares']) {
++  assert(migration.includes(`create table if not exists public.${table}`), `Migration must create ${table}`)
++  assert(migration.includes(`alter table public.${table} enable row level security`), `Migration must enable RLS for ${table}`)
++}
++
++console.log('wechat feature checks passed')
+diff --git a/scripts/testRecipeShareContent.mts b/scripts/testRecipeShareContent.mts
+new file mode 100644
+index 0000000..f44ea99
+--- /dev/null
++++ b/scripts/testRecipeShareContent.mts
+@@ -0,0 +1,21 @@
++import {strict as assert} from 'node:assert'
++import recipeContentHelpers from '../src/utils/recipeShareContent'
++
++const {extractPosterSections} = recipeContentHelpers
++
++const parsed = extractPosterSections(`# 番茄炒蛋
++## 食材用量
++- 番茄：300g
++- 鸡蛋：2个
++## 烹饪步骤
++1. 番茄切块
++2. 鸡蛋炒熟
++## 营养特点
++- 蛋白质丰富`)
++
++assert.deepEqual(parsed.ingredients, ['番茄：300g', '鸡蛋：2个'])
++assert.deepEqual(parsed.steps, ['番茄切块', '鸡蛋炒熟'])
++assert.deepEqual(parsed.nutrition, ['蛋白质丰富'])
++assert.deepEqual(extractPosterSections('普通文本').steps, [])
++
++console.log('recipe share content tests passed')

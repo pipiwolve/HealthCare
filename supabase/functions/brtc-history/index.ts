@@ -32,6 +32,7 @@ const API_HOST = 'rtc-aiagent.baidubce.com'
 const DEFAULT_PAGE_SIZE = 100
 const DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60
 const GROUP_GAP_SECONDS = 30 * 60
+const MAX_HISTORY_GROUPS = 10
 const AUTH_TIMEOUT_MS = 5000
 const BRTC_HISTORY_TIMEOUT_MS = 8000
 
@@ -102,15 +103,60 @@ function buildTitle(messages: HistoryMessage[]): string {
   return question.content.trim().slice(0, 20)
 }
 
+function normalizeQuestionText(text: string): string {
+  const source = (text || '').replace(/\\n/g, '\n').trim()
+  if (!source) return ''
+
+  const markerMatch = source.match(/用户问题[:：]\s*([\s\S]+)$/)
+  if (markerMatch?.[1]) {
+    return markerMatch[1].trim()
+  }
+
+  const hiddenQuestionPrefixes = [
+    '你是专业健康饮食顾问',
+    '请用不超过',
+    '请使用简单 Markdown 输出',
+    '不要输出长篇食谱',
+    '不能给出医疗诊断',
+    '请先请求上传图片',
+    '图片已上传完成',
+    '识别图片中的食材',
+    '只输出食材名',
+    '【本餐用餐成员健康档案】',
+    '请分析以下食材',
+  ]
+  if (hiddenQuestionPrefixes.some(prefix => source.startsWith(prefix))) return ''
+  if (source.includes('请分析以下食材的营养成分')) return ''
+  return source
+}
+
+function normalizeDialogueText(row: DialogueRow): string {
+  if (row.type === 'QUESTION') return normalizeQuestionText(row.text || '')
+  return (row.text || '').trim()
+}
+
 function groupRows(rows: DialogueRow[]): HistoryGroup[] {
-  const messages = rows
-    .map(row => ({
-      role: row.type === 'QUESTION' ? 'user' as const : 'assistant' as const,
-      content: row.text || '',
+  const sortedRows = [...rows].sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp))
+  const messages: HistoryMessage[] = []
+  let skipAnswerForHiddenQuestion = false
+
+  for (const row of sortedRows) {
+    const role = row.type === 'QUESTION' ? 'user' as const : 'assistant' as const
+    const content = normalizeDialogueText(row)
+    if (role === 'user') {
+      skipAnswerForHiddenQuestion = !content.trim()
+      if (!content.trim()) continue
+    } else if (skipAnswerForHiddenQuestion) {
+      skipAnswerForHiddenQuestion = false
+      continue
+    }
+    if (!content.trim()) continue
+    messages.push({
+      role,
+      content,
       timestamp: normalizeTimestamp(row.timestamp),
-    }))
-    .filter(message => message.content.trim())
-    .sort((a, b) => a.timestamp - b.timestamp)
+    })
+  }
 
   const groups: HistoryGroup[] = []
   let current: HistoryMessage[] = []
@@ -253,18 +299,24 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     const payload = JSON.parse(responseText)
     const rows = Array.isArray(payload.data) ? payload.data as DialogueRow[] : []
-    const groups = groupRows(rows)
+    const allGroups = groupRows(rows)
+    const groups = allGroups.slice(0, MAX_HISTORY_GROUPS)
 
     console.info('[brtc-history] completed', {
       traceId,
       rowCount: rows.length,
+      totalGroupCount: allGroups.length,
       groupCount: groups.length,
+      historyLimit: MAX_HISTORY_GROUPS,
       elapsedMs: Date.now() - startedAt,
     })
 
     return new Response(JSON.stringify({
       pageNo: payload.pageNo ?? pageNo,
       pageSize: payload.pageSize ?? rows.length,
+      source: 'baidu-rtc-dialogues',
+      groupGapSeconds: GROUP_GAP_SECONDS,
+      historyLimit: MAX_HISTORY_GROUPS,
       groups,
     }), {
       status: 200,

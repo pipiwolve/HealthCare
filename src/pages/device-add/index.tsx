@@ -4,7 +4,7 @@ import Taro from '@tarojs/taro'
 import {useAuth} from '@/contexts/AuthContext'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {upsertDevice} from '@/db/api'
-import {bleService} from '@/utils/bleService'
+import {bleService, isStrongSupportedBLEDevice, isSupportedBLEDeviceName} from '@/utils/bleService'
 import {useAppStore} from '@/store/appStore'
 import type {BLEDevice} from '@/utils/bleService'
 
@@ -53,6 +53,7 @@ function DeviceAddPage() {
     }, 1000)
 
     await bleService.startScan((device) => {
+      if (!isSupportedBLEDeviceName(device.name)) return
       setFoundDevices(prev => {
         if (prev.find(d => d.deviceId === device.deviceId)) return prev
         return [...prev, device]
@@ -67,22 +68,21 @@ function DeviceAddPage() {
     if (scanTimer.current) clearInterval(scanTimer.current)
   }
 
-  // 扫描完成后自动推荐信号最强设备
+  // 仅推荐名称匹配且信号达到“强”的营养秤。
   const handleScanComplete = (devices: BLEDevice[]) => {
-    if (devices.length === 0) return
-    const sorted = [...devices].sort((a, b) => b.RSSI - a.RSSI)
-    const best = sorted[0]
-    if (best.RSSI > -85) {
-      Taro.showModal({
-        title: '发现推荐设备',
-        content: `检测到最强信号设备「${best.name}」，是否直接连接？`,
-        confirmText: '直接连接',
-        cancelText: '手动选择',
-        success: (res) => {
-          if (res.confirm) handleSelectDevice(best)
-        }
-      })
-    }
+    const best = devices
+      .filter(isStrongSupportedBLEDevice)
+      .sort((a, b) => b.RSSI - a.RSSI)[0]
+    if (!best) return
+    Taro.showModal({
+      title: '发现推荐设备',
+      content: `检测到强信号设备「${best.name}」，是否直接连接？`,
+      confirmText: '直接连接',
+      cancelText: '手动选择',
+      success: (res) => {
+        if (res.confirm) handleSelectDevice(best)
+      }
+    })
   }
 
   const handleSelectDevice = (device: BLEDevice) => {
@@ -198,7 +198,9 @@ function DeviceAddPage() {
               </div>
             </div>
           ) : (() => {
-            const sorted = [...foundDevices].sort((a, b) => b.RSSI - a.RSSI)
+            const sorted = foundDevices
+              .filter(device => isSupportedBLEDeviceName(device.name))
+              .sort((a, b) => b.RSSI - a.RSSI)
             const strongDevices = sorted.filter(d => d.RSSI > -85)
             const weakDevices = sorted.filter(d => d.RSSI <= -85)
             const renderDevice = (device: BLEDevice) => (
