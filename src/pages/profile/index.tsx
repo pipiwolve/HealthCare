@@ -40,6 +40,7 @@ function ProfilePage() {
   const menuItems = [
     {icon: 'i-mdi-bluetooth', label: '设备管理', desc: `${devices.length}台设备`, url: '/pages/device-manager/index'},
     {icon: 'i-mdi-account-edit', label: '个人资料', desc: activeMember?.nickname || '未设置', url: '/pages/personal-info/index'},
+    {icon: 'i-mdi-chart-timeline-variant', label: '历史记录查询', desc: '热量趋势', url: '/pages/calorie-history/index'},
     {icon: 'i-mdi-shield-account', label: '账号与微信', desc: '登录与绑定', url: '/pages/account-settings/index'},
     {icon: 'i-mdi-account-group', label: '家庭成员', desc: familyMembers.length > 0 ? `${familyMembers.length}位成员` : '未配置', url: '/pages/family/index'},
     {icon: 'i-mdi-bell-outline', label: '提醒设置', desc: '餐前&饮水提醒', url: '/pages/reminder-settings/index'},

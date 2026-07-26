@@ -4,7 +4,7 @@ import Taro, {useDidShow} from '@tarojs/taro'
 import {Picker} from '@tarojs/components'
 import {useAuth} from '@/contexts/AuthContext'
 import {withRouteGuard} from '@/components/RouteGuard'
-import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages} from '@/db/api'
+import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
 import {useAppStore} from '@/store/appStore'
 import type {FamilyMember, GenderType, BloodType} from '@/db/types'
 
@@ -22,6 +22,7 @@ function PersonalInfoPage() {
   const [customDisease, setCustomDisease] = useState('')
   const [customAllergen, setCustomAllergen] = useState('')
   const [saving, setSaving] = useState(false)
+  const [clearingChat, setClearingChat] = useState(false)
 
   const activeMemberRef = useRef(activeMember)
   useEffect(() => { activeMemberRef.current = activeMember }, [activeMember])
@@ -97,8 +98,8 @@ function PersonalInfoPage() {
   const handleClearData = async () => {
     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
       Taro.showModal({
-        title: '清除健康数据',
-        content: '此操作将清除您的所有健康档案数据，不可撤销。确认继续？',
+        title: '清空当前成员健康档案',
+        content: '仅清空当前成员的基础健康信息、慢性病、过敏原、用药和营养目标；不会删除称重历史、食材图片、其他成员或账号。',
         confirmColor: '#D9534F',
         success: (res) => resolve({confirm: res.confirm})
       })
@@ -108,26 +109,38 @@ function PersonalInfoPage() {
       await updateFamilyMember(member.id, {
         gender: 'unknown', age: null, height: null, weight: null,
         birthday: null, blood_type: null, chronic_diseases: [], allergens: [],
-        medications: null, daily_calorie_goal: null
+        medications: null, daily_calorie_goal: null, daily_protein_goal: null,
+        daily_fat_goal: null, daily_carb_goal: null
       })
     }
     await refreshMembers(user!.id)
     loadMember()
-    Taro.showToast({title: '健康数据已清除', icon: 'success'})
+    Taro.showToast({title: '当前成员健康档案已清空', icon: 'success'})
   }
 
   const handleClearChat = async () => {
     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
       Taro.showModal({
-        title: '清除对话记录',
-        content: '将删除所有AI问答历史，此操作不可撤销。',
+        title: '清除 AI 记忆与旧版对话',
+        content: '将清除百度 AI 对话上下文和小程序旧版对话数据。百度对话日志可能仍按云服务策略保留，此操作不可撤销。',
         confirmColor: '#D9534F',
         success: (res) => resolve({confirm: res.confirm})
       })
     })
     if (!confirm) return
-    await deleteAllChatMessages(user!.id)
-    Taro.showToast({title: '对话记录已清除', icon: 'success'})
+    if (!user || clearingChat) return
+    setClearingChat(true)
+    try {
+      await deleteRtcContexts()
+      const localDeleted = await deleteAllChatMessages(user.id)
+      if (!localDeleted) throw new Error('旧版对话删除失败')
+      Taro.showToast({title: 'AI 记忆与旧版对话已清除', icon: 'success'})
+    } catch (error) {
+      console.error('清除 AI 记忆与旧版对话失败:', error)
+      Taro.showToast({title: '清除失败，请稍后重试', icon: 'none'})
+    } finally {
+      setClearingChat(false)
+    }
   }
 
   // BMI参考热量
@@ -372,13 +385,14 @@ function PersonalInfoPage() {
             className="w-full flex items-center justify-center leading-none text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-xl"
             style={{height: '48px'}}
             onClick={handleClearData}
-          >清除所有健康数据</button>
+          >清空当前成员健康档案</button>
           <button
             type="button"
-            className="w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl"
+            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
             style={{height: '48px'}}
             onClick={handleClearChat}
-          >清除对话记录</button>
+            disabled={clearingChat}
+          >{clearingChat ? '清除中...' : '清除 AI 记忆与旧版对话'}</button>
         </div>
       </div>
     </div>

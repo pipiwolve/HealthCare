@@ -4,7 +4,6 @@ import type {User} from '@supabase/supabase-js'
 import type {Profile} from '@/db/types'
 import {
   bindWechatAccount,
-  registerWechatAccount,
   startWechatLogin,
   type WechatStartResult
 } from '@/services/wechatAuth'
@@ -29,13 +28,18 @@ interface AuthContextType {
   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
   startWechatSignIn: () => Promise<{data: WechatStartResult | null; error: Error | null}>
-  registerWechatSignIn: (ticket: string, phoneCode?: string) => Promise<{error: Error | null}>
   bindWechatSignIn: (ticket: string) => Promise<{error: Error | null}>
   signOut: () => Promise<void>
   refreshProfile: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
+
+function normalizeUsername(username: string): string {
+  const normalized = username.trim().toLowerCase()
+  if (!/^[A-Za-z0-9_]{3,32}$/.test(normalized)) throw new Error('用户名需为3-32位字母、数字或下划线')
+  return normalized
+}
 
 export function AuthProvider({children}: {children: ReactNode}) {
   const [user, setUser] = useState<User | null>(null)
@@ -86,7 +90,8 @@ export function AuthProvider({children}: {children: ReactNode}) {
 
   const signInWithUsername = async (username: string, password: string) => {
     try {
-      const email = `${username}@miaoda.com`
+      const normalizedUsername = normalizeUsername(username)
+      const email = `${normalizedUsername}@miaoda.com`
       const {error} = await supabase.auth.signInWithPassword({
         email,
         password
@@ -101,11 +106,12 @@ export function AuthProvider({children}: {children: ReactNode}) {
 
   const signUpWithUsername = async (username: string, password: string) => {
     try {
-      const email = `${username}@miaoda.com`
+      const normalizedUsername = normalizeUsername(username)
+      const email = `${normalizedUsername}@miaoda.com`
       const {error} = await supabase.auth.signUp({
         email,
         password,
-        options: {data: {username}}
+        options: {data: {username: normalizedUsername}}
       })
 
       if (error) throw error
@@ -162,15 +168,6 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
   }
 
-  const registerWechatSignIn = async (ticket: string, phoneCode?: string) => {
-    try {
-      await registerWechatAccount(ticket, phoneCode)
-      return {error: null}
-    } catch (error) {
-      return {error: error as Error}
-    }
-  }
-
   const bindWechatSignIn = async (ticket: string) => {
     try {
       await bindWechatAccount(ticket)
@@ -198,7 +195,6 @@ export function AuthProvider({children}: {children: ReactNode}) {
         signInWithPhone,
         verifyPhoneOtp,
         startWechatSignIn,
-        registerWechatSignIn,
         bindWechatSignIn,
         signOut,
         refreshProfile

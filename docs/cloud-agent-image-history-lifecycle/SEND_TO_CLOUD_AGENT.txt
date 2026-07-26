@@ -1,0 +1,11 @@
+请按 `docs/cloud-agent-image-history-lifecycle/README.md` 和 `CLOUD_AGENT_PROMPT.md` 执行本次迁移。
+
+严格顺序：
+1. 先应用 `0001-code-and-tests.patch`，完成代码检查和 `pnpm run build:weapp`；
+2. 确认代码无误后，检查远端 Supabase 迁移历史，不要直接 `supabase db push`；
+3. 迁移历史校准后再应用 `0002-database-migration.patch`，只执行 `00006_food_image_lifecycle.sql`；
+4. 最后部署 `upload-food-image`、`food-image-cleanup`、`brtc-history`，配置 `FOOD_IMAGE_CLEANUP_SECRET`，再用测试账号做微信开发者工具验收。
+
+重点验收：大图最长边 1280px/300KB、缩略图最长边 320px/50KB、大图保留 30 天、缩略图长期保留；称重历史懒加载缩略图并支持全屏预览；BRTC 历史按上海时区日期分组、会话按 30 分钟切分；清除 AI 记忆按钮调用认证后的 BRTC contexts 删除接口。
+
+禁止输出任何 Secret 或用户数据，禁止整文件覆盖云端已有业务代码，禁止未授权执行真实删除。

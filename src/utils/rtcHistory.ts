@@ -20,6 +20,13 @@ export interface RtcHistoryGroup {
   messages: RtcHistoryMessage[]
 }
 
+export interface RtcHistoryDateGroup {
+  id: string
+  dateKey: string
+  label: string
+  groups: RtcHistoryGroup[]
+}
+
 const DEFAULT_GAP_SECONDS = 30 * 60
 
 function normalizeTimestamp(value: number | string): number {
@@ -120,4 +127,50 @@ export function groupRtcDialogueRows(rows: RtcDialogueRow[], gapSeconds = DEFAUL
 
   if (current.length > 0) groups.push(toGroup(current))
   return groups
+}
+
+export function getShanghaiDateKey(timestamp: number): string {
+  const date = new Date(timestamp * 1000)
+  const shanghai = new Date(date.getTime() + 8 * 60 * 60 * 1000)
+  return `${shanghai.getUTCFullYear()}-${String(shanghai.getUTCMonth() + 1).padStart(2, '0')}-${String(shanghai.getUTCDate()).padStart(2, '0')}`
+}
+
+function addDays(dateKey: string, days: number): string {
+  const [year, month, day] = dateKey.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day + days))
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`
+}
+
+export function formatRtcDateLabel(dateKey: string, nowTimestamp = Date.now() / 1000): string {
+  const todayKey = getShanghaiDateKey(nowTimestamp)
+  if (dateKey === todayKey) return '今天'
+  if (dateKey === addDays(todayKey, -1)) return '昨天'
+
+  const [year, month, day] = dateKey.split('-').map(Number)
+  return `${year}年${month}月${day}日`
+}
+
+export function groupRtcHistoryByDate(
+  groups: RtcHistoryGroup[],
+  nowTimestamp = Date.now() / 1000,
+): RtcHistoryDateGroup[] {
+  const sortedGroups = [...groups].sort((a, b) => b.endTime - a.endTime)
+  const grouped = new Map<string, RtcHistoryGroup[]>()
+
+  for (const group of sortedGroups) {
+    // A session that crosses midnight belongs to the date of its first message.
+    const dateKey = getShanghaiDateKey(group.startTime)
+    const dateGroups = grouped.get(dateKey) || []
+    dateGroups.push(group)
+    grouped.set(dateKey, dateGroups)
+  }
+
+  return [...grouped.entries()]
+    .sort(([dateA], [dateB]) => dateB.localeCompare(dateA))
+    .map(([dateKey, dateGroups]) => ({
+      id: `rtc-date-${dateKey}`,
+      dateKey,
+      label: formatRtcDateLabel(dateKey, nowTimestamp),
+      groups: dateGroups,
+    }))
 }

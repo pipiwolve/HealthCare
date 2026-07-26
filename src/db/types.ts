@@ -59,7 +59,10 @@ export interface Ingredient {
   unit: string
   hasAllergen?: boolean
   allergenName?: string
-  image_url?: string | null  // 拍照识别时写入，手动输入为 null
+  image_id?: string | null
+  image_url?: string | null
+  thumbnail_url?: string | null
+  image_expires_at?: string | null
 }
 
 export interface WeighingRecord {

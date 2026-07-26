@@ -46,4 +46,5 @@ history/*.json
 .vite_cache
 /.skills
 /tasks
+/tmp/
 package.json.[0-9]*

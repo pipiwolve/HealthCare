@@ -3,7 +3,6 @@
 import {Image} from '@tarojs/components'
 import Taro, {useDidShow} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {supabase} from '@/client/supabase'
 import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
 import {DisclaimerModal} from '@/components/DisclaimerModal'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
@@ -12,6 +11,7 @@ import {useAuth} from '@/contexts/AuthContext'
 import {createWeighingRecord, getDevices, getWeighingRecords, updateProfile } from '@/db/api'
 import type {Ingredient, WeighingRecord } from '@/db/types'
 import {getAiWebSocket, type AgentProfile} from '@/services/aiWebSocket'
+import {uploadFoodImageVariants} from '@/services/foodImageStorage'
 import {useAppStore} from '@/store/appStore'
 import {buildFamilyHealthContext, checkAllergens, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
 import {buildFoodRecognitionPrompt, parseRecognizedFoods} from '@/utils/aiPromptHelpers'
@@ -21,8 +21,14 @@ import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip} 
 import {bleMockService} from '@/utils/bleMock'
 import type {WeightUnit} from '@/utils/bleService'
 import {bleService} from '@/utils/bleService'
+import {compressFoodImages} from '@/utils/foodImageCompression'
+import {getFoodImageDisplay, type FoodImageFields} from '@/utils/foodImage'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+interface PendingIngredientImage extends FoodImageFields {
+  preview_url: string
+}
 
 function formatNumber(value: number | null, digits = 1): string {
   if (value == null || !Number.isFinite(value)) return '--'
@@ -71,9 +77,7 @@ function HomePage() {
 
   const [foodName, setFoodName] = useState('')
   const [manualWeight, setManualWeight] = useState('')
-  // 拍照识别后暂存图片URL，添加食材时一并写入；手动输入时为null
-  const [currentIngredientImageUrl, setCurrentIngredientImageUrl] = useState<string | null>(null)
-  const [isRecording, setIsRecording] = useState(false)
+  const [currentIngredientImage, setCurrentIngredientImage] = useState<PendingIngredientImage | null>(null)
   const [analysisResult, setAnalysisResult] = useState('')
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [history, setHistory] = useState<WeighingRecord[]>([])
@@ -85,7 +89,7 @@ function HomePage() {
   const [connectedDeviceName, setConnectedDeviceName] = useState('')
   const [showAnalysisContent, setShowAnalysisContent] = useState(true)
   const [showMealMemberSelector, setShowMealMemberSelector] = useState(false)
-  const recorderManager = useRef<Taro.RecorderManager | null>(null)
+  const [failedHistoryImages, setFailedHistoryImages] = useState<Set<string>>(() => new Set())
 
   const selectedMealMembers = useMemo(() => {
     const selected = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
@@ -221,7 +225,16 @@ function HomePage() {
       Taro.showToast({title: '请输入有效重量', icon: 'none'})
       return
     }
-    const base = {name: foodName.trim(), weight: w, unit: weightUnit, image_url: currentIngredientImageUrl ?? null}
+    const hasStoredImage = Boolean(currentIngredientImage?.image_id)
+    const base: Ingredient = {
+      name: foodName.trim(),
+      weight: w,
+      unit: weightUnit,
+      image_id: hasStoredImage ? currentIngredientImage?.image_id || null : null,
+      image_url: hasStoredImage ? currentIngredientImage?.image_url || null : null,
+      thumbnail_url: hasStoredImage ? currentIngredientImage?.thumbnail_url || null : null,
+      image_expires_at: hasStoredImage ? currentIngredientImage?.image_expires_at || null : null,
+    }
     const enriched = enrichIngredientsWithAllergens([base], activeMember)
     addIngredient(enriched[0])
     if (familyMembers.length > 0 && selectedMealMembers.length === 0 && activeMember) {
@@ -229,7 +242,7 @@ function HomePage() {
     }
     setFoodName('')
     setManualWeight('')
-    setCurrentIngredientImageUrl(null)
+    setCurrentIngredientImage(null)
   }
 
   const toggleMealMember = (memberId: string) => {
@@ -245,25 +258,6 @@ function HomePage() {
       return
     }
     setSelectedMealMemberIds([...selected, memberId])
-  }
-
-  // 读取文件为base64（小程序专用）
-  const readFileAsBase64 = (filePath: string): Promise<{base64: string; size: number}> => {
-    return new Promise((resolve, reject) => {
-      const fs = Taro.getFileSystemManager()
-      fs.getFileInfo({
-        filePath,
-        success: (info) => {
-          fs.readFile({
-            filePath,
-            encoding: 'base64',
-            success: (res) => resolve({base64: res.data as string, size: info.size}),
-            fail: reject
-          })
-        },
-        fail: reject
-      })
-    })
   }
 
   // 读取图片为带前缀的base64
@@ -302,62 +296,6 @@ function HomePage() {
     throw lastError instanceof Error ? lastError : new Error('AI WebSocket connect failed')
   }
 
-  const handleVoiceInput = () => {
-    if (!isOnline) {
-      Taro.showToast({title: '需要网络连接', icon: 'none'})
-      return
-    }
-    if (isRecording) return
-
-    recorderManager.current = Taro.getRecorderManager()
-    recorderManager.current.onStart(() => setIsRecording(true))
-    recorderManager.current.onStop(async (res) => {
-      setIsRecording(false)
-      if (!res.tempFilePath) return
-      setRecognizing(true)
-      const ws = getAiWebSocket()
-      try {
-        await connectDefaultAgent(ws, 'voice-ptt')
-        const {base64} = await readFileAsBase64(res.tempFilePath)
-        const buffer = Taro.base64ToArrayBuffer(base64)
-        const text = await new Promise<string>((resolve, reject) => {
-          const timeout = setTimeout(() => { unsub(); reject(new Error('ASR timeout')) }, 15000)
-          const unsub = ws.onMessage('asr-final', (data) => {
-            clearTimeout(timeout)
-            unsub()
-            resolve(data as string)
-          })
-          void (async () => {
-            await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
-            await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
-            await ws.sendAudio(buffer)
-            await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
-          })().catch((error) => {
-            clearTimeout(timeout)
-            unsub()
-            reject(error)
-          })
-        })
-        if (text.trim()) {
-          setFoodName(text.trim())
-          Taro.showToast({title: '识别成功，请确认', icon: 'success'})
-        } else {
-          Taro.showToast({title: '未能识别，请重试或手动输入', icon: 'none'})
-        }
-      } catch {
-        Taro.showToast({title: '未能识别，请重试或手动输入', icon: 'none'})
-      } finally {
-        ws.disconnect()
-        setRecognizing(false)
-      }
-    })
-    recorderManager.current.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
-  }
-
-  const handleStopVoice = () => {
-    recorderManager.current?.stop()
-  }
-
   const handlePhotoRecognize = async () => {
     if (!isOnline) {
       Taro.showToast({title: '需要网络连接', icon: 'none'})
@@ -368,25 +306,17 @@ function HomePage() {
       const res = await Taro.chooseMedia({count: 1, mediaType: ['image'], sourceType: ['album', 'camera']})
       if (!res.tempFiles?.[0]) return
       const localPreviewPath = res.tempFiles[0].tempFilePath
-      setCurrentIngredientImageUrl(localPreviewPath)
+      setCurrentIngredientImage({preview_url: localPreviewPath})
       setRecognizing(true)
 
-      // Step 1: 压缩图片
       Taro.showLoading({title: '图片压缩中...'})
       loadingShown = true
-      let compressedPath = res.tempFiles[0].tempFilePath
-      try {
-        const compressRes = await Taro.compressImage({src: compressedPath, quality: 80})
-        compressedPath = compressRes.tempFilePath
-      } catch {
-        // 压缩失败降级到原图
-      }
+      const compressed = await compressFoodImages(localPreviewPath)
+      const [largeBase64, thumbnailBase64] = await Promise.all([
+        readImageAsBase64(compressed.large.path),
+        readImageAsBase64(compressed.thumbnail.path),
+      ])
 
-      // Step 2: 读取 base64
-      const base64Image = await readImageAsBase64(compressedPath)
-      const ext = compressedPath.split('.').pop()?.toLowerCase() || 'jpg'
-
-      // Step 3: 识别食材 & 上传图片 并发执行
       Taro.showLoading({title: '识别并上传中...'})
 
       const ws = getAiWebSocket()
@@ -396,25 +326,28 @@ function HomePage() {
             await connectDefaultAgent(ws, 'vision')
             return await ws.requestImageResponse({
               triggerText: buildFoodRecognitionPrompt('trigger'),
-              imageBase64: base64Image,
-              fileName: `food.${ext}`,
+              imageBase64: largeBase64,
+              fileName: 'food.jpg',
               finalText: buildFoodRecognitionPrompt('final')
             })
           } finally {
             ws.disconnect()
           }
         })(),
-        supabase.functions.invoke('upload-food-image', {body: {image: base64Image, ext}})
+        uploadFoodImageVariants({
+          largeImage: largeBase64,
+          thumbnailImage: thumbnailBase64,
+          large: compressed.large,
+          thumbnail: compressed.thumbnail,
+        })
       ])
 
       Taro.hideLoading()
       loadingShown = false
 
       // 处理上传结果
-      let uploadedImageUrl: string | null = null
-      if (uploadResult.status === 'fulfilled' && !uploadResult.value.error) {
-        uploadedImageUrl = uploadResult.value.data?.url || null
-      }
+      const storedImage = uploadResult.status === 'fulfilled' ? uploadResult.value : null
+      if (uploadResult.status === 'rejected') console.warn('食材图片上传失败:', uploadResult.reason)
 
       // 处理识别结果
       if (recognizeResult.status === 'rejected') {
@@ -424,20 +357,20 @@ function HomePage() {
       const foods = parseRecognizedFoods(raw)
       if (foods.length > 0) {
         setFoodName(foods[0])
-        setCurrentIngredientImageUrl(uploadedImageUrl || localPreviewPath)
+        setCurrentIngredientImage({preview_url: localPreviewPath, ...(storedImage || {})})
         Taro.showToast({
-          title: uploadedImageUrl
+          title: storedImage
             ? `识别到：${foods.slice(0, 3).join('、')}`
             : '识别成功，图片仅在本机临时显示',
           icon: 'none'
         })
       } else {
-        setCurrentIngredientImageUrl(null)
+        setCurrentIngredientImage(null)
         Taro.showToast({title: '未识别到食材，请光线充足正面拍摄', icon: 'none'})
       }
     } catch (err: any) {
       if (loadingShown) Taro.hideLoading()
-      setCurrentIngredientImageUrl(null)
+      setCurrentIngredientImage(null)
       if (isUserCancelError(err)) return
       if (isPrivacyScopeError(err)) {
         console.warn('拍照识别隐私配置缺失:', err)
@@ -534,6 +467,23 @@ function HomePage() {
 
   const handleContinueChat = () => {
     Taro.switchTab({url: '/pages/chat/index'})
+  }
+
+  const handlePreviewIngredientImage = async (ingredient: Ingredient) => {
+    const display = getFoodImageDisplay(ingredient)
+    if (!display.previewUrl) {
+      Taro.showToast({title: '图片暂不可用', icon: 'none'})
+      return
+    }
+    if (display.largeExpired) {
+      Taro.showToast({title: '原图已到期，显示缩略图', icon: 'none'})
+    }
+    try {
+      await Taro.previewImage({current: display.previewUrl, urls: [display.previewUrl]})
+    } catch (error) {
+      console.warn('食材图片预览失败:', error)
+      Taro.showToast({title: '图片预览失败', icon: 'none'})
+    }
   }
 
   const bleStatusColor = bleStatus === 'connected' ? 'bg-primary' : bleStatus === 'connecting' ? 'bg-warning animate-breathe' : 'bg-muted-foreground'
@@ -660,14 +610,6 @@ function HomePage() {
                 value={foodName}
                 onInput={(e) => { const ev = e as any; setFoodName(ev.detail?.value ?? ev.target?.value ?? '') }}
               />
-              {/* 语音按钮 */}
-              <div
-                className={`flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0 ${isRecording ? 'bg-destructive animate-breathe' : recognizing ? 'bg-primary/50' : 'bg-primary'}`}
-                onTouchStart={handleVoiceInput}
-                onTouchEnd={handleStopVoice}
-              >
-                <div className="i-mdi-microphone text-2xl text-white" />
-              </div>
               {/* 拍照按钮 */}
               <div
                 className="flex items-center justify-center w-10 h-10 rounded-full bg-secondary flex-shrink-0"
@@ -677,10 +619,10 @@ function HomePage() {
               </div>
             </div>
 
-            {currentIngredientImageUrl && (
+            {currentIngredientImage && (
               <div className="flex items-center gap-3 px-3 py-2 bg-secondary rounded-xl">
                 <Image
-                  src={currentIngredientImageUrl}
+                  src={currentIngredientImage.thumbnail_url || currentIngredientImage.image_url || currentIngredientImage.preview_url}
                   mode="aspectFill"
                   style={{width: '52px', height: '52px', borderRadius: '8px', flexShrink: 0}}
                 />
@@ -692,7 +634,7 @@ function HomePage() {
                   type="button"
                   className="flex items-center justify-center flex-shrink-0"
                   style={{width: '36px', height: '36px'}}
-                  onClick={() => setCurrentIngredientImageUrl(null)}
+                  onClick={() => setCurrentIngredientImage(null)}
                 >
                   <div className="i-mdi-close text-2xl text-muted-foreground" />
                 </button>
@@ -814,10 +756,11 @@ function HomePage() {
                     className="flex-shrink-0 overflow-hidden"
                     style={{width: '48px', height: '48px', borderRadius: '50%'}}
                   >
-                    {ing.image_url ? (
+                    {ing.thumbnail_url || ing.image_url ? (
                       <Image
-                        src={ing.image_url}
+                        src={ing.thumbnail_url || ing.image_url || ''}
                         mode="aspectFill"
+                        lazyLoad
                         style={{width: '48px', height: '48px'}}
                       />
                     ) : (
@@ -1009,14 +952,27 @@ function HomePage() {
                     <div className="flex items-start gap-2 mb-3">
                       {displayIngs.map((ing: Ingredient, i: number) => {
                         const isLast = i === 2 && extraCount > 0
+                        const imageKey = `${record.id}-${ing.image_id || i}`
+                        const imageDisplay = getFoodImageDisplay(ing)
+                        const listImageUrl = failedHistoryImages.has(imageKey) ? null : imageDisplay.listUrl
                         return (
                           <div key={i} className="flex flex-col items-center" style={{width: '64px'}}>
-                            <div className="relative" style={{width: '64px', height: '64px'}}>
-                              {ing.image_url ? (
+                            <div
+                              className="relative"
+                              style={{width: '64px', height: '64px'}}
+                              onClick={() => void handlePreviewIngredientImage(ing)}
+                            >
+                              {listImageUrl ? (
                                 <Image
-                                  src={ing.image_url}
+                                  src={listImageUrl}
                                   mode="aspectFill"
+                                  lazyLoad
                                   style={{width: '64px', height: '64px', borderRadius: '8px', display: 'block'}}
+                                  onError={() => setFailedHistoryImages(previous => {
+                                    const next = new Set(previous)
+                                    next.add(imageKey)
+                                    return next
+                                  })}
                                 />
                               ) : (
                                 <div

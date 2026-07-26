@@ -4,6 +4,7 @@ export default defineAppConfig({
     'pages/chat/index',
     'pages/stats/index',
     'pages/profile/index',
+    'pages/calorie-history/index',
     'pages/device-manager/index',
     'pages/device-add/index',
     'pages/personal-info/index',

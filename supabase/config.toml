@@ -9,3 +9,6 @@ verify_jwt = false
 
 [functions.recipe-share]
 verify_jwt = false
+
+[functions.food-image-cleanup]
+verify_jwt = false

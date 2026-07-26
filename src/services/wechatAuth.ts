@@ -8,6 +8,8 @@ export type WechatStartResult =
 export interface WechatAccountStatus {
   bound: boolean
   phoneMasked: string | null
+  hasUsernameLogin: boolean
+  username: string | null
 }
 
 async function getFunctionError(error: any, fallback: string): Promise<Error> {
@@ -49,12 +51,6 @@ export async function startWechatLogin(): Promise<WechatStartResult> {
   throw new Error('微信登录状态异常')
 }
 
-export async function registerWechatAccount(registrationTicket: string, phoneCode?: string): Promise<void> {
-  const data = await invokeWechat({action: 'register', registrationTicket, phoneCode: phoneCode || undefined})
-  if (!data.token) throw new Error('微信账号创建失败')
-  await verifyMagicLink(data.token)
-}
-
 export async function bindWechatAccount(registrationTicket: string): Promise<void> {
   const data = await invokeWechat({action: 'bind', registrationTicket})
   if (data.status !== 'bound') throw new Error('微信账号绑定失败')
@@ -71,7 +67,17 @@ export async function prepareWechatBinding(): Promise<string> {
 
 export async function getWechatAccountStatus(): Promise<WechatAccountStatus> {
   const data = await invokeWechat({action: 'status'})
-  return {bound: !!data.bound, phoneMasked: data.phoneMasked || null}
+  return {
+    bound: !!data.bound,
+    phoneMasked: data.phoneMasked || null,
+    hasUsernameLogin: !!data.hasUsernameLogin,
+    username: data.username || null
+  }
+}
+
+export async function unbindWechatAccount(password: string): Promise<void> {
+  const data = await invokeWechat({action: 'unbind', password})
+  if (data.status !== 'unbound') throw new Error('微信解绑失败')
 }
 
 export async function uploadWechatAvatar(localPath: string): Promise<string> {

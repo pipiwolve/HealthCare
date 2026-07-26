@@ -1,84 +1,93 @@
-// upload-food-image Edge Function
-// 接收 base64 图片 → 解码为 ArrayBuffer → 用 service_role 上传到 chat-images bucket → 返回公开 URL
-// 之所以在服务端处理：微信小程序中 Taro.request 不支持二进制 body，Storage SDK 和 Taro.uploadFile 均无法可靠上传
+import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+const BUCKET = 'chat-images'
+const LARGE_MAX_BYTES = 300 * 1024
+const THUMBNAIL_MAX_BYTES = 50 * 1024
+const LARGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+
+function decodeJpeg(value: unknown, label: string, maxBytes: number): Uint8Array {
+  if (typeof value !== 'string' || !value) throw new HttpError(400, `缺少${label}`)
+  if (value.length > Math.ceil(maxBytes * 4 / 3) + 256) throw new HttpError(400, `${label}超过大小限制`)
+  try {
+    const raw = value.includes(',') ? value.slice(value.indexOf(',') + 1) : value
+    const binary = atob(raw)
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+    if (bytes.byteLength > maxBytes) throw new HttpError(400, `${label}超过大小限制`)
+    if (bytes.byteLength < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
+      throw new HttpError(400, `${label}必须为 JPEG 格式`)
+    }
+    return bytes
+  } catch (error) {
+    if (error instanceof HttpError) throw error
+    throw new HttpError(400, `${label}编码无效`)
+  }
 }
 
-// 将 base64 字符串解码为 Uint8Array
-function base64ToUint8Array(base64: string): Uint8Array {
-  // 去除 data URL 前缀（如 data:image/jpeg;base64,）
-  const raw = base64.includes(',') ? base64.split(',')[1] : base64
-  const binaryStr = atob(raw)
-  const bytes = new Uint8Array(binaryStr.length)
-  for (let i = 0; i < binaryStr.length; i++) {
-    bytes[i] = binaryStr.charCodeAt(i)
+function safeDimension(value: unknown): number | null {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 10000 ? Math.round(parsed) : null
+}
+
+async function uploadImages(userId: string, body: Record<string, unknown>): Promise<Response> {
+  const largeBytes = decodeJpeg(body.largeImage, '大图', LARGE_MAX_BYTES)
+  const thumbnailBytes = decodeJpeg(body.thumbnailImage, '缩略图', THUMBNAIL_MAX_BYTES)
+  const imageId = crypto.randomUUID()
+  const largePath = `${userId}/${imageId}/large.jpg`
+  const thumbnailPath = `${userId}/${imageId}/thumb.jpg`
+  const largeExpiresAt = new Date(Date.now() + LARGE_RETENTION_MS).toISOString()
+  const largeMeta = body.largeMeta && typeof body.largeMeta === 'object' ? body.largeMeta as Record<string, unknown> : {}
+  const thumbnailMeta = body.thumbnailMeta && typeof body.thumbnailMeta === 'object' ? body.thumbnailMeta as Record<string, unknown> : {}
+  const admin = getSupabaseAdmin()
+
+  const {error: largeError} = await admin.storage.from(BUCKET).upload(largePath, largeBytes, {
+    contentType: 'image/jpeg',
+    upsert: false,
+  })
+  if (largeError) throw largeError
+
+  const {error: thumbnailError} = await admin.storage.from(BUCKET).upload(thumbnailPath, thumbnailBytes, {
+    contentType: 'image/jpeg',
+    upsert: false,
+  })
+  if (thumbnailError) {
+    await admin.storage.from(BUCKET).remove([largePath])
+    throw thumbnailError
   }
-  return bytes
+
+  const {error: metadataError} = await admin.from('food_images').insert({
+    id: imageId,
+    user_id: userId,
+    large_path: largePath,
+    thumbnail_path: thumbnailPath,
+    large_bytes: largeBytes.byteLength,
+    thumbnail_bytes: thumbnailBytes.byteLength,
+    large_width: safeDimension(largeMeta.width),
+    large_height: safeDimension(largeMeta.height),
+    thumbnail_width: safeDimension(thumbnailMeta.width),
+    thumbnail_height: safeDimension(thumbnailMeta.height),
+    large_expires_at: largeExpiresAt,
+  })
+  if (metadataError) {
+    await admin.storage.from(BUCKET).remove([largePath, thumbnailPath])
+    throw metadataError
+  }
+
+  const largeUrl = admin.storage.from(BUCKET).getPublicUrl(largePath).data.publicUrl
+  const thumbnailUrl = admin.storage.from(BUCKET).getPublicUrl(thumbnailPath).data.publicUrl
+  return json({imageId, largeUrl, thumbnailUrl, largeExpiresAt})
 }
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders })
-  }
-  if (req.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405, headers: corsHeaders })
-  }
-
+  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
+  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
   try {
-    const body = await req.json()
-    const { image, ext = "jpg" } = body
-
-    if (!image) {
-      return new Response(
-        JSON.stringify({ error: "Missing image" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      )
-    }
-
-    const supabaseUrl = Deno.env.get("APP_SUPABASE_URL") || Deno.env.get("SUPABASE_URL")!
-    const serviceRoleKey = Deno.env.get("APP_SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-
-    // 生成唯一文件路径
-    const safeExt = ext.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg'
-    const contentType = safeExt === 'jpg' ? 'image/jpeg' : `image/${safeExt}`
-    const objectPath = `food-images/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`
-    const uploadUrl = `${supabaseUrl}/storage/v1/object/chat-images/${objectPath}`
-
-    // 解码 base64 为二进制
-    const imageBytes = base64ToUint8Array(image)
-
-    // 用 service_role 直接 POST 到 Supabase Storage REST API
-    const uploadRes = await fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${serviceRoleKey}`,
-        "Content-Type": contentType,
-        "x-upsert": "false",
-      },
-      body: imageBytes,
-    })
-
-    if (!uploadRes.ok) {
-      const errText = await uploadRes.text()
-      return new Response(
-        JSON.stringify({ error: `Storage upload failed: ${uploadRes.status} ${errText}` }),
-        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      )
-    }
-
-    const publicUrl = `${supabaseUrl}/storage/v1/object/public/chat-images/${objectPath}`
-
-    return new Response(
-      JSON.stringify({ url: publicUrl }),
-      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    )
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ error: e instanceof Error ? e.message : "Internal error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    )
+    const userId = await getAuthUserId(req)
+    const parsedBody = await req.json().catch(() => ({}))
+    const body = parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
+      ? parsedBody as Record<string, unknown>
+      : {}
+    return await uploadImages(userId!, body)
+  } catch (error) {
+    return handleError(error, 'upload-food-image')
   }
 })

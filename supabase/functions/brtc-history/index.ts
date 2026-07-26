@@ -26,15 +26,17 @@ const corsHeaders = {
 const AK = Deno.env.get('BAIDU_BCE_AK') || Deno.env.get('BAIDU_BRTC_AK') || ''
 const SK = Deno.env.get('BAIDU_BCE_SK') || Deno.env.get('BAIDU_BRTC_SK') || ''
 const APPID = Deno.env.get('BAIDU_BRTC_APPID') || 'appsf7sknqh440y'
+const CONTEXT_ROLE = (Deno.env.get('BAIDU_BRTC_CONTEXT_ROLE') || '').trim()
 const SUPABASE_URL = Deno.env.get('APP_SUPABASE_URL') || Deno.env.get('SUPABASE_URL')!
 const SUPABASE_ANON_KEY = Deno.env.get('APP_SUPABASE_ANON_KEY') || Deno.env.get('SUPABASE_ANON_KEY')!
 const API_HOST = 'rtc-aiagent.baidubce.com'
 const DEFAULT_PAGE_SIZE = 100
 const DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60
 const GROUP_GAP_SECONDS = 30 * 60
-const MAX_HISTORY_GROUPS = 10
+const MAX_HISTORY_GROUPS = DEFAULT_PAGE_SIZE
 const AUTH_TIMEOUT_MS = 5000
 const BRTC_HISTORY_TIMEOUT_MS = 8000
+const BRTC_DELETE_TIMEOUT_MS = 8000
 
 const encoder = new TextEncoder()
 
@@ -238,8 +240,63 @@ Deno.serve(async (req: Request): Promise<Response> => {
       return jsonResponse({error: 'Unauthorized', traceId}, 401)
     }
 
+    const parsedBody = await req.json().catch(() => ({}))
+    const body = parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
+      ? parsedBody as Record<string, unknown>
+      : {}
+    const action = body.action === 'delete-contexts' ? 'delete-contexts' : 'list-dialogues'
+
+    if (action === 'delete-contexts') {
+      const path = '/api/v1/contexts'
+      const query = new URLSearchParams()
+      const deleteBody: Record<string, string> = {appId: APPID, userId}
+      if (CONTEXT_ROLE) deleteBody.role = CONTEXT_ROLE
+      const authorization = await buildBceAuthorization('DELETE', path, query, API_HOST)
+
+      console.info('[brtc-history] deleting contexts', {
+        traceId,
+        hasRole: Boolean(CONTEXT_ROLE),
+      })
+
+      let upstream: Response
+      try {
+        upstream = await fetchWithTimeout(`https://${API_HOST}${path}`, {
+          method: 'DELETE',
+          headers: {
+            host: API_HOST,
+            authorization,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(deleteBody),
+        }, BRTC_DELETE_TIMEOUT_MS)
+      } catch (error) {
+        console.error('[brtc-history] baidu contexts delete failed', {
+          traceId,
+          elapsedMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return jsonResponse({error: 'BRTC_CONTEXT_DELETE_TIMEOUT', traceId}, 504)
+      }
+
+      const responseText = await upstream.text()
+      if (!upstream.ok) {
+        console.error('[brtc-history] baidu contexts delete rejected', {
+          traceId,
+          status: upstream.status,
+          responseText,
+        })
+        return jsonResponse({error: `BRTC context delete failed: ${upstream.status} ${responseText}`, traceId}, 502)
+      }
+
+      console.info('[brtc-history] contexts deleted', {
+        traceId,
+        hasRole: Boolean(CONTEXT_ROLE),
+        elapsedMs: Date.now() - startedAt,
+      })
+      return jsonResponse({success: true, source: 'baidu-rtc-contexts'}, 200)
+    }
+
     const nowSeconds = Math.floor(Date.now() / 1000)
-    const body = await req.json().catch(() => ({}))
     const beginTime = Number.isFinite(Number(body.beginTime)) ? Number(body.beginTime) : nowSeconds - DEFAULT_RANGE_SECONDS
     const endTime = Number.isFinite(Number(body.endTime)) ? Number(body.endTime) : nowSeconds
     const pageNo = Math.max(1, Number.isFinite(Number(body.pageNo)) ? Number(body.pageNo) : 1)

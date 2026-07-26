@@ -1,0 +1,80 @@
+diff --git a/src/pages/chat/index.tsx b/src/pages/chat/index.tsx
+index c6b9467..1b4bac0 100644
+--- a/src/pages/chat/index.tsx
++++ b/src/pages/chat/index.tsx
+@@ -20,6 +20,7 @@ import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wecha
+ const VOICE_MESSAGE_PREFIX = '🎙 '
+ const VOICE_LONG_PRESS_MS = 120
+ const MIN_VOICE_RECORD_MS = 500
++const NATIVE_TAB_BAR_HEIGHT = 50
+ 
+ let sharedRtcAudioContext: any = null
+ /** 上下文已验证为 running 且 currentTime 推进才为 true */
+@@ -1070,21 +1071,33 @@ function ChatPage() {
+   // 消息列表底部留出输入栏高度 + 16px，保证内容不被输入框遮挡
+   const messageBottomPadding = inputBarHeight + 16
+ 
+-  // iOS 键盘弹起时 webview 不会被压缩，fixed 输入栏需手动上移；Android webview 会被压缩，fixed 元素自然位于键盘上方
+-  // iOS 上键盘高度事件包含底部 Touch Bar/Home Indicator 区域，上移时需减去该高度以贴合键盘
++  // iOS 键盘高度基于屏幕底部，而当前页面 viewport 已排除原生 TabBar。
++  // 手动上移时需同时扣除原生 TabBar 和底部安全区，避免输入栏悬空。
+   const systemInfo = useMemo(() => {
+     try { return Taro.getSystemInfoSync() } catch { return null }
+   }, [])
+   const platform = systemInfo?.platform || 'ios'
+-  const touchBarHeight = useMemo(() => {
++  const safeAreaBottom = useMemo(() => {
+     if (!systemInfo?.safeArea) return 0
+     return Math.max(0, systemInfo.screenHeight - systemInfo.safeArea.bottom)
+   }, [systemInfo])
+   const inputBarBottom = useMemo(() => {
+     if (keyboardHeight <= 0) return 0
+     if (platform !== 'ios') return 0
+-    return Math.max(0, keyboardHeight - touchBarHeight)
+-  }, [keyboardHeight, platform, touchBarHeight])
++    return Math.max(0, keyboardHeight - NATIVE_TAB_BAR_HEIGHT - safeAreaBottom)
++  }, [keyboardHeight, platform, safeAreaBottom])
++
++  useEffect(() => {
++    if (keyboardHeight <= 0) return
++    console.info('[chat-keyboard-layout]', {
++      keyboardHeight,
++      safeAreaBottom,
++      nativeTabBarHeight: NATIVE_TAB_BAR_HEIGHT,
++      inputBarBottom,
++      screenHeight: systemInfo?.screenHeight,
++      windowHeight: systemInfo?.windowHeight,
++    })
++  }, [inputBarBottom, keyboardHeight, safeAreaBottom, systemInfo])
+ 
+   const measureInputBarHeight = useCallback(() => {
+     if (!inputBarRef.current) return
+@@ -1352,12 +1365,15 @@ function ChatPage() {
+       <div
+         id="chat-input-bar"
+         ref={inputBarRef}
+-        className="flex-shrink-0 bg-card border-t border-border fixed left-0 right-0"
++        className="flex-shrink-0 fixed left-0 right-0"
+         style={{
+-          padding: '6px 12px',
++          padding: '8px 12px',
+           bottom: `${inputBarBottom}px`,
+           zIndex: 50,
+           transform: 'translateZ(0)',
++          backgroundColor: '#FFFFFF',
++          borderTop: '1px solid #E5E7EB',
++          boxShadow: keyboardHeight > 0 ? '0 -4px 12px rgba(0,0,0,0.08)' : 'none',
+         }}
+       >
+         {voiceState === 'active' ? (
+@@ -1463,8 +1479,8 @@ function ChatPage() {
+                 onClick={() => setVoiceMode(true)}>
+                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
+               </button>
+-              <div className="flex items-center bg-white"
+-                style={{flex: 1, minWidth: 0, borderRadius: '18px', border: '1px solid #E5E5E5', minHeight: '38px', padding: '0 10px', gap: '8px'}}>
++              <div className="flex items-center"
++                style={{flex: 1, minWidth: 0, borderRadius: '18px', border: '1px solid #E5E5E5', minHeight: '40px', padding: '0 10px', gap: '8px', backgroundColor: '#FFFFFF'}}>
+                 <Textarea
+                   className="flex-1 text-xl bg-transparent outline-none leading-normal"
+                   placeholder="输入健康问题..."

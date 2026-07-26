@@ -11,22 +11,30 @@ const home = read('src/pages/home/index.tsx')
 const chat = read('src/pages/chat/index.tsx')
 const familyEdit = read('src/pages/family-edit/index.tsx')
 const family = read('src/pages/family/index.tsx')
-const stats = read('src/pages/stats/index.tsx')
+const memberSwitcher = read('src/components/NutritionMemberSwitcher.tsx')
 const profile = read('src/pages/profile/index.tsx')
 const ble = read('src/utils/bleService.ts')
 const cloudInstructions = read('docs/cloud-agent-wechat-incremental/DEPLOY_AND_VERIFY.md')
 
-assert(home.includes('setCurrentIngredientImageUrl(localPreviewPath)'), 'Photo selection must create an immediate local preview')
-assert(home.includes('uploadedImageUrl || localPreviewPath'), 'Ingredient images must fall back to the local preview')
+assert(home.includes('setCurrentIngredientImage({preview_url: localPreviewPath})'), 'Photo selection must create an immediate local preview')
+assert(
+  home.includes('setCurrentIngredientImage({preview_url: localPreviewPath, ...(storedImage || {})})') &&
+    home.includes('图片仅在本机临时显示'),
+  'Ingredient images must fall back to the local preview',
+)
+assert(!home.includes('i-mdi-microphone') && !home.includes('getRecorderManager()') && !home.includes("'voice-ptt'"), 'Home photo recognition must not include short voice input controls or ASR')
 assert(home.includes('setConnectedDevice(devices[0] || null)'), 'The bound database device must populate shared state')
 assert(!home.includes('onDeviceNameUpdate:'), 'Broadcast names must not overwrite the bound device alias on home')
 
 assert(chat.includes('adjustPosition={false}') && chat.includes('onKeyboardHeightChange'), 'Chat input must follow the measured keyboard height')
 const voiceFooter = chat.slice(chat.indexOf('{voiceMode ? ('), chat.indexOf(') : (', chat.indexOf('{voiceMode ? (')))
+assert((voiceFooter.match(/<button\b/g) || []).length === 1, 'Voice input footer must only render the keyboard switch button beside the hold-to-talk area')
 assert(!voiceFooter.includes('i-mdi-robot'), 'Voice input footer must not render a robot action')
+assert(!chat.includes('VOICE_LONG_PRESS_MS') && chat.includes('voiceStopRequestedRef') && chat.includes('voiceRecordingAttemptRef'), 'Voice recording must start immediately and retain release requests while the recorder is starting')
+assert(chat.includes('onTouchCancel={handleVoiceTouchCancel}') && chat.includes("isVoiceStopping ? '正在发送...'"), 'Voice release and cancellation must expose immediate, distinct feedback')
 
 assert(familyEdit.includes("openType: 'chooseAvatar'") && familyEdit.includes('uploadWechatAvatar'), 'Family editor must upload custom avatars')
-assert(family.includes('getMemberAvatar(member)') && stats.includes('getMemberAvatar(member)'), 'Custom member avatars must render in management and switching views')
+assert(family.includes('getMemberAvatar(member)') && memberSwitcher.includes('getMemberAvatar(member)'), 'Custom member avatars must render in management and switching views')
 
 assert(ble.includes("SUPPORTED_BLE_DEVICE_NAME = 'Bai'") && ble.includes('isSupportedBLEDeviceName(name)'), 'BLE discovery must only expose supported Bai devices')
 assert(ble.includes('device.RSSI > STRONG_BLE_SIGNAL_RSSI'), 'Automatic recommendation must require a strong supported device')
