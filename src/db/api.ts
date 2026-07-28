@@ -1,5 +1,10 @@
 // 数据库API封装
 import {supabase} from '@/client/supabase'
+import {
+  getNutritionPeriodRange,
+  getShanghaiDateKey,
+  toShanghaiRangeIso,
+} from '@/utils/nutritionDates'
 import type {
   Profile, FamilyMember, Device,
   WeighingRecord, ChatSession, ChatMessage,
@@ -315,6 +320,22 @@ export async function getRtcHistoryGroups(options?: {
   return Array.isArray(data?.groups) ? data.groups : []
 }
 
+export async function deleteRtcContexts(): Promise<void> {
+  const {data, error} = await supabase.functions.invoke<{
+    success?: boolean
+    error?: string
+  }>('brtc-history', {
+    body: {action: 'delete-contexts'}
+  })
+  if (error) {
+    console.error('deleteRtcContexts error:', error)
+    throw new Error(error.message || 'BRTC context delete request failed')
+  }
+  if (data?.error || !data?.success) {
+    throw new Error(data?.error || 'BRTC context delete failed')
+  }
+}
+
 // ===== Reminder Settings API =====
 export async function getReminderSettings(userId: string): Promise<ReminderSettings | null> {
   const {data, error} = await supabase
@@ -336,32 +357,52 @@ export async function upsertReminderSettings(userId: string, settings: Partial<R
 
 // ===== Nutrition Stats API =====
 export async function getNutritionStats(userId: string, memberId: string | null, period: 'day' | 'week' | 'month'): Promise<NutritionStats[]> {
-  const now = new Date()
-  let startDate: Date
-  if (period === 'day') {
-    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  } else if (period === 'week') {
-    const day = now.getDay()
-    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day)
-  } else {
-    startDate = new Date(now.getFullYear(), now.getMonth(), 1)
+  const {startDate, endDate} = getNutritionPeriodRange(period)
+  return getNutritionStatsByRange(userId, memberId, startDate, endDate)
+}
+
+export async function getNutritionStatsByRange(
+  userId: string,
+  memberId: string | null,
+  startDate: string,
+  endDate: string,
+): Promise<NutritionStats[]> {
+  if (startDate > endDate) return []
+
+  const {startIso, endExclusiveIso} = toShanghaiRangeIso(startDate, endDate)
+  const rows: Array<{
+    created_at: string
+    total_calories: number | null
+    protein: number | null
+    fat: number | null
+    carbs: number | null
+  }> = []
+  const pageSize = 1000
+
+  for (let offset = 0; ; offset += pageSize) {
+    let query = supabase
+      .from('weighing_records')
+      .select('created_at, total_calories, protein, fat, carbs')
+      .eq('user_id', userId)
+      .gte('created_at', startIso)
+      .lt('created_at', endExclusiveIso)
+      .order('created_at', {ascending: true})
+      .range(offset, offset + pageSize - 1)
+    if (memberId) query = query.eq('member_id', memberId)
+
+    const {data, error} = await query
+    if (error) {
+      console.error('getNutritionStatsByRange error:', error)
+      return []
+    }
+    rows.push(...(data || []))
+    if (!data || data.length < pageSize) break
   }
 
-  let query = supabase
-    .from('weighing_records')
-    .select('created_at, total_calories, protein, fat, carbs')
-    .eq('user_id', userId)
-    .gte('created_at', startDate.toISOString())
-    .order('created_at', {ascending: true})
-  if (memberId) query = query.eq('member_id', memberId)
-
-  const {data, error} = await query
-  if (error) console.error('getNutritionStats error:', error)
-
-  // 按日聚合
+  // created_at 存储为 UTC，展示与统计统一归入上海自然日。
   const grouped: Record<string, NutritionStats> = {}
-  for (const row of data || []) {
-    const date = row.created_at.split('T')[0]
+  for (const row of rows) {
+    const date = getShanghaiDateKey(row.created_at)
     if (!grouped[date]) {
       grouped[date] = {date, total_calories: 0, protein: 0, fat: 0, carbs: 0, records_count: 0}
     }

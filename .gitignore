@@ -4,6 +4,8 @@ deploy_versions/
 .rn_temp/
 node_modules/
 .swc
+__pycache__/
+*.py[cod]
 
 # Logs
 logs
@@ -46,4 +48,5 @@ history/*.json
 .vite_cache
 /.skills
 /tasks
+/tmp/
 package.json.[0-9]*

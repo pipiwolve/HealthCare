@@ -98,12 +98,12 @@ assert(
 
 assert(
   chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
-    chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
+  chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
     chatSource.includes('createAiWebSocket()') &&
     wsSource.includes('export function createAiWebSocket()') &&
-    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
-    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
-  'push-to-talk flows should use RTC ASR control commands without reusing the chat reply socket'
+    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
+    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
+  'chat push-to-talk should use an independent RTC ASR socket while the home page remains voice-free'
 )
 
 assert(
@@ -115,18 +115,19 @@ assert(
 )
 
 assert(
-  chatSource.includes('VOICE_LONG_PRESS_MS') &&
-    chatSource.includes('VOICE_LONG_PRESS_MS = 120') &&
+  !chatSource.includes('VOICE_LONG_PRESS_MS') &&
     chatSource.includes('MIN_VOICE_RECORD_MS = 500') &&
-    chatSource.includes('voicePressTimerRef') &&
     chatSource.includes('voicePressingRef') &&
+    chatSource.includes('voiceStopRequestedRef') &&
+    chatSource.includes('voiceRecordingAttemptRef') &&
     chatSource.includes('setIsVoicePressing(true)') &&
+    chatSource.includes('void startVoiceRecording()') &&
     chatSource.includes('startVoiceRecording') &&
     chatSource.includes('interruptActiveChatResponse') &&
     chatSource.includes('AI 回复已被用户语音输入打断') &&
     !chatSource.includes('if (isLoading || isUploadingImage) return') &&
     !chatSource.includes('handleVoiceMicToggle'),
-  'push-to-talk should start after a short hold and interrupt active AI/TTS output instead of being blocked by isLoading'
+  'push-to-talk should start immediately, retain release requests during startup, and interrupt active AI/TTS output'
 )
 
 assert(
@@ -241,11 +242,16 @@ assert(
 
 assert(
   chatSource.includes('getRtcHistoryGroups') &&
-    chatSource.includes('rtcHistoryGroups.map') &&
+    chatSource.includes('groupRtcHistoryByDate') &&
+    chatSource.includes('rtcHistoryDateGroups.map') &&
     chatSource.includes('handleSelectRtcHistory') &&
-    chatSource.includes('最近 10 个历史对话') &&
-    chatSource.includes('RTC 云端记录，按 30 分钟自动分段'),
-  'chat history drawer should render the latest 10 grouped RTC cloud history conversations'
+    chatSource.includes('最近 30 天') &&
+    chatSource.includes('RTC 云端记录，按日期整理') &&
+    chatSource.includes('expandedRtcDateKeys') &&
+    chatSource.includes('px-4 pt-3 pb-4 flex-shrink-0') &&
+    !chatSource.includes('px-4 pt-3 pb-safe-4 flex-shrink-0') &&
+    !chatSource.includes('px-4 pt-3 pb-tabbar flex-shrink-0'),
+  'chat history drawer should render date-grouped RTC cloud history conversations'
 )
 
 assert(

@@ -3,6 +3,7 @@
 import {Image, Textarea} from '@tarojs/components'
 import Taro, {useDidHide, useDidShow} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
+import {HealthAdvisorMark} from '@/components/HealthMarks'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
@@ -13,11 +14,12 @@ import {useAppStore} from '@/store/appStore'
 import {buildChatPrompt} from '@/utils/aiPromptHelpers'
 import {buildFamilyHealthContext} from '@/utils/allergenUtils'
 import {normalizeAiMarkdown} from '@/utils/markdownText'
+import {getShanghaiDateKey, groupRtcHistoryByDate} from '@/utils/rtcHistory'
 import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
 
 const VOICE_MESSAGE_PREFIX = '🎙 '
-const VOICE_LONG_PRESS_MS = 120
 const MIN_VOICE_RECORD_MS = 500
+const VOICE_STOP_TIMEOUT_MS = 3000
 
 let sharedRtcAudioContext: any = null
 let sharedRtcAudioUnlockLogged = false
@@ -130,6 +132,7 @@ function ChatPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [showDrawer, setShowDrawer] = useState(false)
   const [rtcHistoryGroups, setRtcHistoryGroups] = useState<RtcHistoryGroup[]>([])
+  const [expandedRtcDateKeys, setExpandedRtcDateKeys] = useState<string[]>([])
   const [rtcHistoryLoading, setRtcHistoryLoading] = useState(false)
   const [rtcHistoryError, setRtcHistoryError] = useState('')
   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
@@ -146,12 +149,21 @@ function ChatPage() {
   const interruptedChatWsRef = useRef<Set<ReturnType<typeof getAiWebSocket>>>(new Set())
   const voiceTouchStartYRef = useRef(0)
   const voiceCancelRef = useRef(false)
-  const voicePressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePressingRef = useRef(false)
+  const voiceStopRequestedRef = useRef(false)
   const voiceRecordStartingRef = useRef(false)
   const voiceRecordStartedAtRef = useRef(0)
+  const voiceRecordingAttemptRef = useRef(0)
+  const voiceStopFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const recordPermissionRequestRef = useRef<Promise<boolean> | null>(null)
   const [voiceMode, setVoiceMode] = useState(false)
   const voiceSessionRef = useRef<ChatSession | null>(null)
+
+  const resetVoiceCaptureVisualState = useCallback(() => {
+    setIsRecording(false)
+    setIsVoicePressing(false)
+    setIsRecordingCanceling(false)
+  }, [])
 
   const loadRtcHistory = useCallback(async () => {
     if (!user) return
@@ -161,6 +173,12 @@ function ChatPage() {
     try {
       const data = await getRtcHistoryGroups()
       setRtcHistoryGroups(data)
+      const dateGroups = groupRtcHistoryByDate(data)
+      setExpandedRtcDateKeys(current => {
+        const availableKeys = new Set(dateGroups.map(group => group.dateKey))
+        const retainedKeys = current.filter(key => availableKeys.has(key))
+        return retainedKeys.length > 0 ? retainedKeys : (dateGroups[0] ? [dateGroups[0].dateKey] : [])
+      })
     } catch (err: any) {
       console.error('加载 RTC 云端历史失败:', err?.message || err)
       setRtcHistoryError(err?.message || 'RTC 云端历史加载失败')
@@ -182,7 +200,10 @@ function ChatPage() {
 
   useEffect(() => {
     return () => {
-      if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
+      voiceRecordingAttemptRef.current += 1
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
+      recorderManager.current?.stop()
       audioContextRef.current?.destroy()
       audioContextRef.current = null
       liveAudioPlayerRef.current?.stop()
@@ -582,6 +603,8 @@ function ChatPage() {
   }, [activeSession, activeMember, user])
 
   const ensureRecordPermission = useCallback((): Promise<boolean> => {
+    if (recordPermissionRequestRef.current) return recordPermissionRequestRef.current
+
     const showSettingGuide = () => {
       Taro.showModal({
         title: '需要麦克风权限',
@@ -592,7 +615,7 @@ function ChatPage() {
       })
     }
 
-    return new Promise((resolve) => {
+    const request = new Promise<boolean>((resolve) => {
       Taro.getSetting({
         success: (settingRes: any) => {
           const status = settingRes?.authSetting?.['scope.record']
@@ -624,39 +647,67 @@ function ChatPage() {
         }
       })
     })
+    recordPermissionRequestRef.current = request
+    const clearRequest = () => {
+      if (recordPermissionRequestRef.current === request) recordPermissionRequestRef.current = null
+    }
+    void request.then(clearRequest, clearRequest)
+    return request
   }, [])
 
+  const handleEnterVoiceMode = useCallback(() => {
+    setVoiceMode(true)
+    void ensureRecordPermission()
+  }, [ensureRecordPermission])
+
   const startVoiceRecording = useCallback(async () => {
-    if (isRecording || voiceRecordStartingRef.current) return
+    if (isRecording || voiceRecordStartingRef.current || voiceStopRequestedRef.current) return
     voiceRecordStartingRef.current = true
+    voiceStopRequestedRef.current = false
     if (!await ensureRecordPermission()) {
       voiceRecordStartingRef.current = false
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
+      resetVoiceCaptureVisualState()
       return
     }
-    if (!voicePressingRef.current) {
+    if (!voicePressingRef.current || voiceStopRequestedRef.current) {
       voiceRecordStartingRef.current = false
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
+      resetVoiceCaptureVisualState()
       return
     }
 
     const doStartRecord = () => {
       const rm = Taro.getRecorderManager()
+      const attemptId = voiceRecordingAttemptRef.current + 1
+      voiceRecordingAttemptRef.current = attemptId
       recorderManager.current = rm
       voiceCancelRef.current = false
       setIsRecordingCanceling(false)
       rm.onStart(() => {
+        if (voiceRecordingAttemptRef.current !== attemptId) return
         voiceRecordStartingRef.current = false
-        if (!voicePressingRef.current) {
-          recorderManager.current?.stop()
+        voiceRecordStartedAtRef.current = Date.now()
+        if (!voicePressingRef.current || voiceStopRequestedRef.current) {
+          rm.stop()
           return
         }
-        voiceRecordStartedAtRef.current = Date.now()
         setIsRecording(true)
       })
       rm.onStop(async (res) => {
+        if (voiceRecordingAttemptRef.current !== attemptId) return
+        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+        voiceStopFallbackTimerRef.current = null
         voiceRecordStartingRef.current = false
-        setIsRecording(false)
-        setIsVoicePressing(false)
-        setIsRecordingCanceling(false)
+        voiceStopRequestedRef.current = false
+        recorderManager.current = null
+        resetVoiceCaptureVisualState()
         if (voiceCancelRef.current) {
           voiceCancelRef.current = false
           voiceRecordStartedAtRef.current = 0
@@ -718,46 +769,76 @@ function ChatPage() {
           ws.disconnect()
         }
       })
+      rm.onError(() => {
+        if (voiceRecordingAttemptRef.current !== attemptId) return
+        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+        voiceStopFallbackTimerRef.current = null
+        voiceRecordStartingRef.current = false
+        voiceStopRequestedRef.current = false
+        voiceRecordStartedAtRef.current = 0
+        recorderManager.current = null
+        resetVoiceCaptureVisualState()
+        Taro.showToast({title: '录音失败，请重试', icon: 'none'})
+      })
       rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
     }
 
     doStartRecord()
-  }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
+  }, [ensureRecordPermission, ensureSession, isRecording, resetVoiceCaptureVisualState, sendMessage, user])
 
   const handleVoiceTouchStart = useCallback((event: any) => {
+    if (voicePressingRef.current || voiceRecordStartingRef.current || voiceStopRequestedRef.current || isRecording) return
     unlockRtcAudioPlayback('voice-touch')
     if (isLoading) interruptActiveChatResponse('voice-touch')
     voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
     voiceCancelRef.current = false
+    voiceStopRequestedRef.current = false
     voicePressingRef.current = true
     setIsVoicePressing(true)
     setIsRecordingCanceling(false)
-    if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
-    voicePressTimerRef.current = setTimeout(() => {
-      voicePressTimerRef.current = null
-      void startVoiceRecording()
-    }, VOICE_LONG_PRESS_MS)
-  }, [interruptActiveChatResponse, isLoading, startVoiceRecording])
+    void startVoiceRecording()
+  }, [interruptActiveChatResponse, isLoading, isRecording, startVoiceRecording])
 
   const handleVoiceTouchMove = useCallback((event: any) => {
-    if (!isRecording) return
+    if (!voicePressingRef.current) return
     const currentY = event?.touches?.[0]?.clientY || voiceTouchStartYRef.current
     const shouldCancel = voiceTouchStartYRef.current - currentY > 48
     voiceCancelRef.current = shouldCancel
     setIsRecordingCanceling(shouldCancel)
-  }, [isRecording])
+  }, [])
 
   const handleVoiceTouchEnd = useCallback(() => {
+    if (voiceStopRequestedRef.current) return
+    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
     voicePressingRef.current = false
-    setIsVoicePressing(false)
-    if (voicePressTimerRef.current) {
-      clearTimeout(voicePressTimerRef.current)
-      voicePressTimerRef.current = null
-      setIsRecordingCanceling(false)
-      return
+    voiceStopRequestedRef.current = true
+    resetVoiceCaptureVisualState()
+    try {
+      recorderManager.current?.stop()
+    } catch (error) {
+      console.warn('停止录音失败，等待超时兜底:', error)
     }
-    recorderManager.current?.stop()
-  }, [])
+    if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+    voiceStopFallbackTimerRef.current = setTimeout(() => {
+      voiceStopFallbackTimerRef.current = null
+      if (!voiceStopRequestedRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
+      try { recorderManager.current?.stop() } catch {}
+      voiceRecordingAttemptRef.current += 1
+      voiceRecordStartingRef.current = false
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      voiceRecordStartedAtRef.current = 0
+      recorderManager.current = null
+      resetVoiceCaptureVisualState()
+      Taro.showToast({title: '录音停止超时，请重试', icon: 'none'})
+    }, VOICE_STOP_TIMEOUT_MS)
+  }, [resetVoiceCaptureVisualState])
+
+  const handleVoiceTouchCancel = useCallback(() => {
+    voiceCancelRef.current = true
+    setIsRecordingCanceling(true)
+    handleVoiceTouchEnd()
+  }, [handleVoiceTouchEnd])
 
   const handleSend = () => {
     if (isLoading || !inputText.trim()) return
@@ -781,16 +862,17 @@ function ChatPage() {
   const formatRtcClock = (seconds: number) => new Date(seconds * 1000).toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: 'Asia/Shanghai',
   })
   const formatRtcGroupTime = (group: RtcHistoryGroup) => {
-    const start = new Date(group.startTime * 1000)
-    const end = new Date(group.endTime * 1000)
-    const date = end.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})
-    if (start.toDateString() === end.toDateString()) {
-      return `${date} ${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
+    const startDate = getShanghaiDateKey(group.startTime)
+    const endDate = getShanghaiDateKey(group.endTime)
+    if (startDate === endDate) {
+      return `${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
     }
-    return `${date} 截止 ${formatRtcClock(group.endTime)}`
+    return `${endDate.slice(5).replace('-', '/')} 截止 ${formatRtcClock(group.endTime)}`
   }
+  const rtcHistoryDateGroups = useMemo(() => groupRtcHistoryByDate(rtcHistoryGroups), [rtcHistoryGroups])
   const hasAnyHistory = rtcHistoryGroups.length > 0
   const isVoiceButtonActive = isRecording || isVoicePressing
 
@@ -869,7 +951,7 @@ function ChatPage() {
         {messages.length === 0 ? (
           <div className="flex flex-col items-center pt-8 gap-3">
             <div className="w-16 h-16 bg-gradient-primary rounded-3xl flex items-center justify-center">
-              <div className="i-mdi-robot-happy text-4xl text-white" />
+              <HealthAdvisorMark size={40} className="text-white" />
             </div>
             <p className="text-2xl font-semibold text-foreground">AI健康顾问</p>
             <p className="text-xl text-muted-foreground text-center px-6">有任何饮食健康问题都可以向我咨询</p>
@@ -902,7 +984,7 @@ function ChatPage() {
               <div key={msg.id} className={`flex items-end gap-2 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {msg.role === 'assistant' && (
                   <div className="w-8 h-8 bg-gradient-primary rounded-xl flex items-center justify-center flex-shrink-0 mb-1">
-                    <div className="i-mdi-robot text-xl text-white" />
+                    <HealthAdvisorMark size={20} className="text-white" />
                   </div>
                 )}
                 <div className="flex flex-col items-start" style={{maxWidth: '75%'}}>
@@ -992,7 +1074,7 @@ function ChatPage() {
             {isLoading && !hasStreamingAiMessage && (
               <div className="flex items-end gap-2 justify-start">
                 <div className="w-8 h-8 bg-gradient-primary rounded-xl flex items-center justify-center flex-shrink-0 mb-1">
-                  <div className="i-mdi-robot text-xl text-white" />
+                  <HealthAdvisorMark size={20} className="text-white" />
                 </div>
                 <div className="rounded-2xl rounded-bl-[4px] px-4 py-4" style={{backgroundColor: '#F2F2F2'}}>
                   <div className="flex gap-1">
@@ -1039,7 +1121,7 @@ function ChatPage() {
               }}
               onTouchStart={handleVoiceTouchStart}
               onTouchMove={handleVoiceTouchMove}
-              onTouchCancel={handleVoiceTouchEnd}
+              onTouchCancel={handleVoiceTouchCancel}
               onTouchEnd={handleVoiceTouchEnd}
             >
               {isVoiceButtonActive ? (
@@ -1062,7 +1144,6 @@ function ChatPage() {
                   </>
                 )}
                 <div className="flex items-center gap-2">
-                    <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
                     <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
                       {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
                     </span>
@@ -1076,7 +1157,6 @@ function ChatPage() {
                 </>
               ) : (
                 <div className="flex items-center gap-2">
-                  <div className="i-mdi-microphone text-xl text-muted-foreground" />
                   <span className="text-xl text-muted-foreground">按住说话</span>
                 </div>
               )}
@@ -1087,7 +1167,7 @@ function ChatPage() {
               <button type="button" className="flex-shrink-0 flex items-center justify-center"
                 style={{width: '44px', height: '44px'}}
                 onTouchStart={() => unlockRtcAudioPlayback('voice-mode-touch')}
-                onClick={() => setVoiceMode(true)}>
+                onClick={handleEnterVoiceMode}>
                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
               </button>
               <div className="flex items-center bg-white"
@@ -1144,7 +1224,7 @@ function ChatPage() {
             <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
               <div>
                 <p className="text-2xl font-semibold text-foreground">对话历史</p>
-                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按 30 分钟自动分段</p>
+                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按日期整理</p>
               </div>
               <div className="flex items-center gap-4">
                 <button
@@ -1185,36 +1265,60 @@ function ChatPage() {
                 </div>
               ) : (
                 <>
-                  {rtcHistoryGroups.length > 0 && (
+                  {rtcHistoryDateGroups.length > 0 && (
                     <div>
                       <div className="px-4 py-2 bg-secondary/60 border-b border-border">
-                        <p className="text-xl font-semibold text-foreground">最近 10 个历史对话</p>
+                        <p className="text-xl font-semibold text-foreground">最近 30 天</p>
                       </div>
-                      {rtcHistoryGroups.map(group => (
-                  <div
-                    key={group.id}
-                    className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
-                    style={{minHeight: '56px'}}
-                    onClick={() => handleSelectRtcHistory(group)}
-                  >
-                    <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                        {group.title}
-                      </p>
-                      <p className="text-xl text-muted-foreground">
-                        {formatRtcGroupTime(group)}
-                      </p>
-                    </div>
-                    <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
-                  </div>
-                      ))}
+                      {rtcHistoryDateGroups.map(dateGroup => {
+                        const isExpanded = expandedRtcDateKeys.includes(dateGroup.dateKey)
+                        return (
+                          <div key={dateGroup.id}>
+                            <button
+                              type="button"
+                              className="w-full flex items-center justify-between gap-3 px-4 bg-white border-b border-border active:bg-secondary/40"
+                              style={{minHeight: '48px'}}
+                              onClick={() => setExpandedRtcDateKeys(current => (
+                                current.includes(dateGroup.dateKey)
+                                  ? current.filter(key => key !== dateGroup.dateKey)
+                                  : [...current, dateGroup.dateKey]
+                              ))}
+                            >
+                              <span className="flex items-center gap-2 min-w-0">
+                                <span className="i-mdi-calendar-blank-outline text-xl text-muted-foreground flex-shrink-0" />
+                                <span className="text-xl font-semibold text-foreground">{dateGroup.label}</span>
+                                <span className="text-xl text-muted-foreground">{dateGroup.groups.length} 个会话</span>
+                              </span>
+                              <span className={`${isExpanded ? 'i-mdi-chevron-up' : 'i-mdi-chevron-down'} text-2xl text-muted-foreground flex-shrink-0`} />
+                            </button>
+                            {isExpanded && dateGroup.groups.map(group => (
+                              <div
+                                key={group.id}
+                                className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
+                                style={{minHeight: '56px', paddingLeft: '36px'}}
+                                onClick={() => handleSelectRtcHistory(group)}
+                              >
+                                <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                    {group.title}
+                                  </p>
+                                  <p className="text-xl text-muted-foreground">
+                                    {formatRtcGroupTime(group)}
+                                  </p>
+                                </div>
+                                <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
                 </>
               )}
             </div>
-            <div className="px-4 pt-3 pb-tabbar flex-shrink-0">
+            <div className="px-4 pt-3 pb-4 flex-shrink-0">
               <button
                 type="button"
                 className="w-full flex items-center justify-center leading-none gap-2 text-xl font-semibold bg-gradient-primary text-white rounded-xl"

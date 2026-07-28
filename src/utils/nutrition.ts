@@ -7,6 +7,7 @@ export type NutritionValues = {
   protein: number | null
   fat: number | null
   carbs: number | null
+  sugar: number | null
 }
 
 const emptyNutrition: NutritionValues = {
@@ -14,6 +15,7 @@ const emptyNutrition: NutritionValues = {
   protein: null,
   fat: null,
   carbs: null,
+  sugar: null,
 }
 
 export function extractNutritionValues(text: string): NutritionValues {
@@ -26,6 +28,7 @@ export function extractNutritionValues(text: string): NutritionValues {
     protein: firstFinite(fromJson.protein, fromText.protein),
     fat: firstFinite(fromJson.fat, fromText.fat),
     carbs: firstFinite(fromJson.carbs, fromText.carbs),
+    sugar: firstFinite(fromJson.sugar, fromText.sugar),
   }
 }
 
@@ -41,6 +44,7 @@ function parseNutritionJson(text: string): NutritionValues {
         protein: toNumber(data.protein ?? data['蛋白质'] ?? data['蛋白'] ?? null),
         fat: toNumber(data.fat ?? data['脂肪'] ?? null),
         carbs: toNumber(data.carbs ?? data.carbohydrate ?? data.carbohydrates ?? data['碳水'] ?? data['碳水化合物'] ?? null),
+        sugar: toNumber(data.sugar ?? data.sugars ?? data.total_sugar ?? data.added_sugar ?? data['糖分'] ?? data['总糖'] ?? data['添加糖'] ?? null),
       }
     } catch {}
   }
@@ -55,6 +59,7 @@ function parseNutritionText(text: string): NutritionValues {
     protein: findLineValue(lines, ['蛋白质', '蛋白', 'protein'], ['g', '克']),
     fat: findLineValue(lines, ['脂肪', '脂坊', 'fat'], ['g', '克']),
     carbs: findLineValue(lines, ['碳水化合物', '碳水', 'carbs', 'carbohydrate'], ['g', '克']),
+    sugar: findLineValue(lines, ['糖分', '总糖', '添加糖', '游离糖', 'sugar', 'added sugar'], ['g', '克']),
   }
 }
 

@@ -1,0 +1,2453 @@
+scripts/checkChatStreaming.mjs                |  30 ++--
+ scripts/checkRtcHistoryHelpers.mjs            |  38 ++++-
+ src/db/api.ts                                 |  85 ++++++++---
+ src/db/types.ts                               |   5 +-
+ src/pages/chat/index.tsx                      | 173 ++++++++++++++--------
+ src/pages/home/index.tsx                      | 202 ++++++++++----------------
+ src/pages/personal-info/index.tsx             |  38 +++--
+ src/utils/rtcHistory.ts                       |  53 +++++++
+ supabase/config.toml                          |   3 +
+ supabase/functions/brtc-history/index.ts      |  61 +++++++-
+ supabase/functions/upload-food-image/index.ts | 151 ++++++++++---------
+ 11 files changed, 537 insertions(+), 302 deletions(-)
+
+diff --git a/scripts/checkChatStreaming.mjs b/scripts/checkChatStreaming.mjs
+index 7912983c..afab27f6 100644
+--- a/scripts/checkChatStreaming.mjs
++++ b/scripts/checkChatStreaming.mjs
+@@ -98,12 +98,12 @@ assert(
+ 
+ assert(
+   chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
+-    chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
++  chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
+     chatSource.includes('createAiWebSocket()') &&
+     wsSource.includes('export function createAiWebSocket()') &&
+-    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
+-    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
+-  'push-to-talk flows should use RTC ASR control commands without reusing the chat reply socket'
++    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
++    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
++  'chat push-to-talk should use an independent RTC ASR socket while the home page remains voice-free'
+ )
+ 
+ assert(
+@@ -115,18 +115,19 @@ assert(
+ )
+ 
+ assert(
+-  chatSource.includes('VOICE_LONG_PRESS_MS') &&
+-    chatSource.includes('VOICE_LONG_PRESS_MS = 120') &&
++  !chatSource.includes('VOICE_LONG_PRESS_MS') &&
+     chatSource.includes('MIN_VOICE_RECORD_MS = 500') &&
+-    chatSource.includes('voicePressTimerRef') &&
+     chatSource.includes('voicePressingRef') &&
++    chatSource.includes('voiceStopRequestedRef') &&
++    chatSource.includes('voiceRecordingAttemptRef') &&
+     chatSource.includes('setIsVoicePressing(true)') &&
++    chatSource.includes('void startVoiceRecording()') &&
+     chatSource.includes('startVoiceRecording') &&
+     chatSource.includes('interruptActiveChatResponse') &&
+     chatSource.includes('AI 回复已被用户语音输入打断') &&
+     !chatSource.includes('if (isLoading || isUploadingImage) return') &&
+     !chatSource.includes('handleVoiceMicToggle'),
+-  'push-to-talk should start after a short hold and interrupt active AI/TTS output instead of being blocked by isLoading'
++  'push-to-talk should start immediately, retain release requests during startup, and interrupt active AI/TTS output'
+ )
+ 
+ assert(
+@@ -241,11 +242,16 @@ assert(
+ 
+ assert(
+   chatSource.includes('getRtcHistoryGroups') &&
+-    chatSource.includes('rtcHistoryGroups.map') &&
++    chatSource.includes('groupRtcHistoryByDate') &&
++    chatSource.includes('rtcHistoryDateGroups.map') &&
+     chatSource.includes('handleSelectRtcHistory') &&
+-    chatSource.includes('最近 10 个历史对话') &&
+-    chatSource.includes('RTC 云端记录，按 30 分钟自动分段'),
+-  'chat history drawer should render the latest 10 grouped RTC cloud history conversations'
++    chatSource.includes('最近 30 天') &&
++    chatSource.includes('RTC 云端记录，按日期整理') &&
++    chatSource.includes('expandedRtcDateKeys') &&
++    chatSource.includes('px-4 pt-3 pb-4 flex-shrink-0') &&
++    !chatSource.includes('px-4 pt-3 pb-safe-4 flex-shrink-0') &&
++    !chatSource.includes('px-4 pt-3 pb-tabbar flex-shrink-0'),
++  'chat history drawer should render date-grouped RTC cloud history conversations'
+ )
+ 
+ assert(
+diff --git a/scripts/checkRtcHistoryHelpers.mjs b/scripts/checkRtcHistoryHelpers.mjs
+index ea6a5b1b..5bb87131 100644
+--- a/scripts/checkRtcHistoryHelpers.mjs
++++ b/scripts/checkRtcHistoryHelpers.mjs
+@@ -39,6 +39,27 @@ assert(groups[0].messages[0].content === '早餐怎么吃比较健康？', 'RTC
+ assert(groups[0].messages[1].role === 'assistant', 'ANSWER rows map to assistant messages')
+ assert(groups[1].id === 'rtc-3600-3600', 'group id should be stable from start and end timestamps')
+ 
++const dateGroups = helpers.groupRtcHistoryByDate([
++  {
++    id: 'late-night',
++    title: '跨午夜会话',
++    startTime: Date.parse('2026-07-26T15:55:00Z') / 1000,
++    endTime: Date.parse('2026-07-26T16:05:00Z') / 1000,
++    messages: [],
++  },
++  {
++    id: 'next-day',
++    title: '第二天会话',
++    startTime: Date.parse('2026-07-27T02:00:00Z') / 1000,
++    endTime: Date.parse('2026-07-27T02:05:00Z') / 1000,
++    messages: [],
++  },
++], Date.parse('2026-07-27T04:00:00Z') / 1000)
++assert(dateGroups.length === 2, 'RTC groups should be organized into Shanghai calendar dates')
++assert(dateGroups[0].label === '今天', 'the latest Shanghai date should be labeled today')
++assert(dateGroups[1].label === '昨天', 'the previous Shanghai date should be labeled yesterday')
++assert(dateGroups[1].groups[0].id === 'late-night', 'cross-midnight sessions should use their first message date')
++
+ const halfWidthMarker = helpers.groupRtcDialogueRows([
+   {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。\\n\\n用户问题: 今天适合吃什么水果？'}
+ ])
+@@ -91,11 +112,26 @@ assert(
+   'brtc-history edge function must not trust a client-supplied userId'
+ )
+ 
++assert(
++  edgeSource.includes("body.action === 'delete-contexts'") &&
++    edgeSource.includes("const path = '/api/v1/contexts'") &&
++    edgeSource.includes("method: 'DELETE'") &&
++    edgeSource.includes('JSON.stringify(deleteBody)') &&
++    edgeSource.includes('deleteBody: Record<string, string> = {appId: APPID, userId}'),
++  'brtc-history should delete contexts with the trusted server-side appId and authenticated userId'
++)
++
++assert(
++  apiSource.includes('export async function deleteRtcContexts') &&
++    apiSource.includes("body: {action: 'delete-contexts'}"),
++  'miniapp API should expose the authenticated BRTC context deletion action'
++)
++
+ assert(
+   edgeSource.includes('DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60') &&
+     edgeSource.includes('DEFAULT_PAGE_SIZE = 100') &&
+     edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60') &&
+-    edgeSource.includes('MAX_HISTORY_GROUPS = 10') &&
++    edgeSource.includes('MAX_HISTORY_GROUPS = DEFAULT_PAGE_SIZE') &&
+     edgeSource.includes('normalizeQuestionText') &&
+     edgeSource.includes('skipAnswerForHiddenQuestion') &&
+     edgeSource.includes('请分析以下食材的营养成分') &&
+diff --git a/src/db/api.ts b/src/db/api.ts
+index c2c8312f..06612b71 100644
+--- a/src/db/api.ts
++++ b/src/db/api.ts
+@@ -1,5 +1,10 @@
+ // 数据库API封装
+ import {supabase} from '@/client/supabase'
++import {
++  getNutritionPeriodRange,
++  getShanghaiDateKey,
++  toShanghaiRangeIso,
++} from '@/utils/nutritionDates'
+ import type {
+   Profile, FamilyMember, Device,
+   WeighingRecord, ChatSession, ChatMessage,
+@@ -315,6 +320,22 @@ export async function getRtcHistoryGroups(options?: {
+   return Array.isArray(data?.groups) ? data.groups : []
+ }
+ 
++export async function deleteRtcContexts(): Promise<void> {
++  const {data, error} = await supabase.functions.invoke<{
++    success?: boolean
++    error?: string
++  }>('brtc-history', {
++    body: {action: 'delete-contexts'}
++  })
++  if (error) {
++    console.error('deleteRtcContexts error:', error)
++    throw new Error(error.message || 'BRTC context delete request failed')
++  }
++  if (data?.error || !data?.success) {
++    throw new Error(data?.error || 'BRTC context delete failed')
++  }
++}
++
+ // ===== Reminder Settings API =====
+ export async function getReminderSettings(userId: string): Promise<ReminderSettings | null> {
+   const {data, error} = await supabase
+@@ -336,32 +357,52 @@ export async function upsertReminderSettings(userId: string, settings: Partial<R
+ 
+ // ===== Nutrition Stats API =====
+ export async function getNutritionStats(userId: string, memberId: string | null, period: 'day' | 'week' | 'month'): Promise<NutritionStats[]> {
+-  const now = new Date()
+-  let startDate: Date
+-  if (period === 'day') {
+-    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+-  } else if (period === 'week') {
+-    const day = now.getDay()
+-    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day)
+-  } else {
+-    startDate = new Date(now.getFullYear(), now.getMonth(), 1)
+-  }
++  const {startDate, endDate} = getNutritionPeriodRange(period)
++  return getNutritionStatsByRange(userId, memberId, startDate, endDate)
++}
+ 
+-  let query = supabase
+-    .from('weighing_records')
+-    .select('created_at, total_calories, protein, fat, carbs')
+-    .eq('user_id', userId)
+-    .gte('created_at', startDate.toISOString())
+-    .order('created_at', {ascending: true})
+-  if (memberId) query = query.eq('member_id', memberId)
++export async function getNutritionStatsByRange(
++  userId: string,
++  memberId: string | null,
++  startDate: string,
++  endDate: string,
++): Promise<NutritionStats[]> {
++  if (startDate > endDate) return []
+ 
+-  const {data, error} = await query
+-  if (error) console.error('getNutritionStats error:', error)
++  const {startIso, endExclusiveIso} = toShanghaiRangeIso(startDate, endDate)
++  const rows: Array<{
++    created_at: string
++    total_calories: number | null
++    protein: number | null
++    fat: number | null
++    carbs: number | null
++  }> = []
++  const pageSize = 1000
++
++  for (let offset = 0; ; offset += pageSize) {
++    let query = supabase
++      .from('weighing_records')
++      .select('created_at, total_calories, protein, fat, carbs')
++      .eq('user_id', userId)
++      .gte('created_at', startIso)
++      .lt('created_at', endExclusiveIso)
++      .order('created_at', {ascending: true})
++      .range(offset, offset + pageSize - 1)
++    if (memberId) query = query.eq('member_id', memberId)
++
++    const {data, error} = await query
++    if (error) {
++      console.error('getNutritionStatsByRange error:', error)
++      return []
++    }
++    rows.push(...(data || []))
++    if (!data || data.length < pageSize) break
++  }
+ 
+-  // 按日聚合
++  // created_at 存储为 UTC，展示与统计统一归入上海自然日。
+   const grouped: Record<string, NutritionStats> = {}
+-  for (const row of data || []) {
+-    const date = row.created_at.split('T')[0]
++  for (const row of rows) {
++    const date = getShanghaiDateKey(row.created_at)
+     if (!grouped[date]) {
+       grouped[date] = {date, total_calories: 0, protein: 0, fat: 0, carbs: 0, records_count: 0}
+     }
+diff --git a/src/db/types.ts b/src/db/types.ts
+index 2dd2d155..7757a6b2 100644
+--- a/src/db/types.ts
++++ b/src/db/types.ts
+@@ -59,7 +59,10 @@ export interface Ingredient {
+   unit: string
+   hasAllergen?: boolean
+   allergenName?: string
+-  image_url?: string | null  // 拍照识别时写入，手动输入为 null
++  image_id?: string | null
++  image_url?: string | null
++  thumbnail_url?: string | null
++  image_expires_at?: string | null
+ }
+ 
+ export interface WeighingRecord {
+diff --git a/src/pages/chat/index.tsx b/src/pages/chat/index.tsx
+index 8cf6cf04..78388c9a 100644
+--- a/src/pages/chat/index.tsx
++++ b/src/pages/chat/index.tsx
+@@ -3,6 +3,7 @@
+ import {Image, Textarea} from '@tarojs/components'
+ import Taro, {useDidHide, useDidShow} from '@tarojs/taro'
+ import {useCallback, useEffect, useMemo, useRef, useState} from 'react'
++import {HealthAdvisorMark} from '@/components/HealthMarks'
+ import {MarkdownRenderer} from '@/components/MarkdownRenderer'
+ import {withRouteGuard} from '@/components/RouteGuard'
+ import {useAuth} from '@/contexts/AuthContext'
+@@ -13,10 +14,10 @@ import {useAppStore} from '@/store/appStore'
+ import {buildChatPrompt} from '@/utils/aiPromptHelpers'
+ import {buildFamilyHealthContext} from '@/utils/allergenUtils'
+ import {normalizeAiMarkdown} from '@/utils/markdownText'
++import {getShanghaiDateKey, groupRtcHistoryByDate} from '@/utils/rtcHistory'
+ import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
+ 
+ const VOICE_MESSAGE_PREFIX = '🎙 '
+-const VOICE_LONG_PRESS_MS = 120
+ const MIN_VOICE_RECORD_MS = 500
+ 
+ let sharedRtcAudioContext: any = null
+@@ -130,11 +131,13 @@ function ChatPage() {
+   const [isLoading, setIsLoading] = useState(false)
+   const [showDrawer, setShowDrawer] = useState(false)
+   const [rtcHistoryGroups, setRtcHistoryGroups] = useState<RtcHistoryGroup[]>([])
++  const [expandedRtcDateKeys, setExpandedRtcDateKeys] = useState<string[]>([])
+   const [rtcHistoryLoading, setRtcHistoryLoading] = useState(false)
+   const [rtcHistoryError, setRtcHistoryError] = useState('')
+   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
+   const [isRecording, setIsRecording] = useState(false)
+   const [isVoicePressing, setIsVoicePressing] = useState(false)
++  const [isVoiceStopping, setIsVoiceStopping] = useState(false)
+   const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
+   const [useProfile, setUseProfile] = useState(true)
+   const [useIngredients, setUseIngredients] = useState(false)
+@@ -146,10 +149,11 @@ function ChatPage() {
+   const interruptedChatWsRef = useRef<Set<ReturnType<typeof getAiWebSocket>>>(new Set())
+   const voiceTouchStartYRef = useRef(0)
+   const voiceCancelRef = useRef(false)
+-  const voicePressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+   const voicePressingRef = useRef(false)
++  const voiceStopRequestedRef = useRef(false)
+   const voiceRecordStartingRef = useRef(false)
+   const voiceRecordStartedAtRef = useRef(0)
++  const voiceRecordingAttemptRef = useRef(0)
+   const [voiceMode, setVoiceMode] = useState(false)
+   const voiceSessionRef = useRef<ChatSession | null>(null)
+ 
+@@ -161,6 +165,12 @@ function ChatPage() {
+     try {
+       const data = await getRtcHistoryGroups()
+       setRtcHistoryGroups(data)
++      const dateGroups = groupRtcHistoryByDate(data)
++      setExpandedRtcDateKeys(current => {
++        const availableKeys = new Set(dateGroups.map(group => group.dateKey))
++        const retainedKeys = current.filter(key => availableKeys.has(key))
++        return retainedKeys.length > 0 ? retainedKeys : (dateGroups[0] ? [dateGroups[0].dateKey] : [])
++      })
+     } catch (err: any) {
+       console.error('加载 RTC 云端历史失败:', err?.message || err)
+       setRtcHistoryError(err?.message || 'RTC 云端历史加载失败')
+@@ -182,7 +192,8 @@ function ChatPage() {
+ 
+   useEffect(() => {
+     return () => {
+-      if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
++      voiceRecordingAttemptRef.current += 1
++      recorderManager.current?.stop()
+       audioContextRef.current?.destroy()
+       audioContextRef.current = null
+       liveAudioPlayerRef.current?.stop()
+@@ -629,33 +640,40 @@ function ChatPage() {
+   const startVoiceRecording = useCallback(async () => {
+     if (isRecording || voiceRecordStartingRef.current) return
+     voiceRecordStartingRef.current = true
++    voiceStopRequestedRef.current = false
+     if (!await ensureRecordPermission()) {
+       voiceRecordStartingRef.current = false
++      setIsVoiceStopping(false)
+       return
+     }
+-    if (!voicePressingRef.current) {
++    if (!voicePressingRef.current || voiceStopRequestedRef.current) {
+       voiceRecordStartingRef.current = false
++      setIsVoiceStopping(false)
+       return
+     }
+ 
+     const doStartRecord = () => {
+       const rm = Taro.getRecorderManager()
++      const attemptId = voiceRecordingAttemptRef.current + 1
++      voiceRecordingAttemptRef.current = attemptId
+       recorderManager.current = rm
+       voiceCancelRef.current = false
+       setIsRecordingCanceling(false)
+       rm.onStart(() => {
++        if (voiceRecordingAttemptRef.current !== attemptId) return
+         voiceRecordStartingRef.current = false
+-        if (!voicePressingRef.current) {
+-          recorderManager.current?.stop()
+-          return
+-        }
+         voiceRecordStartedAtRef.current = Date.now()
+         setIsRecording(true)
++        if (!voicePressingRef.current || voiceStopRequestedRef.current) rm.stop()
+       })
+       rm.onStop(async (res) => {
++        if (voiceRecordingAttemptRef.current !== attemptId) return
+         voiceRecordStartingRef.current = false
++        voiceStopRequestedRef.current = false
++        recorderManager.current = null
+         setIsRecording(false)
+         setIsVoicePressing(false)
++        setIsVoiceStopping(false)
+         setIsRecordingCanceling(false)
+         if (voiceCancelRef.current) {
+           voiceCancelRef.current = false
+@@ -718,6 +736,18 @@ function ChatPage() {
+           ws.disconnect()
+         }
+       })
++      rm.onError(() => {
++        if (voiceRecordingAttemptRef.current !== attemptId) return
++        voiceRecordStartingRef.current = false
++        voiceStopRequestedRef.current = false
++        voiceRecordStartedAtRef.current = 0
++        recorderManager.current = null
++        setIsRecording(false)
++        setIsVoicePressing(false)
++        setIsVoiceStopping(false)
++        setIsRecordingCanceling(false)
++        Taro.showToast({title: '录音失败，请重试', icon: 'none'})
++      })
+       rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+     }
+ 
+@@ -725,39 +755,41 @@ function ChatPage() {
+   }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
+ 
+   const handleVoiceTouchStart = useCallback((event: any) => {
++    if (voicePressingRef.current || voiceRecordStartingRef.current || isRecording) return
+     unlockRtcAudioPlayback('voice-touch')
+     if (isLoading) interruptActiveChatResponse('voice-touch')
+     voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
+     voiceCancelRef.current = false
++    voiceStopRequestedRef.current = false
+     voicePressingRef.current = true
+     setIsVoicePressing(true)
++    setIsVoiceStopping(false)
+     setIsRecordingCanceling(false)
+-    if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
+-    voicePressTimerRef.current = setTimeout(() => {
+-      voicePressTimerRef.current = null
+-      void startVoiceRecording()
+-    }, VOICE_LONG_PRESS_MS)
+-  }, [interruptActiveChatResponse, isLoading, startVoiceRecording])
++    void startVoiceRecording()
++  }, [interruptActiveChatResponse, isLoading, isRecording, startVoiceRecording])
+ 
+   const handleVoiceTouchMove = useCallback((event: any) => {
+-    if (!isRecording) return
++    if (!voicePressingRef.current) return
+     const currentY = event?.touches?.[0]?.clientY || voiceTouchStartYRef.current
+     const shouldCancel = voiceTouchStartYRef.current - currentY > 48
+     voiceCancelRef.current = shouldCancel
+     setIsRecordingCanceling(shouldCancel)
+-  }, [isRecording])
++  }, [])
+ 
+   const handleVoiceTouchEnd = useCallback(() => {
++    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !isRecording) return
+     voicePressingRef.current = false
++    voiceStopRequestedRef.current = true
+     setIsVoicePressing(false)
+-    if (voicePressTimerRef.current) {
+-      clearTimeout(voicePressTimerRef.current)
+-      voicePressTimerRef.current = null
+-      setIsRecordingCanceling(false)
+-      return
+-    }
++    setIsVoiceStopping(true)
+     recorderManager.current?.stop()
+-  }, [])
++  }, [isRecording])
++
++  const handleVoiceTouchCancel = useCallback(() => {
++    voiceCancelRef.current = true
++    setIsRecordingCanceling(true)
++    handleVoiceTouchEnd()
++  }, [handleVoiceTouchEnd])
+ 
+   const handleSend = () => {
+     if (isLoading || !inputText.trim()) return
+@@ -781,18 +813,19 @@ function ChatPage() {
+   const formatRtcClock = (seconds: number) => new Date(seconds * 1000).toLocaleTimeString('zh-CN', {
+     hour: '2-digit',
+     minute: '2-digit',
++    timeZone: 'Asia/Shanghai',
+   })
+   const formatRtcGroupTime = (group: RtcHistoryGroup) => {
+-    const start = new Date(group.startTime * 1000)
+-    const end = new Date(group.endTime * 1000)
+-    const date = end.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})
+-    if (start.toDateString() === end.toDateString()) {
+-      return `${date} ${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
++    const startDate = getShanghaiDateKey(group.startTime)
++    const endDate = getShanghaiDateKey(group.endTime)
++    if (startDate === endDate) {
++      return `${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
+     }
+-    return `${date} 截止 ${formatRtcClock(group.endTime)}`
++    return `${endDate.slice(5).replace('-', '/')} 截止 ${formatRtcClock(group.endTime)}`
+   }
++  const rtcHistoryDateGroups = useMemo(() => groupRtcHistoryByDate(rtcHistoryGroups), [rtcHistoryGroups])
+   const hasAnyHistory = rtcHistoryGroups.length > 0
+-  const isVoiceButtonActive = isRecording || isVoicePressing
++  const isVoiceButtonActive = isRecording || isVoicePressing || isVoiceStopping
+ 
+   return (
+     <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
+@@ -869,7 +902,7 @@ function ChatPage() {
+         {messages.length === 0 ? (
+           <div className="flex flex-col items-center pt-8 gap-3">
+             <div className="w-16 h-16 bg-gradient-primary rounded-3xl flex items-center justify-center">
+-              <div className="i-mdi-robot-happy text-4xl text-white" />
++              <HealthAdvisorMark size={40} className="text-white" />
+             </div>
+             <p className="text-2xl font-semibold text-foreground">AI健康顾问</p>
+             <p className="text-xl text-muted-foreground text-center px-6">有任何饮食健康问题都可以向我咨询</p>
+@@ -902,7 +935,7 @@ function ChatPage() {
+               <div key={msg.id} className={`flex items-end gap-2 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                 {msg.role === 'assistant' && (
+                   <div className="w-8 h-8 bg-gradient-primary rounded-xl flex items-center justify-center flex-shrink-0 mb-1">
+-                    <div className="i-mdi-robot text-xl text-white" />
++                    <HealthAdvisorMark size={20} className="text-white" />
+                   </div>
+                 )}
+                 <div className="flex flex-col items-start" style={{maxWidth: '75%'}}>
+@@ -992,7 +1025,7 @@ function ChatPage() {
+             {isLoading && !hasStreamingAiMessage && (
+               <div className="flex items-end gap-2 justify-start">
+                 <div className="w-8 h-8 bg-gradient-primary rounded-xl flex items-center justify-center flex-shrink-0 mb-1">
+-                  <div className="i-mdi-robot text-xl text-white" />
++                  <HealthAdvisorMark size={20} className="text-white" />
+                 </div>
+                 <div className="rounded-2xl rounded-bl-[4px] px-4 py-4" style={{backgroundColor: '#F2F2F2'}}>
+                   <div className="flex gap-1">
+@@ -1039,7 +1072,7 @@ function ChatPage() {
+               }}
+               onTouchStart={handleVoiceTouchStart}
+               onTouchMove={handleVoiceTouchMove}
+-              onTouchCancel={handleVoiceTouchEnd}
++              onTouchCancel={handleVoiceTouchCancel}
+               onTouchEnd={handleVoiceTouchEnd}
+             >
+               {isVoiceButtonActive ? (
+@@ -1064,7 +1097,7 @@ function ChatPage() {
+                 <div className="flex items-center gap-2">
+                     <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
+                     <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
+-                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
++                      {isRecordingCanceling ? '松手取消' : (isVoiceStopping ? '正在发送...' : (isRecording ? '录音中...' : '准备录音...'))}
+                     </span>
+                     <div className="flex items-end gap-0.5" style={{height: '16px'}}>
+                       {[0,1,2,3,4].map(i => (
+@@ -1144,7 +1177,7 @@ function ChatPage() {
+             <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
+               <div>
+                 <p className="text-2xl font-semibold text-foreground">对话历史</p>
+-                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按 30 分钟自动分段</p>
++                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按日期整理</p>
+               </div>
+               <div className="flex items-center gap-4">
+                 <button
+@@ -1185,36 +1218,60 @@ function ChatPage() {
+                 </div>
+               ) : (
+                 <>
+-                  {rtcHistoryGroups.length > 0 && (
++                  {rtcHistoryDateGroups.length > 0 && (
+                     <div>
+                       <div className="px-4 py-2 bg-secondary/60 border-b border-border">
+-                        <p className="text-xl font-semibold text-foreground">最近 10 个历史对话</p>
++                        <p className="text-xl font-semibold text-foreground">最近 30 天</p>
+                       </div>
+-                      {rtcHistoryGroups.map(group => (
+-                  <div
+-                    key={group.id}
+-                    className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
+-                    style={{minHeight: '56px'}}
+-                    onClick={() => handleSelectRtcHistory(group)}
+-                  >
+-                    <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
+-                    <div className="flex-1 min-w-0">
+-                      <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+-                        {group.title}
+-                      </p>
+-                      <p className="text-xl text-muted-foreground">
+-                        {formatRtcGroupTime(group)}
+-                      </p>
+-                    </div>
+-                    <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
+-                  </div>
+-                      ))}
++                      {rtcHistoryDateGroups.map(dateGroup => {
++                        const isExpanded = expandedRtcDateKeys.includes(dateGroup.dateKey)
++                        return (
++                          <div key={dateGroup.id}>
++                            <button
++                              type="button"
++                              className="w-full flex items-center justify-between gap-3 px-4 bg-white border-b border-border active:bg-secondary/40"
++                              style={{minHeight: '48px'}}
++                              onClick={() => setExpandedRtcDateKeys(current => (
++                                current.includes(dateGroup.dateKey)
++                                  ? current.filter(key => key !== dateGroup.dateKey)
++                                  : [...current, dateGroup.dateKey]
++                              ))}
++                            >
++                              <span className="flex items-center gap-2 min-w-0">
++                                <span className="i-mdi-calendar-blank-outline text-xl text-muted-foreground flex-shrink-0" />
++                                <span className="text-xl font-semibold text-foreground">{dateGroup.label}</span>
++                                <span className="text-xl text-muted-foreground">{dateGroup.groups.length} 个会话</span>
++                              </span>
++                              <span className={`${isExpanded ? 'i-mdi-chevron-up' : 'i-mdi-chevron-down'} text-2xl text-muted-foreground flex-shrink-0`} />
++                            </button>
++                            {isExpanded && dateGroup.groups.map(group => (
++                              <div
++                                key={group.id}
++                                className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
++                                style={{minHeight: '56px', paddingLeft: '36px'}}
++                                onClick={() => handleSelectRtcHistory(group)}
++                              >
++                                <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
++                                <div className="flex-1 min-w-0">
++                                  <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
++                                    {group.title}
++                                  </p>
++                                  <p className="text-xl text-muted-foreground">
++                                    {formatRtcGroupTime(group)}
++                                  </p>
++                                </div>
++                                <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
++                              </div>
++                            ))}
++                          </div>
++                        )
++                      })}
+                     </div>
+                   )}
+                 </>
+               )}
+             </div>
+-            <div className="px-4 pt-3 pb-tabbar flex-shrink-0">
++            <div className="px-4 pt-3 pb-4 flex-shrink-0">
+               <button
+                 type="button"
+                 className="w-full flex items-center justify-center leading-none gap-2 text-xl font-semibold bg-gradient-primary text-white rounded-xl"
+diff --git a/src/pages/home/index.tsx b/src/pages/home/index.tsx
+index 8bafd407..861619e9 100644
+--- a/src/pages/home/index.tsx
++++ b/src/pages/home/index.tsx
+@@ -3,7 +3,6 @@
+ import {Image} from '@tarojs/components'
+ import Taro, {useDidShow} from '@tarojs/taro'
+ import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
+-import {supabase} from '@/client/supabase'
+ import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
+ import {DisclaimerModal} from '@/components/DisclaimerModal'
+ import {MarkdownRenderer} from '@/components/MarkdownRenderer'
+@@ -12,6 +11,7 @@ import {useAuth} from '@/contexts/AuthContext'
+ import {createWeighingRecord, getDevices, getWeighingRecords, updateProfile } from '@/db/api'
+ import type {Ingredient, WeighingRecord } from '@/db/types'
+ import {getAiWebSocket, type AgentProfile} from '@/services/aiWebSocket'
++import {uploadFoodImageVariants} from '@/services/foodImageStorage'
+ import {useAppStore} from '@/store/appStore'
+ import {buildFamilyHealthContext, checkAllergens, enrichIngredientsWithAllergens } from '@/utils/allergenUtils'
+ import {buildFoodRecognitionPrompt, parseRecognizedFoods} from '@/utils/aiPromptHelpers'
+@@ -21,9 +21,15 @@ import {isPrivacyScopeError, isUserCancelError, showPrivacyScopeDeclarationTip}
+ import {bleMockService} from '@/utils/bleMock'
+ import type {WeightUnit} from '@/utils/bleService'
+ import {bleService} from '@/utils/bleService'
++import {compressFoodImages} from '@/utils/foodImageCompression'
++import {getFoodImageDisplay, type FoodImageFields} from '@/utils/foodImage'
+ 
+ const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+ 
++interface PendingIngredientImage extends FoodImageFields {
++  preview_url: string
++}
++
+ function formatNumber(value: number | null, digits = 1): string {
+   if (value == null || !Number.isFinite(value)) return '--'
+   return Number.isInteger(value) ? String(value) : value.toFixed(digits).replace(/\.0$/, '')
+@@ -71,9 +77,7 @@ function HomePage() {
+ 
+   const [foodName, setFoodName] = useState('')
+   const [manualWeight, setManualWeight] = useState('')
+-  // 拍照识别后暂存图片URL，添加食材时一并写入；手动输入时为null
+-  const [currentIngredientImageUrl, setCurrentIngredientImageUrl] = useState<string | null>(null)
+-  const [isRecording, setIsRecording] = useState(false)
++  const [currentIngredientImage, setCurrentIngredientImage] = useState<PendingIngredientImage | null>(null)
+   const [analysisResult, setAnalysisResult] = useState('')
+   const [isAnalyzing, setIsAnalyzing] = useState(false)
+   const [history, setHistory] = useState<WeighingRecord[]>([])
+@@ -85,7 +89,7 @@ function HomePage() {
+   const [connectedDeviceName, setConnectedDeviceName] = useState('')
+   const [showAnalysisContent, setShowAnalysisContent] = useState(true)
+   const [showMealMemberSelector, setShowMealMemberSelector] = useState(false)
+-  const recorderManager = useRef<Taro.RecorderManager | null>(null)
++  const [failedHistoryImages, setFailedHistoryImages] = useState<Set<string>>(() => new Set())
+ 
+   const selectedMealMembers = useMemo(() => {
+     const selected = familyMembers.filter(member => selectedMealMemberIds.includes(member.id))
+@@ -221,7 +225,16 @@ function HomePage() {
+       Taro.showToast({title: '请输入有效重量', icon: 'none'})
+       return
+     }
+-    const base = {name: foodName.trim(), weight: w, unit: weightUnit, image_url: currentIngredientImageUrl ?? null}
++    const hasStoredImage = Boolean(currentIngredientImage?.image_id)
++    const base: Ingredient = {
++      name: foodName.trim(),
++      weight: w,
++      unit: weightUnit,
++      image_id: hasStoredImage ? currentIngredientImage?.image_id || null : null,
++      image_url: hasStoredImage ? currentIngredientImage?.image_url || null : null,
++      thumbnail_url: hasStoredImage ? currentIngredientImage?.thumbnail_url || null : null,
++      image_expires_at: hasStoredImage ? currentIngredientImage?.image_expires_at || null : null,
++    }
+     const enriched = enrichIngredientsWithAllergens([base], activeMember)
+     addIngredient(enriched[0])
+     if (familyMembers.length > 0 && selectedMealMembers.length === 0 && activeMember) {
+@@ -229,7 +242,7 @@ function HomePage() {
+     }
+     setFoodName('')
+     setManualWeight('')
+-    setCurrentIngredientImageUrl(null)
++    setCurrentIngredientImage(null)
+   }
+ 
+   const toggleMealMember = (memberId: string) => {
+@@ -247,25 +260,6 @@ function HomePage() {
+     setSelectedMealMemberIds([...selected, memberId])
+   }
+ 
+-  // 读取文件为base64（小程序专用）
+-  const readFileAsBase64 = (filePath: string): Promise<{base64: string; size: number}> => {
+-    return new Promise((resolve, reject) => {
+-      const fs = Taro.getFileSystemManager()
+-      fs.getFileInfo({
+-        filePath,
+-        success: (info) => {
+-          fs.readFile({
+-            filePath,
+-            encoding: 'base64',
+-            success: (res) => resolve({base64: res.data as string, size: info.size}),
+-            fail: reject
+-          })
+-        },
+-        fail: reject
+-      })
+-    })
+-  }
+-
+   // 读取图片为带前缀的base64
+   const readImageAsBase64 = (filePath: string): Promise<string> => {
+     return new Promise((resolve, reject) => {
+@@ -302,62 +296,6 @@ function HomePage() {
+     throw lastError instanceof Error ? lastError : new Error('AI WebSocket connect failed')
+   }
+ 
+-  const handleVoiceInput = () => {
+-    if (!isOnline) {
+-      Taro.showToast({title: '需要网络连接', icon: 'none'})
+-      return
+-    }
+-    if (isRecording) return
+-
+-    recorderManager.current = Taro.getRecorderManager()
+-    recorderManager.current.onStart(() => setIsRecording(true))
+-    recorderManager.current.onStop(async (res) => {
+-      setIsRecording(false)
+-      if (!res.tempFilePath) return
+-      setRecognizing(true)
+-      const ws = getAiWebSocket()
+-      try {
+-        await connectDefaultAgent(ws, 'voice-ptt')
+-        const {base64} = await readFileAsBase64(res.tempFilePath)
+-        const buffer = Taro.base64ToArrayBuffer(base64)
+-        const text = await new Promise<string>((resolve, reject) => {
+-          const timeout = setTimeout(() => { unsub(); reject(new Error('ASR timeout')) }, 15000)
+-          const unsub = ws.onMessage('asr-final', (data) => {
+-            clearTimeout(timeout)
+-            unsub()
+-            resolve(data as string)
+-          })
+-          void (async () => {
+-            await ws.sendControl('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
+-            await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
+-            await ws.sendAudio(buffer)
+-            await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
+-          })().catch((error) => {
+-            clearTimeout(timeout)
+-            unsub()
+-            reject(error)
+-          })
+-        })
+-        if (text.trim()) {
+-          setFoodName(text.trim())
+-          Taro.showToast({title: '识别成功，请确认', icon: 'success'})
+-        } else {
+-          Taro.showToast({title: '未能识别，请重试或手动输入', icon: 'none'})
+-        }
+-      } catch {
+-        Taro.showToast({title: '未能识别，请重试或手动输入', icon: 'none'})
+-      } finally {
+-        ws.disconnect()
+-        setRecognizing(false)
+-      }
+-    })
+-    recorderManager.current.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+-  }
+-
+-  const handleStopVoice = () => {
+-    recorderManager.current?.stop()
+-  }
+-
+   const handlePhotoRecognize = async () => {
+     if (!isOnline) {
+       Taro.showToast({title: '需要网络连接', icon: 'none'})
+@@ -368,25 +306,17 @@ function HomePage() {
+       const res = await Taro.chooseMedia({count: 1, mediaType: ['image'], sourceType: ['album', 'camera']})
+       if (!res.tempFiles?.[0]) return
+       const localPreviewPath = res.tempFiles[0].tempFilePath
+-      setCurrentIngredientImageUrl(localPreviewPath)
++      setCurrentIngredientImage({preview_url: localPreviewPath})
+       setRecognizing(true)
+ 
+-      // Step 1: 压缩图片
+       Taro.showLoading({title: '图片压缩中...'})
+       loadingShown = true
+-      let compressedPath = res.tempFiles[0].tempFilePath
+-      try {
+-        const compressRes = await Taro.compressImage({src: compressedPath, quality: 80})
+-        compressedPath = compressRes.tempFilePath
+-      } catch {
+-        // 压缩失败降级到原图
+-      }
+-
+-      // Step 2: 读取 base64
+-      const base64Image = await readImageAsBase64(compressedPath)
+-      const ext = compressedPath.split('.').pop()?.toLowerCase() || 'jpg'
++      const compressed = await compressFoodImages(localPreviewPath)
++      const [largeBase64, thumbnailBase64] = await Promise.all([
++        readImageAsBase64(compressed.large.path),
++        readImageAsBase64(compressed.thumbnail.path),
++      ])
+ 
+-      // Step 3: 识别食材 & 上传图片 并发执行
+       Taro.showLoading({title: '识别并上传中...'})
+ 
+       const ws = getAiWebSocket()
+@@ -396,25 +326,28 @@ function HomePage() {
+             await connectDefaultAgent(ws, 'vision')
+             return await ws.requestImageResponse({
+               triggerText: buildFoodRecognitionPrompt('trigger'),
+-              imageBase64: base64Image,
+-              fileName: `food.${ext}`,
++              imageBase64: largeBase64,
++              fileName: 'food.jpg',
+               finalText: buildFoodRecognitionPrompt('final')
+             })
+           } finally {
+             ws.disconnect()
+           }
+         })(),
+-        supabase.functions.invoke('upload-food-image', {body: {image: base64Image, ext}})
++        uploadFoodImageVariants({
++          largeImage: largeBase64,
++          thumbnailImage: thumbnailBase64,
++          large: compressed.large,
++          thumbnail: compressed.thumbnail,
++        })
+       ])
+ 
+       Taro.hideLoading()
+       loadingShown = false
+ 
+       // 处理上传结果
+-      let uploadedImageUrl: string | null = null
+-      if (uploadResult.status === 'fulfilled' && !uploadResult.value.error) {
+-        uploadedImageUrl = uploadResult.value.data?.url || null
+-      }
++      const storedImage = uploadResult.status === 'fulfilled' ? uploadResult.value : null
++      if (uploadResult.status === 'rejected') console.warn('食材图片上传失败:', uploadResult.reason)
+ 
+       // 处理识别结果
+       if (recognizeResult.status === 'rejected') {
+@@ -424,20 +357,20 @@ function HomePage() {
+       const foods = parseRecognizedFoods(raw)
+       if (foods.length > 0) {
+         setFoodName(foods[0])
+-        setCurrentIngredientImageUrl(uploadedImageUrl || localPreviewPath)
++        setCurrentIngredientImage({preview_url: localPreviewPath, ...(storedImage || {})})
+         Taro.showToast({
+-          title: uploadedImageUrl
++          title: storedImage
+             ? `识别到：${foods.slice(0, 3).join('、')}`
+             : '识别成功，图片仅在本机临时显示',
+           icon: 'none'
+         })
+       } else {
+-        setCurrentIngredientImageUrl(null)
++        setCurrentIngredientImage(null)
+         Taro.showToast({title: '未识别到食材，请光线充足正面拍摄', icon: 'none'})
+       }
+     } catch (err: any) {
+       if (loadingShown) Taro.hideLoading()
+-      setCurrentIngredientImageUrl(null)
++      setCurrentIngredientImage(null)
+       if (isUserCancelError(err)) return
+       if (isPrivacyScopeError(err)) {
+         console.warn('拍照识别隐私配置缺失:', err)
+@@ -536,6 +469,23 @@ function HomePage() {
+     Taro.switchTab({url: '/pages/chat/index'})
+   }
+ 
++  const handlePreviewIngredientImage = async (ingredient: Ingredient) => {
++    const display = getFoodImageDisplay(ingredient)
++    if (!display.previewUrl) {
++      Taro.showToast({title: '图片暂不可用', icon: 'none'})
++      return
++    }
++    if (display.largeExpired) {
++      Taro.showToast({title: '原图已到期，显示缩略图', icon: 'none'})
++    }
++    try {
++      await Taro.previewImage({current: display.previewUrl, urls: [display.previewUrl]})
++    } catch (error) {
++      console.warn('食材图片预览失败:', error)
++      Taro.showToast({title: '图片预览失败', icon: 'none'})
++    }
++  }
++
+   const bleStatusColor = bleStatus === 'connected' ? 'bg-primary' : bleStatus === 'connecting' ? 'bg-warning animate-breathe' : 'bg-muted-foreground'
+   const bleStatusText = bleStatus === 'connected'
+     ? '接收中'
+@@ -660,14 +610,6 @@ function HomePage() {
+                 value={foodName}
+                 onInput={(e) => { const ev = e as any; setFoodName(ev.detail?.value ?? ev.target?.value ?? '') }}
+               />
+-              {/* 语音按钮 */}
+-              <div
+-                className={`flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0 ${isRecording ? 'bg-destructive animate-breathe' : recognizing ? 'bg-primary/50' : 'bg-primary'}`}
+-                onTouchStart={handleVoiceInput}
+-                onTouchEnd={handleStopVoice}
+-              >
+-                <div className="i-mdi-microphone text-2xl text-white" />
+-              </div>
+               {/* 拍照按钮 */}
+               <div
+                 className="flex items-center justify-center w-10 h-10 rounded-full bg-secondary flex-shrink-0"
+@@ -677,10 +619,10 @@ function HomePage() {
+               </div>
+             </div>
+ 
+-            {currentIngredientImageUrl && (
++            {currentIngredientImage && (
+               <div className="flex items-center gap-3 px-3 py-2 bg-secondary rounded-xl">
+                 <Image
+-                  src={currentIngredientImageUrl}
++                  src={currentIngredientImage.thumbnail_url || currentIngredientImage.image_url || currentIngredientImage.preview_url}
+                   mode="aspectFill"
+                   style={{width: '52px', height: '52px', borderRadius: '8px', flexShrink: 0}}
+                 />
+@@ -692,7 +634,7 @@ function HomePage() {
+                   type="button"
+                   className="flex items-center justify-center flex-shrink-0"
+                   style={{width: '36px', height: '36px'}}
+-                  onClick={() => setCurrentIngredientImageUrl(null)}
++                  onClick={() => setCurrentIngredientImage(null)}
+                 >
+                   <div className="i-mdi-close text-2xl text-muted-foreground" />
+                 </button>
+@@ -814,10 +756,11 @@ function HomePage() {
+                     className="flex-shrink-0 overflow-hidden"
+                     style={{width: '48px', height: '48px', borderRadius: '50%'}}
+                   >
+-                    {ing.image_url ? (
++                    {ing.thumbnail_url || ing.image_url ? (
+                       <Image
+-                        src={ing.image_url}
++                        src={ing.thumbnail_url || ing.image_url || ''}
+                         mode="aspectFill"
++                        lazyLoad
+                         style={{width: '48px', height: '48px'}}
+                       />
+                     ) : (
+@@ -1009,14 +952,27 @@ function HomePage() {
+                     <div className="flex items-start gap-2 mb-3">
+                       {displayIngs.map((ing: Ingredient, i: number) => {
+                         const isLast = i === 2 && extraCount > 0
++                        const imageKey = `${record.id}-${ing.image_id || i}`
++                        const imageDisplay = getFoodImageDisplay(ing)
++                        const listImageUrl = failedHistoryImages.has(imageKey) ? null : imageDisplay.listUrl
+                         return (
+                           <div key={i} className="flex flex-col items-center" style={{width: '64px'}}>
+-                            <div className="relative" style={{width: '64px', height: '64px'}}>
+-                              {ing.image_url ? (
++                            <div
++                              className="relative"
++                              style={{width: '64px', height: '64px'}}
++                              onClick={() => void handlePreviewIngredientImage(ing)}
++                            >
++                              {listImageUrl ? (
+                                 <Image
+-                                  src={ing.image_url}
++                                  src={listImageUrl}
+                                   mode="aspectFill"
++                                  lazyLoad
+                                   style={{width: '64px', height: '64px', borderRadius: '8px', display: 'block'}}
++                                  onError={() => setFailedHistoryImages(previous => {
++                                    const next = new Set(previous)
++                                    next.add(imageKey)
++                                    return next
++                                  })}
+                                 />
+                               ) : (
+                                 <div
+diff --git a/src/pages/personal-info/index.tsx b/src/pages/personal-info/index.tsx
+index e97c2b93..1f7a2694 100644
+--- a/src/pages/personal-info/index.tsx
++++ b/src/pages/personal-info/index.tsx
+@@ -4,7 +4,7 @@ import Taro, {useDidShow} from '@tarojs/taro'
+ import {Picker} from '@tarojs/components'
+ import {useAuth} from '@/contexts/AuthContext'
+ import {withRouteGuard} from '@/components/RouteGuard'
+-import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages} from '@/db/api'
++import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
+ import {useAppStore} from '@/store/appStore'
+ import type {FamilyMember, GenderType, BloodType} from '@/db/types'
+ 
+@@ -22,6 +22,7 @@ function PersonalInfoPage() {
+   const [customDisease, setCustomDisease] = useState('')
+   const [customAllergen, setCustomAllergen] = useState('')
+   const [saving, setSaving] = useState(false)
++  const [clearingChat, setClearingChat] = useState(false)
+ 
+   const activeMemberRef = useRef(activeMember)
+   useEffect(() => { activeMemberRef.current = activeMember }, [activeMember])
+@@ -97,8 +98,8 @@ function PersonalInfoPage() {
+   const handleClearData = async () => {
+     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
+       Taro.showModal({
+-        title: '清除健康数据',
+-        content: '此操作将清除您的所有健康档案数据，不可撤销。确认继续？',
++        title: '清空当前成员健康档案',
++        content: '仅清空当前成员的基础健康信息、慢性病、过敏原、用药和营养目标；不会删除称重历史、食材图片、其他成员或账号。',
+         confirmColor: '#D9534F',
+         success: (res) => resolve({confirm: res.confirm})
+       })
+@@ -108,26 +109,38 @@ function PersonalInfoPage() {
+       await updateFamilyMember(member.id, {
+         gender: 'unknown', age: null, height: null, weight: null,
+         birthday: null, blood_type: null, chronic_diseases: [], allergens: [],
+-        medications: null, daily_calorie_goal: null
++        medications: null, daily_calorie_goal: null, daily_protein_goal: null,
++        daily_fat_goal: null, daily_carb_goal: null
+       })
+     }
+     await refreshMembers(user!.id)
+     loadMember()
+-    Taro.showToast({title: '健康数据已清除', icon: 'success'})
++    Taro.showToast({title: '当前成员健康档案已清空', icon: 'success'})
+   }
+ 
+   const handleClearChat = async () => {
+     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
+       Taro.showModal({
+-        title: '清除对话记录',
+-        content: '将删除所有AI问答历史，此操作不可撤销。',
++        title: '清除 AI 记忆与旧版对话',
++        content: '将清除百度 AI 对话上下文和小程序旧版对话数据。百度对话日志可能仍按云服务策略保留，此操作不可撤销。',
+         confirmColor: '#D9534F',
+         success: (res) => resolve({confirm: res.confirm})
+       })
+     })
+     if (!confirm) return
+-    await deleteAllChatMessages(user!.id)
+-    Taro.showToast({title: '对话记录已清除', icon: 'success'})
++    if (!user || clearingChat) return
++    setClearingChat(true)
++    try {
++      await deleteRtcContexts()
++      const localDeleted = await deleteAllChatMessages(user.id)
++      if (!localDeleted) throw new Error('旧版对话删除失败')
++      Taro.showToast({title: 'AI 记忆与旧版对话已清除', icon: 'success'})
++    } catch (error) {
++      console.error('清除 AI 记忆与旧版对话失败:', error)
++      Taro.showToast({title: '清除失败，请稍后重试', icon: 'none'})
++    } finally {
++      setClearingChat(false)
++    }
+   }
+ 
+   // BMI参考热量
+@@ -372,13 +385,14 @@ function PersonalInfoPage() {
+             className="w-full flex items-center justify-center leading-none text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-xl"
+             style={{height: '48px'}}
+             onClick={handleClearData}
+-          >清除所有健康数据</button>
++          >清空当前成员健康档案</button>
+           <button
+             type="button"
+-            className="w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl"
++            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
+             style={{height: '48px'}}
+             onClick={handleClearChat}
+-          >清除对话记录</button>
++            disabled={clearingChat}
++          >{clearingChat ? '清除中...' : '清除 AI 记忆与旧版对话'}</button>
+         </div>
+       </div>
+     </div>
+diff --git a/src/utils/rtcHistory.ts b/src/utils/rtcHistory.ts
+index 0d7a25db..44b44c71 100644
+--- a/src/utils/rtcHistory.ts
++++ b/src/utils/rtcHistory.ts
+@@ -20,6 +20,13 @@ export interface RtcHistoryGroup {
+   messages: RtcHistoryMessage[]
+ }
+ 
++export interface RtcHistoryDateGroup {
++  id: string
++  dateKey: string
++  label: string
++  groups: RtcHistoryGroup[]
++}
++
+ const DEFAULT_GAP_SECONDS = 30 * 60
+ 
+ function normalizeTimestamp(value: number | string): number {
+@@ -121,3 +128,49 @@ export function groupRtcDialogueRows(rows: RtcDialogueRow[], gapSeconds = DEFAUL
+   if (current.length > 0) groups.push(toGroup(current))
+   return groups
+ }
++
++export function getShanghaiDateKey(timestamp: number): string {
++  const date = new Date(timestamp * 1000)
++  const shanghai = new Date(date.getTime() + 8 * 60 * 60 * 1000)
++  return `${shanghai.getUTCFullYear()}-${String(shanghai.getUTCMonth() + 1).padStart(2, '0')}-${String(shanghai.getUTCDate()).padStart(2, '0')}`
++}
++
++function addDays(dateKey: string, days: number): string {
++  const [year, month, day] = dateKey.split('-').map(Number)
++  const date = new Date(Date.UTC(year, month - 1, day + days))
++  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`
++}
++
++export function formatRtcDateLabel(dateKey: string, nowTimestamp = Date.now() / 1000): string {
++  const todayKey = getShanghaiDateKey(nowTimestamp)
++  if (dateKey === todayKey) return '今天'
++  if (dateKey === addDays(todayKey, -1)) return '昨天'
++
++  const [year, month, day] = dateKey.split('-').map(Number)
++  return `${year}年${month}月${day}日`
++}
++
++export function groupRtcHistoryByDate(
++  groups: RtcHistoryGroup[],
++  nowTimestamp = Date.now() / 1000,
++): RtcHistoryDateGroup[] {
++  const sortedGroups = [...groups].sort((a, b) => b.endTime - a.endTime)
++  const grouped = new Map<string, RtcHistoryGroup[]>()
++
++  for (const group of sortedGroups) {
++    // A session that crosses midnight belongs to the date of its first message.
++    const dateKey = getShanghaiDateKey(group.startTime)
++    const dateGroups = grouped.get(dateKey) || []
++    dateGroups.push(group)
++    grouped.set(dateKey, dateGroups)
++  }
++
++  return [...grouped.entries()]
++    .sort(([dateA], [dateB]) => dateB.localeCompare(dateA))
++    .map(([dateKey, dateGroups]) => ({
++      id: `rtc-date-${dateKey}`,
++      dateKey,
++      label: formatRtcDateLabel(dateKey, nowTimestamp),
++      groups: dateGroups,
++    }))
++}
+diff --git a/supabase/config.toml b/supabase/config.toml
+index e0afa8eb..8c544b2f 100644
+--- a/supabase/config.toml
++++ b/supabase/config.toml
+@@ -9,3 +9,6 @@ verify_jwt = false
+ 
+ [functions.recipe-share]
+ verify_jwt = false
++
++[functions.food-image-cleanup]
++verify_jwt = false
+diff --git a/supabase/functions/brtc-history/index.ts b/supabase/functions/brtc-history/index.ts
+index 5bc88417..29a56cc1 100644
+--- a/supabase/functions/brtc-history/index.ts
++++ b/supabase/functions/brtc-history/index.ts
+@@ -26,15 +26,17 @@ const corsHeaders = {
+ const AK = Deno.env.get('BAIDU_BCE_AK') || Deno.env.get('BAIDU_BRTC_AK') || ''
+ const SK = Deno.env.get('BAIDU_BCE_SK') || Deno.env.get('BAIDU_BRTC_SK') || ''
+ const APPID = Deno.env.get('BAIDU_BRTC_APPID') || 'appsf7sknqh440y'
++const CONTEXT_ROLE = (Deno.env.get('BAIDU_BRTC_CONTEXT_ROLE') || '').trim()
+ const SUPABASE_URL = Deno.env.get('APP_SUPABASE_URL') || Deno.env.get('SUPABASE_URL')!
+ const SUPABASE_ANON_KEY = Deno.env.get('APP_SUPABASE_ANON_KEY') || Deno.env.get('SUPABASE_ANON_KEY')!
+ const API_HOST = 'rtc-aiagent.baidubce.com'
+ const DEFAULT_PAGE_SIZE = 100
+ const DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60
+ const GROUP_GAP_SECONDS = 30 * 60
+-const MAX_HISTORY_GROUPS = 10
++const MAX_HISTORY_GROUPS = DEFAULT_PAGE_SIZE
+ const AUTH_TIMEOUT_MS = 5000
+ const BRTC_HISTORY_TIMEOUT_MS = 8000
++const BRTC_DELETE_TIMEOUT_MS = 8000
+ 
+ const encoder = new TextEncoder()
+ 
+@@ -238,8 +240,63 @@ Deno.serve(async (req: Request): Promise<Response> => {
+       return jsonResponse({error: 'Unauthorized', traceId}, 401)
+     }
+ 
++    const parsedBody = await req.json().catch(() => ({}))
++    const body = parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
++      ? parsedBody as Record<string, unknown>
++      : {}
++    const action = body.action === 'delete-contexts' ? 'delete-contexts' : 'list-dialogues'
++
++    if (action === 'delete-contexts') {
++      const path = '/api/v1/contexts'
++      const query = new URLSearchParams()
++      const deleteBody: Record<string, string> = {appId: APPID, userId}
++      if (CONTEXT_ROLE) deleteBody.role = CONTEXT_ROLE
++      const authorization = await buildBceAuthorization('DELETE', path, query, API_HOST)
++
++      console.info('[brtc-history] deleting contexts', {
++        traceId,
++        hasRole: Boolean(CONTEXT_ROLE),
++      })
++
++      let upstream: Response
++      try {
++        upstream = await fetchWithTimeout(`https://${API_HOST}${path}`, {
++          method: 'DELETE',
++          headers: {
++            host: API_HOST,
++            authorization,
++            'content-type': 'application/json',
++          },
++          body: JSON.stringify(deleteBody),
++        }, BRTC_DELETE_TIMEOUT_MS)
++      } catch (error) {
++        console.error('[brtc-history] baidu contexts delete failed', {
++          traceId,
++          elapsedMs: Date.now() - startedAt,
++          error: error instanceof Error ? error.message : String(error),
++        })
++        return jsonResponse({error: 'BRTC_CONTEXT_DELETE_TIMEOUT', traceId}, 504)
++      }
++
++      const responseText = await upstream.text()
++      if (!upstream.ok) {
++        console.error('[brtc-history] baidu contexts delete rejected', {
++          traceId,
++          status: upstream.status,
++          responseText,
++        })
++        return jsonResponse({error: `BRTC context delete failed: ${upstream.status} ${responseText}`, traceId}, 502)
++      }
++
++      console.info('[brtc-history] contexts deleted', {
++        traceId,
++        hasRole: Boolean(CONTEXT_ROLE),
++        elapsedMs: Date.now() - startedAt,
++      })
++      return jsonResponse({success: true, source: 'baidu-rtc-contexts'}, 200)
++    }
++
+     const nowSeconds = Math.floor(Date.now() / 1000)
+-    const body = await req.json().catch(() => ({}))
+     const beginTime = Number.isFinite(Number(body.beginTime)) ? Number(body.beginTime) : nowSeconds - DEFAULT_RANGE_SECONDS
+     const endTime = Number.isFinite(Number(body.endTime)) ? Number(body.endTime) : nowSeconds
+     const pageNo = Math.max(1, Number.isFinite(Number(body.pageNo)) ? Number(body.pageNo) : 1)
+diff --git a/supabase/functions/upload-food-image/index.ts b/supabase/functions/upload-food-image/index.ts
+index c95e4fec..cdc8a9c3 100644
+--- a/supabase/functions/upload-food-image/index.ts
++++ b/supabase/functions/upload-food-image/index.ts
+@@ -1,84 +1,93 @@
+-// upload-food-image Edge Function
+-// 接收 base64 图片 → 解码为 ArrayBuffer → 用 service_role 上传到 chat-images bucket → 返回公开 URL
+-// 之所以在服务端处理：微信小程序中 Taro.request 不支持二进制 body，Storage SDK 和 Taro.uploadFile 均无法可靠上传
++import {corsHeaders, getAuthUserId, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
+ 
+-const corsHeaders = {
+-  "Access-Control-Allow-Origin": "*",
+-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+-}
+-
+-// 将 base64 字符串解码为 Uint8Array
+-function base64ToUint8Array(base64: string): Uint8Array {
+-  // 去除 data URL 前缀（如 data:image/jpeg;base64,）
+-  const raw = base64.includes(',') ? base64.split(',')[1] : base64
+-  const binaryStr = atob(raw)
+-  const bytes = new Uint8Array(binaryStr.length)
+-  for (let i = 0; i < binaryStr.length; i++) {
+-    bytes[i] = binaryStr.charCodeAt(i)
+-  }
+-  return bytes
+-}
+-
+-Deno.serve(async (req: Request): Promise<Response> => {
+-  if (req.method === "OPTIONS") {
+-    return new Response(null, { headers: corsHeaders })
+-  }
+-  if (req.method !== "POST") {
+-    return new Response("Method Not Allowed", { status: 405, headers: corsHeaders })
+-  }
++const BUCKET = 'chat-images'
++const LARGE_MAX_BYTES = 300 * 1024
++const THUMBNAIL_MAX_BYTES = 50 * 1024
++const LARGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+ 
++function decodeJpeg(value: unknown, label: string, maxBytes: number): Uint8Array {
++  if (typeof value !== 'string' || !value) throw new HttpError(400, `缺少${label}`)
++  if (value.length > Math.ceil(maxBytes * 4 / 3) + 256) throw new HttpError(400, `${label}超过大小限制`)
+   try {
+-    const body = await req.json()
+-    const { image, ext = "jpg" } = body
+-
+-    if (!image) {
+-      return new Response(
+-        JSON.stringify({ error: "Missing image" }),
+-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+-      )
++    const raw = value.includes(',') ? value.slice(value.indexOf(',') + 1) : value
++    const binary = atob(raw)
++    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
++    if (bytes.byteLength > maxBytes) throw new HttpError(400, `${label}超过大小限制`)
++    if (bytes.byteLength < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
++      throw new HttpError(400, `${label}必须为 JPEG 格式`)
+     }
++    return bytes
++  } catch (error) {
++    if (error instanceof HttpError) throw error
++    throw new HttpError(400, `${label}编码无效`)
++  }
++}
+ 
+-    const supabaseUrl = Deno.env.get("APP_SUPABASE_URL") || Deno.env.get("SUPABASE_URL")!
+-    const serviceRoleKey = Deno.env.get("APP_SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
++function safeDimension(value: unknown): number | null {
++  const parsed = Number(value)
++  return Number.isFinite(parsed) && parsed > 0 && parsed <= 10000 ? Math.round(parsed) : null
++}
+ 
+-    // 生成唯一文件路径
+-    const safeExt = ext.toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg'
+-    const contentType = safeExt === 'jpg' ? 'image/jpeg' : `image/${safeExt}`
+-    const objectPath = `food-images/${Date.now()}-${Math.random().toString(36).slice(2)}.${safeExt}`
+-    const uploadUrl = `${supabaseUrl}/storage/v1/object/chat-images/${objectPath}`
++async function uploadImages(userId: string, body: Record<string, unknown>): Promise<Response> {
++  const largeBytes = decodeJpeg(body.largeImage, '大图', LARGE_MAX_BYTES)
++  const thumbnailBytes = decodeJpeg(body.thumbnailImage, '缩略图', THUMBNAIL_MAX_BYTES)
++  const imageId = crypto.randomUUID()
++  const largePath = `${userId}/${imageId}/large.jpg`
++  const thumbnailPath = `${userId}/${imageId}/thumb.jpg`
++  const largeExpiresAt = new Date(Date.now() + LARGE_RETENTION_MS).toISOString()
++  const largeMeta = body.largeMeta && typeof body.largeMeta === 'object' ? body.largeMeta as Record<string, unknown> : {}
++  const thumbnailMeta = body.thumbnailMeta && typeof body.thumbnailMeta === 'object' ? body.thumbnailMeta as Record<string, unknown> : {}
++  const admin = getSupabaseAdmin()
+ 
+-    // 解码 base64 为二进制
+-    const imageBytes = base64ToUint8Array(image)
++  const {error: largeError} = await admin.storage.from(BUCKET).upload(largePath, largeBytes, {
++    contentType: 'image/jpeg',
++    upsert: false,
++  })
++  if (largeError) throw largeError
+ 
+-    // 用 service_role 直接 POST 到 Supabase Storage REST API
+-    const uploadRes = await fetch(uploadUrl, {
+-      method: "POST",
+-      headers: {
+-        "Authorization": `Bearer ${serviceRoleKey}`,
+-        "Content-Type": contentType,
+-        "x-upsert": "false",
+-      },
+-      body: imageBytes,
+-    })
++  const {error: thumbnailError} = await admin.storage.from(BUCKET).upload(thumbnailPath, thumbnailBytes, {
++    contentType: 'image/jpeg',
++    upsert: false,
++  })
++  if (thumbnailError) {
++    await admin.storage.from(BUCKET).remove([largePath])
++    throw thumbnailError
++  }
+ 
+-    if (!uploadRes.ok) {
+-      const errText = await uploadRes.text()
+-      return new Response(
+-        JSON.stringify({ error: `Storage upload failed: ${uploadRes.status} ${errText}` }),
+-        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+-      )
+-    }
++  const {error: metadataError} = await admin.from('food_images').insert({
++    id: imageId,
++    user_id: userId,
++    large_path: largePath,
++    thumbnail_path: thumbnailPath,
++    large_bytes: largeBytes.byteLength,
++    thumbnail_bytes: thumbnailBytes.byteLength,
++    large_width: safeDimension(largeMeta.width),
++    large_height: safeDimension(largeMeta.height),
++    thumbnail_width: safeDimension(thumbnailMeta.width),
++    thumbnail_height: safeDimension(thumbnailMeta.height),
++    large_expires_at: largeExpiresAt,
++  })
++  if (metadataError) {
++    await admin.storage.from(BUCKET).remove([largePath, thumbnailPath])
++    throw metadataError
++  }
+ 
+-    const publicUrl = `${supabaseUrl}/storage/v1/object/public/chat-images/${objectPath}`
++  const largeUrl = admin.storage.from(BUCKET).getPublicUrl(largePath).data.publicUrl
++  const thumbnailUrl = admin.storage.from(BUCKET).getPublicUrl(thumbnailPath).data.publicUrl
++  return json({imageId, largeUrl, thumbnailUrl, largeExpiresAt})
++}
+ 
+-    return new Response(
+-      JSON.stringify({ url: publicUrl }),
+-      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+-    )
+-  } catch (e) {
+-    return new Response(
+-      JSON.stringify({ error: e instanceof Error ? e.message : "Internal error" }),
+-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+-    )
++Deno.serve(async (req: Request): Promise<Response> => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const userId = await getAuthUserId(req)
++    const parsedBody = await req.json().catch(() => ({}))
++    const body = parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
++      ? parsedBody as Record<string, unknown>
++      : {}
++    return await uploadImages(userId!, body)
++  } catch (error) {
++    return handleError(error, 'upload-food-image')
+   }
+ })
+
+Changes:
+
+scripts/checkChatStreaming.mjs
+  @@ -98,12 +98,12 @@ assert(
+  -    chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
+  +  chatSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')") &&
+       chatSource.includes('createAiWebSocket()') &&
+       wsSource.includes('export function createAiWebSocket()') &&
+  -    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
+  -    homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
+  -  'push-to-talk flows should use RTC ASR control commands without reusing the chat reply socket'
+  +    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')") &&
+  +    !homeSource.includes("await ws.sendControl('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')"),
+  +  'chat push-to-talk should use an independent RTC ASR socket while the home page remains voice-free'
+   )
+   
+   assert(
+  @@ -115,18 +115,19 @@ assert(
+  -  chatSource.includes('VOICE_LONG_PRESS_MS') &&
+  -    chatSource.includes('VOICE_LONG_PRESS_MS = 120') &&
+  +  !chatSource.includes('VOICE_LONG_PRESS_MS') &&
+       chatSource.includes('MIN_VOICE_RECORD_MS = 500') &&
+  -    chatSource.includes('voicePressTimerRef') &&
+       chatSource.includes('voicePressingRef') &&
+  +    chatSource.includes('voiceStopRequestedRef') &&
+  +    chatSource.includes('voiceRecordingAttemptRef') &&
+       chatSource.includes('setIsVoicePressing(true)') &&
+  +    chatSource.includes('void startVoiceRecording()') &&
+       chatSource.includes('startVoiceRecording') &&
+       chatSource.includes('interruptActiveChatResponse') &&
+       chatSource.includes('AI 回复已被用户语音输入打断') &&
+       !chatSource.includes('if (isLoading || isUploadingImage) return') &&
+       !chatSource.includes('handleVoiceMicToggle'),
+  -  'push-to-talk should start after a short hold and interrupt active AI/TTS output instead of being blocked by isLoading'
+  +  'push-to-talk should start immediately, retain release requests during startup, and interrupt active AI/TTS output'
+   )
+   
+   assert(
+  @@ -241,11 +242,16 @@ assert(
+  -    chatSource.includes('rtcHistoryGroups.map') &&
+  +    chatSource.includes('groupRtcHistoryByDate') &&
+  +    chatSource.includes('rtcHistoryDateGroups.map') &&
+       chatSource.includes('handleSelectRtcHistory') &&
+  -    chatSource.includes('最近 10 个历史对话') &&
+  -    chatSource.includes('RTC 云端记录，按 30 分钟自动分段'),
+  -  'chat history drawer should render the latest 10 grouped RTC cloud history conversations'
+  +    chatSource.includes('最近 30 天') &&
+  +    chatSource.includes('RTC 云端记录，按日期整理') &&
+  +    chatSource.includes('expandedRtcDateKeys') &&
+  +    chatSource.includes('px-4 pt-3 pb-4 flex-shrink-0') &&
+  +    !chatSource.includes('px-4 pt-3 pb-safe-4 flex-shrink-0') &&
+  +    !chatSource.includes('px-4 pt-3 pb-tabbar flex-shrink-0'),
+  +  'chat history drawer should render date-grouped RTC cloud history conversations'
+   )
+   
+   assert(
+  +18 -12
+
+scripts/checkRtcHistoryHelpers.mjs
+  @@ -39,6 +39,27 @@ assert(groups[0].messages[0].content === '早餐怎么吃比较健康？', 'RTC
+  +const dateGroups = helpers.groupRtcHistoryByDate([
+  +  {
+  +    id: 'late-night',
+  +    title: '跨午夜会话',
+  +    startTime: Date.parse('2026-07-26T15:55:00Z') / 1000,
+  +    endTime: Date.parse('2026-07-26T16:05:00Z') / 1000,
+  +    messages: [],
+  +  },
+  +  {
+  +    id: 'next-day',
+  +    title: '第二天会话',
+  +    startTime: Date.parse('2026-07-27T02:00:00Z') / 1000,
+  +    endTime: Date.parse('2026-07-27T02:05:00Z') / 1000,
+  +    messages: [],
+  +  },
+  +], Date.parse('2026-07-27T04:00:00Z') / 1000)
+  +assert(dateGroups.length === 2, 'RTC groups should be organized into Shanghai calendar dates')
+  +assert(dateGroups[0].label === '今天', 'the latest Shanghai date should be labeled today')
+  +assert(dateGroups[1].label === '昨天', 'the previous Shanghai date should be labeled yesterday')
+  +assert(dateGroups[1].groups[0].id === 'late-night', 'cross-midnight sessions should use their first message date')
+  +
+   const halfWidthMarker = helpers.groupRtcDialogueRows([
+     {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。\\n\\n用户问题: 今天适合吃什么水果？'}
+   ])
+  @@ -91,11 +112,26 @@ assert(
+  +assert(
+  +  edgeSource.includes("body.action === 'delete-contexts'") &&
+  +    edgeSource.includes("const path = '/api/v1/contexts'") &&
+  +    edgeSource.includes("method: 'DELETE'") &&
+  +    edgeSource.includes('JSON.stringify(deleteBody)') &&
+  +    edgeSource.includes('deleteBody: Record<string, string> = {appId: APPID, userId}'),
+  +  'brtc-history should delete contexts with the trusted server-side appId and authenticated userId'
+  +)
+  +
+  +assert(
+  +  apiSource.includes('export async function deleteRtcContexts') &&
+  +    apiSource.includes("body: {action: 'delete-contexts'}"),
+  +  'miniapp API should expose the authenticated BRTC context deletion action'
+  +)
+  +
+   assert(
+     edgeSource.includes('DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60') &&
+       edgeSource.includes('DEFAULT_PAGE_SIZE = 100') &&
+       edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60') &&
+  -    edgeSource.includes('MAX_HISTORY_GROUPS = 10') &&
+  +    edgeSource.includes('MAX_HISTORY_GROUPS = DEFAULT_PAGE_SIZE') &&
+       edgeSource.includes('normalizeQuestionText') &&
+       edgeSource.includes('skipAnswerForHiddenQuestion') &&
+       edgeSource.includes('请分析以下食材的营养成分') &&
+  +37 -1
+
+src/db/api.ts
+  @@ -1,5 +1,10 @@
+  +import {
+  +  getNutritionPeriodRange,
+  +  getShanghaiDateKey,
+  +  toShanghaiRangeIso,
+  +} from '@/utils/nutritionDates'
+   import type {
+     Profile, FamilyMember, Device,
+     WeighingRecord, ChatSession, ChatMessage,
+  @@ -315,6 +320,22 @@ export async function getRtcHistoryGroups(options?: {
+  +export async function deleteRtcContexts(): Promise<void> {
+  +  const {data, error} = await supabase.functions.invoke<{
+  +    success?: boolean
+  +    error?: string
+  +  }>('brtc-history', {
+  +    body: {action: 'delete-contexts'}
+  +  })
+  +  if (error) {
+  +    console.error('deleteRtcContexts error:', error)
+  +    throw new Error(error.message || 'BRTC context delete request failed')
+  +  }
+  +  if (data?.error || !data?.success) {
+  +    throw new Error(data?.error || 'BRTC context delete failed')
+  +  }
+  +}
+  +
+   // ===== Reminder Settings API =====
+   export async function getReminderSettings(userId: string): Promise<ReminderSettings | null> {
+     const {data, error} = await supabase
+  @@ -336,32 +357,52 @@ export async function upsertReminderSettings(userId: string, settings: Partial<R
+  -  const now = new Date()
+  -  let startDate: Date
+  -  if (period === 'day') {
+  -    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  -  } else if (period === 'week') {
+  -    const day = now.getDay()
+  -    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day)
+  -  } else {
+  -    startDate = new Date(now.getFullYear(), now.getMonth(), 1)
+  -  }
+  +  const {startDate, endDate} = getNutritionPeriodRange(period)
+  +  return getNutritionStatsByRange(userId, memberId, startDate, endDate)
+  +}
+   
+  -  let query = supabase
+  -    .from('weighing_records')
+  -    .select('created_at, total_calories, protein, fat, carbs')
+  -    .eq('user_id', userId)
+  -    .gte('created_at', startDate.toISOString())
+  -    .order('created_at', {ascending: true})
+  -  if (memberId) query = query.eq('member_id', memberId)
+  +export async function getNutritionStatsByRange(
+  +  userId: string,
+  +  memberId: string | null,
+  +  startDate: string,
+  +  endDate: string,
+  +): Promise<NutritionStats[]> {
+  +  if (startDate > endDate) return []
+   
+  -  const {data, error} = await query
+  -  if (error) console.error('getNutritionStats error:', error)
+  +  const {startIso, endExclusiveIso} = toShanghaiRangeIso(startDate, endDate)
+  +  const rows: Array<{
+  +    created_at: string
+  +    total_calories: number | null
+  +    protein: number | null
+  +    fat: number | null
+  +    carbs: number | null
+  +  }> = []
+  +  const pageSize = 1000
+  +
+  +  for (let offset = 0; ; offset += pageSize) {
+  +    let query = supabase
+  +      .from('weighing_records')
+  +      .select('created_at, total_calories, protein, fat, carbs')
+  +      .eq('user_id', userId)
+  +      .gte('created_at', startIso)
+  +      .lt('created_at', endExclusiveIso)
+  +      .order('created_at', {ascending: true})
+  +      .range(offset, offset + pageSize - 1)
+  +    if (memberId) query = query.eq('member_id', memberId)
+  +
+  +    const {data, error} = await query
+  +    if (error) {
+  +      console.error('getNutritionStatsByRange error:', error)
+  +      return []
+  +    }
+  +    rows.push(...(data || []))
+  +    if (!data || data.length < pageSize) break
+  +  }
+   
+  -  // 按日聚合
+  +  // created_at 存储为 UTC，展示与统计统一归入上海自然日。
+     const grouped: Record<string, NutritionStats> = {}
+  -  for (const row of data || []) {
+  -    const date = row.created_at.split('T')[0]
+  +  for (const row of rows) {
+  +    const date = getShanghaiDateKey(row.created_at)
+       if (!grouped[date]) {
+         grouped[date] = {date, total_calories: 0, protein: 0, fat: 0, carbs: 0, records_count: 0}
+       }
+  +63 -22
+
+src/db/types.ts
+  @@ -59,7 +59,10 @@ export interface Ingredient {
+  -  image_url?: string | null  // 拍照识别时写入，手动输入为 null
+  +  image_id?: string | null
+  +  image_url?: string | null
+  +  thumbnail_url?: string | null
+  +  image_expires_at?: string | null
+   }
+   
+   export interface WeighingRecord {
+  +4 -1
+
+src/pages/chat/index.tsx
+  @@ -3,6 +3,7 @@
+  +import {HealthAdvisorMark} from '@/components/HealthMarks'
+   import {MarkdownRenderer} from '@/components/MarkdownRenderer'
+   import {withRouteGuard} from '@/components/RouteGuard'
+   import {useAuth} from '@/contexts/AuthContext'
+  @@ -13,10 +14,10 @@ import {useAppStore} from '@/store/appStore'
+  +import {getShanghaiDateKey, groupRtcHistoryByDate} from '@/utils/rtcHistory'
+   import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wechatPrivacy'
+   
+   const VOICE_MESSAGE_PREFIX = '🎙 '
+  -const VOICE_LONG_PRESS_MS = 120
+   const MIN_VOICE_RECORD_MS = 500
+   
+   let sharedRtcAudioContext: any = null
+  @@ -130,11 +131,13 @@ function ChatPage() {
+  +  const [expandedRtcDateKeys, setExpandedRtcDateKeys] = useState<string[]>([])
+     const [rtcHistoryLoading, setRtcHistoryLoading] = useState(false)
+     const [rtcHistoryError, setRtcHistoryError] = useState('')
+     const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
+     const [isRecording, setIsRecording] = useState(false)
+     const [isVoicePressing, setIsVoicePressing] = useState(false)
+  +  const [isVoiceStopping, setIsVoiceStopping] = useState(false)
+     const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
+     const [useProfile, setUseProfile] = useState(true)
+     const [useIngredients, setUseIngredients] = useState(false)
+  @@ -146,10 +149,11 @@ function ChatPage() {
+  -  const voicePressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+     const voicePressingRef = useRef(false)
+  +  const voiceStopRequestedRef = useRef(false)
+     const voiceRecordStartingRef = useRef(false)
+     const voiceRecordStartedAtRef = useRef(0)
+  +  const voiceRecordingAttemptRef = useRef(0)
+     const [voiceMode, setVoiceMode] = useState(false)
+     const voiceSessionRef = useRef<ChatSession | null>(null)
+   
+  @@ -161,6 +165,12 @@ function ChatPage() {
+  +      const dateGroups = groupRtcHistoryByDate(data)
+  +      setExpandedRtcDateKeys(current => {
+  +        const availableKeys = new Set(dateGroups.map(group => group.dateKey))
+  +        const retainedKeys = current.filter(key => availableKeys.has(key))
+  +        return retainedKeys.length > 0 ? retainedKeys : (dateGroups[0] ? [dateGroups[0].dateKey] : [])
+  +      })
+       } catch (err: any) {
+         console.error('加载 RTC 云端历史失败:', err?.message || err)
+         setRtcHistoryError(err?.message || 'RTC 云端历史加载失败')
+  @@ -182,7 +192,8 @@ function ChatPage() {
+  -      if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
+  +      voiceRecordingAttemptRef.current += 1
+  +      recorderManager.current?.stop()
+         audioContextRef.current?.destroy()
+         audioContextRef.current = null
+         liveAudioPlayerRef.current?.stop()
+  @@ -629,33 +640,40 @@ function ChatPage() {
+  +    voiceStopRequestedRef.current = false
+       if (!await ensureRecordPermission()) {
+         voiceRecordStartingRef.current = false
+  +      setIsVoiceStopping(false)
+         return
+       }
+  -    if (!voicePressingRef.current) {
+  +    if (!voicePressingRef.current || voiceStopRequestedRef.current) {
+         voiceRecordStartingRef.current = false
+  +      setIsVoiceStopping(false)
+         return
+       }
+   
+       const doStartRecord = () => {
+         const rm = Taro.getRecorderManager()
+  +      const attemptId = voiceRecordingAttemptRef.current + 1
+  +      voiceRecordingAttemptRef.current = attemptId
+         recorderManager.current = rm
+         voiceCancelRef.current = false
+         setIsRecordingCanceling(false)
+         rm.onStart(() => {
+  +        if (voiceRecordingAttemptRef.current !== attemptId) return
+           voiceRecordStartingRef.current = false
+  -        if (!voicePressingRef.current) {
+  -          recorderManager.current?.stop()
+  -          return
+  -        }
+           voiceRecordStartedAtRef.current = Date.now()
+           setIsRecording(true)
+  +        if (!voicePressingRef.current || voiceStopRequestedRef.current) rm.stop()
+         })
+         rm.onStop(async (res) => {
+  +        if (voiceRecordingAttemptRef.current !== attemptId) return
+           voiceRecordStartingRef.current = false
+  +        voiceStopRequestedRef.current = false
+  +        recorderManager.current = null
+           setIsRecording(false)
+           setIsVoicePressing(false)
+  +        setIsVoiceStopping(false)
+           setIsRecordingCanceling(false)
+           if (voiceCancelRef.current) {
+             voiceCancelRef.current = false
+  @@ -718,6 +736,18 @@ function ChatPage() {
+  +      rm.onError(() => {
+  +        if (voiceRecordingAttemptRef.current !== attemptId) return
+  +        voiceRecordStartingRef.current = false
+  +        voiceStopRequestedRef.current = false
+  +        voiceRecordStartedAtRef.current = 0
+  +        recorderManager.current = null
+  +        setIsRecording(false)
+  +        setIsVoicePressing(false)
+  +        setIsVoiceStopping(false)
+  +        setIsRecordingCanceling(false)
+  +        Taro.showToast({title: '录音失败，请重试', icon: 'none'})
+  +      })
+         rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+       }
+   
+  @@ -725,39 +755,41 @@ function ChatPage() {
+  +    if (voicePressingRef.current || voiceRecordStartingRef.current || isRecording) return
+       unlockRtcAudioPlayback('voice-touch')
+       if (isLoading) interruptActiveChatResponse('voice-touch')
+       voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
+       voiceCancelRef.current = false
+  +    voiceStopRequestedRef.current = false
+       voicePressingRef.current = true
+       setIsVoicePressing(true)
+  +    setIsVoiceStopping(false)
+       setIsRecordingCanceling(false)
+  -    if (voicePressTimerRef.current) clearTimeout(voicePressTimerRef.current)
+  -    voicePressTimerRef.current = setTimeout(() => {
+  -      voicePressTimerRef.current = null
+  -      void startVoiceRecording()
+  -    }, VOICE_LONG_PRESS_MS)
+  -  }, [interruptActiveChatResponse, isLoading, startVoiceRecording])
+  +    void startVoiceRecording()
+  +  }, [interruptActiveChatResponse, isLoading, isRecording, startVoiceRecording])
+   
+     const handleVoiceTouchMove = useCallback((event: any) => {
+  -    if (!isRecording) return
+  +    if (!voicePressingRef.current) return
+       const currentY = event?.touches?.[0]?.clientY || voiceTouchStartYRef.current
+       const shouldCancel = voiceTouchStartYRef.current - currentY > 48
+       voiceCancelRef.current = shouldCancel
+       setIsRecordingCanceling(shouldCancel)
+  -  }, [isRecording])
+  +  }, [])
+   
+     const handleVoiceTouchEnd = useCallback(() => {
+  +    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !isRecording) return
+       voicePressingRef.current = false
+  +    voiceStopRequestedRef.current = true
+       setIsVoicePressing(false)
+  -    if (voicePressTimerRef.current) {
+  -      clearTimeout(voicePressTimerRef.current)
+  -      voicePressTimerRef.current = null
+  -      setIsRecordingCanceling(false)
+  -      return
+  -    }
+  +    setIsVoiceStopping(true)
+       recorderManager.current?.stop()
+  -  }, [])
+  +  }, [isRecording])
+  +
+  +  const handleVoiceTouchCancel = useCallback(() => {
+  +    voiceCancelRef.current = true
+  +    setIsRecordingCanceling(true)
+  +    handleVoiceTouchEnd()
+  +  }, [handleVoiceTouchEnd])
+   
+     const handleSend = () => {
+       if (isLoading || !inputText.trim()) return
+  @@ -781,18 +813,19 @@ function ChatPage() {
+  +    timeZone: 'Asia/Shanghai',
+     })
+     const formatRtcGroupTime = (group: RtcHistoryGroup) => {
+  -    const start = new Date(group.startTime * 1000)
+  -    const end = new Date(group.endTime * 1000)
+  -    const date = end.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})
+  -    if (start.toDateString() === end.toDateString()) {
+  -      return `${date} ${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
+  +    const startDate = getShanghaiDateKey(group.startTime)
+  +    const endDate = getShanghaiDateKey(group.endTime)
+  +    if (startDate === endDate) {
+  +      return `${formatRtcClock(group.startTime)}-${formatRtcClock(group.endTime)}`
+       }
+  -    return `${date} 截止 ${formatRtcClock(group.endTime)}`
+  +    return `${endDate.slice(5).replace('-', '/')} 截止 ${formatRtcClock(group.endTime)}`
+     }
+  +  const rtcHistoryDateGroups = useMemo(() => groupRtcHistoryByDate(rtcHistoryGroups), [rtcHistoryGroups])
+     const hasAnyHistory = rtcHistoryGroups.length > 0
+  -  const isVoiceButtonActive = isRecording || isVoicePressing
+  +  const isVoiceButtonActive = isRecording || isVoicePressing || isVoiceStopping
+   
+     return (
+       <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
+  @@ -869,7 +902,7 @@ function ChatPage() {
+  -              <div className="i-mdi-robot-happy text-4xl text-white" />
+  +              <HealthAdvisorMark size={40} className="text-white" />
+               </div>
+               <p className="text-2xl font-semibold text-foreground">AI健康顾问</p>
+               <p className="text-xl text-muted-foreground text-center px-6">有任何饮食健康问题都可以向我咨询</p>
+  @@ -902,7 +935,7 @@ function ChatPage() {
+  -                    <div className="i-mdi-robot text-xl text-white" />
+  +                    <HealthAdvisorMark size={20} className="text-white" />
+                     </div>
+                   )}
+                   <div className="flex flex-col items-start" style={{maxWidth: '75%'}}>
+  @@ -992,7 +1025,7 @@ function ChatPage() {
+  -                  <div className="i-mdi-robot text-xl text-white" />
+  +                  <HealthAdvisorMark size={20} className="text-white" />
+                   </div>
+                   <div className="rounded-2xl rounded-bl-[4px] px-4 py-4" style={{backgroundColor: '#F2F2F2'}}>
+                     <div className="flex gap-1">
+  @@ -1039,7 +1072,7 @@ function ChatPage() {
+  -              onTouchCancel={handleVoiceTouchEnd}
+  +              onTouchCancel={handleVoiceTouchCancel}
+                 onTouchEnd={handleVoiceTouchEnd}
+               >
+                 {isVoiceButtonActive ? (
+  @@ -1064,7 +1097,7 @@ function ChatPage() {
+  -                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
+  +                      {isRecordingCanceling ? '松手取消' : (isVoiceStopping ? '正在发送...' : (isRecording ? '录音中...' : '准备录音...'))}
+                       </span>
+                       <div className="flex items-end gap-0.5" style={{height: '16px'}}>
+                         {[0,1,2,3,4].map(i => (
+  @@ -1144,7 +1177,7 @@ function ChatPage() {
+  -                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按 30 分钟自动分段</p>
+  +                <p className="text-xl text-muted-foreground mt-1">RTC 云端记录，按日期整理</p>
+                 </div>
+                 <div className="flex items-center gap-4">
+                   <button
+  @@ -1185,36 +1218,60 @@ function ChatPage() {
+  -                  {rtcHistoryGroups.length > 0 && (
+  +                  {rtcHistoryDateGroups.length > 0 && (
+                       <div>
+                         <div className="px-4 py-2 bg-secondary/60 border-b border-border">
+  -                        <p className="text-xl font-semibold text-foreground">最近 10 个历史对话</p>
+  +                        <p className="text-xl font-semibold text-foreground">最近 30 天</p>
+                         </div>
+  -                      {rtcHistoryGroups.map(group => (
+  -                  <div
+  -                    key={group.id}
+  -                    className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
+  -                    style={{minHeight: '56px'}}
+  -                    onClick={() => handleSelectRtcHistory(group)}
+  -                  >
+  -                    <div className="i-mdi-cloud-outline text-xl text-muted-foreground flex-shrink-0" />
+  -                    <div className="flex-1 min-w-0">
+  -                      <p className="text-xl font-medium text-foreground" style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+  -                        {group.title}
+  -                      </p>
+  -                      <p className="text-xl text-muted-foreground">
+  -                        {formatRtcGroupTime(group)}
+  -                      </p>
+  -                    </div>
+  -                    <div className="i-mdi-chevron-right text-2xl text-muted-foreground flex-shrink-0" />
+  -                  </div>
+  -                      ))}
+  +                      {rtcHistoryDateGroups.map(dateGroup => {
+  +                        const isExpanded = expandedRtcDateKeys.includes(dateGroup.dateKey)
+  +                        return (
+  +                          <div key={dateGroup.id}>
+  +                            <button
+  +                              type="button"
+  +                              className="w-full flex items-center justify-between gap-3 px-4 bg-white border-b border-border active:bg-secondary/40"
+  +                              style={{minHeight: '48px'}}
+  +                              onClick={() => setExpandedRtcDateKeys(current => (
+  +                                current.includes(dateGroup.dateKey)
+  +                                  ? current.filter(key => key !== dateGroup.dateKey)
+  +                                  : [...current, dateGroup.dateKey]
+  +                              ))}
+  +                            >
+  +                              <span className="flex items-center gap-2 min-w-0">
+  +                                <span className="i-mdi-calendar-blank-outline text-xl text-muted-foreground flex-shrink-0" />
+  +                                <span className="text-xl font-semibold text-foreground">{dateGroup.label}</span>
+  +                                <span className="text-xl text-muted-foreground">{dateGroup.groups.length} 个会话</span>
+  +                              </span>
+  +                              <span className={`${isExpanded ? 'i-mdi-chevron-up' : 'i-mdi-chevron-down'} text-2xl text-muted-foreground flex-shrink-0`} />
+  +                            </button>
+  +                            {isExpanded && dateGroup.groups.map(group => (
+  +                              <div
+  +                                key={group.id}
+  +                                className={`flex items-center gap-3 px-4 border-b border-border ${activeRtcGroupId === group.id ? 'bg-primary/10' : ''}`}
+  +                                style={{minHeight: '56px', paddingLeft: '36px'}}
+
+... (more changes truncated)
+  +97 -57
+[full diff: rtk git diff --no-compact]
+diff --git a/src/utils/foodImage.ts b/src/utils/foodImage.ts
+new file mode 100644
+index 00000000..13e5aeb3
+--- /dev/null
++++ b/src/utils/foodImage.ts
+@@ -0,0 +1,67 @@
++export const FOOD_IMAGE_LARGE_MAX_EDGE = 1280
++export const FOOD_IMAGE_LARGE_MAX_BYTES = 300 * 1024
++export const FOOD_IMAGE_THUMB_MAX_EDGE = 320
++export const FOOD_IMAGE_THUMB_TARGET_BYTES = 40 * 1024
++export const FOOD_IMAGE_THUMB_MAX_BYTES = 50 * 1024
++
++export interface FoodImageFields {
++  image_id?: string | null
++  image_url?: string | null
++  thumbnail_url?: string | null
++  image_expires_at?: string | null
++}
++
++export interface FoodImageDisplay {
++  listUrl: string | null
++  previewUrl: string | null
++  largeExpired: boolean
++}
++
++export function scaleImageDimensions(width: number, height: number, maxEdge: number): {width: number; height: number} {
++  const safeWidth = Math.max(1, Math.round(width))
++  const safeHeight = Math.max(1, Math.round(height))
++  const longest = Math.max(safeWidth, safeHeight)
++  if (longest <= maxEdge) return {width: safeWidth, height: safeHeight}
++  const ratio = maxEdge / longest
++  return {
++    width: Math.max(1, Math.round(safeWidth * ratio)),
++    height: Math.max(1, Math.round(safeHeight * ratio)),
++  }
++}
++
++export function nextCompressionQuality(currentQuality: number, byteSize: number, maxBytes: number, minQuality: number): number {
++  if (byteSize <= maxBytes) return currentQuality
++  const ratio = maxBytes / Math.max(1, byteSize)
++  const step = ratio < 0.5 ? 18 : ratio < 0.75 ? 12 : 8
++  return Math.max(minQuality, currentQuality - step)
++}
++
++export function canReuseSourceAsLarge(width: number, height: number, byteSize: number, imageType: string): boolean {
++  const normalizedType = imageType.toLowerCase()
++  return (
++    (normalizedType === 'jpg' || normalizedType === 'jpeg') &&
++    Math.max(width, height) <= FOOD_IMAGE_LARGE_MAX_EDGE &&
++    byteSize <= FOOD_IMAGE_LARGE_MAX_BYTES
++  )
++}
++
++export function isRemoteImageUrl(value: unknown): value is string {
++  if (typeof value !== 'string' || !value) return false
++  try {
++    return new URL(value).protocol === 'https:'
++  } catch {
++    return false
++  }
++}
++
++export function getFoodImageDisplay(image: FoodImageFields, nowMs = Date.now()): FoodImageDisplay {
++  const largeUrl = isRemoteImageUrl(image.image_url) ? image.image_url : null
++  const thumbnailUrl = isRemoteImageUrl(image.thumbnail_url) ? image.thumbnail_url : null
++  const expiresAtMs = image.image_expires_at ? Date.parse(image.image_expires_at) : Number.NaN
++  const largeExpired = Boolean(largeUrl && Number.isFinite(expiresAtMs) && expiresAtMs <= nowMs)
++  return {
++    listUrl: thumbnailUrl || (largeExpired ? null : largeUrl),
++    previewUrl: largeExpired ? thumbnailUrl : (largeUrl || thumbnailUrl),
++    largeExpired,
++  }
++}
+diff --git a/src/utils/foodImageCompression.ts b/src/utils/foodImageCompression.ts
+new file mode 100644
+index 00000000..ec94700b
+--- /dev/null
++++ b/src/utils/foodImageCompression.ts
+@@ -0,0 +1,103 @@
++import Taro from '@tarojs/taro'
++import {
++  FOOD_IMAGE_LARGE_MAX_BYTES,
++  FOOD_IMAGE_LARGE_MAX_EDGE,
++  FOOD_IMAGE_THUMB_MAX_BYTES,
++  FOOD_IMAGE_THUMB_MAX_EDGE,
++  canReuseSourceAsLarge,
++  nextCompressionQuality,
++  scaleImageDimensions,
++} from './foodImage'
++
++export interface CompressedFoodImageVariant {
++  path: string
++  byteSize: number
++  width: number
++  height: number
++  quality: number
++}
++
++export interface CompressedFoodImages {
++  large: CompressedFoodImageVariant
++  thumbnail: CompressedFoodImageVariant
++}
++
++function getFileSize(filePath: string): Promise<number> {
++  return new Promise((resolve, reject) => {
++    Taro.getFileSystemManager().getFileInfo({
++      filePath,
++      success: info => resolve(info.size),
++      fail: reject,
++    })
++  })
++}
++
++async function compressVariant(params: {
++  sourcePath: string
++  sourceWidth: number
++  sourceHeight: number
++  maxEdge: number
++  maxBytes: number
++  initialQuality: number
++  minQuality: number
++}): Promise<CompressedFoodImageVariant> {
++  const dimensions = scaleImageDimensions(params.sourceWidth, params.sourceHeight, params.maxEdge)
++  let quality = params.initialQuality
++  let lastResult: CompressedFoodImageVariant | null = null
++
++  for (let attempt = 0; attempt < 5; attempt += 1) {
++    const result = await Taro.compressImage({
++      src: params.sourcePath,
++      quality,
++      compressedWidth: dimensions.width,
++      compressedHeight: dimensions.height,
++    })
++    const byteSize = await getFileSize(result.tempFilePath)
++    lastResult = {...dimensions, path: result.tempFilePath, byteSize, quality}
++    if (byteSize <= params.maxBytes) return lastResult
++
++    const nextQuality = nextCompressionQuality(quality, byteSize, params.maxBytes, params.minQuality)
++    if (nextQuality === quality) break
++    quality = nextQuality
++  }
++
++  if (!lastResult || lastResult.byteSize > params.maxBytes) {
++    throw new Error(`图片压缩后仍超过 ${(params.maxBytes / 1024).toFixed(0)}KB`)
++  }
++  return lastResult
++}
++
++export async function compressFoodImages(sourcePath: string): Promise<CompressedFoodImages> {
++  const source = await Taro.getImageInfo({src: sourcePath})
++  const sourceByteSize = await getFileSize(sourcePath)
++  const largePromise = canReuseSourceAsLarge(source.width, source.height, sourceByteSize, source.type)
++    ? Promise.resolve({
++        path: sourcePath,
++        byteSize: sourceByteSize,
++        width: source.width,
++        height: source.height,
++        quality: 100,
++      })
++    : compressVariant({
++        sourcePath,
++        sourceWidth: source.width,
++        sourceHeight: source.height,
++        maxEdge: FOOD_IMAGE_LARGE_MAX_EDGE,
++        maxBytes: FOOD_IMAGE_LARGE_MAX_BYTES,
++        initialQuality: 76,
++        minQuality: 45,
++      })
++  const [large, thumbnail] = await Promise.all([
++    largePromise,
++    compressVariant({
++      sourcePath,
++      sourceWidth: source.width,
++      sourceHeight: source.height,
++      maxEdge: FOOD_IMAGE_THUMB_MAX_EDGE,
++      maxBytes: FOOD_IMAGE_THUMB_MAX_BYTES,
++      initialQuality: 68,
++      minQuality: 32,
++    }),
++  ])
++  return {large, thumbnail}
++}
+diff --git a/src/services/foodImageStorage.ts b/src/services/foodImageStorage.ts
+new file mode 100644
+index 00000000..cef193e1
+--- /dev/null
++++ b/src/services/foodImageStorage.ts
+@@ -0,0 +1,43 @@
++import {supabase} from '@/client/supabase'
++import {isRemoteImageUrl} from '@/utils/foodImage'
++import type {CompressedFoodImageVariant} from '@/utils/foodImageCompression'
++
++export interface StoredFoodImage {
++  image_id: string
++  image_url: string
++  thumbnail_url: string
++  image_expires_at: string
++}
++
++export async function uploadFoodImageVariants(params: {
++  largeImage: string
++  thumbnailImage: string
++  large: CompressedFoodImageVariant
++  thumbnail: CompressedFoodImageVariant
++}): Promise<StoredFoodImage> {
++  const {data, error} = await supabase.functions.invoke<{
++    imageId?: string
++    largeUrl?: string
++    thumbnailUrl?: string
++    largeExpiresAt?: string
++    message?: string
++  }>('upload-food-image', {
++    body: {
++      action: 'upload',
++      largeImage: params.largeImage,
++      thumbnailImage: params.thumbnailImage,
++      largeMeta: {width: params.large.width, height: params.large.height},
++      thumbnailMeta: {width: params.thumbnail.width, height: params.thumbnail.height},
++    },
++  })
++  if (error) throw new Error(error.message || '食材图片上传失败')
++  if (!data?.imageId || !isRemoteImageUrl(data.largeUrl) || !isRemoteImageUrl(data.thumbnailUrl) || !data.largeExpiresAt) {
++    throw new Error(data?.message || '食材图片上传响应无效')
++  }
++  return {
++    image_id: data.imageId,
++    image_url: data.largeUrl,
++    thumbnail_url: data.thumbnailUrl,
++    image_expires_at: data.largeExpiresAt,
++  }
++}
+diff --git a/supabase/functions/food-image-cleanup/index.ts b/supabase/functions/food-image-cleanup/index.ts
+new file mode 100644
+index 00000000..4d659cae
+--- /dev/null
++++ b/supabase/functions/food-image-cleanup/index.ts
+@@ -0,0 +1,61 @@
++import {corsHeaders, getSupabaseAdmin, handleError, HttpError, json} from '../_shared/common.ts'
++
++const BUCKET = 'chat-images'
++
++type CleanupCandidate = {
++  id: string
++  large_path: string
++  thumbnail_path: string
++  delete_all: boolean
++}
++
++Deno.serve(async (req: Request): Promise<Response> => {
++  if (req.method === 'OPTIONS') return new Response(null, {status: 204, headers: corsHeaders})
++  if (req.method !== 'POST') return json({message: 'Method Not Allowed'}, 405)
++  try {
++    const expectedSecret = Deno.env.get('FOOD_IMAGE_CLEANUP_SECRET') || ''
++    const suppliedSecret = req.headers.get('x-dispatch-secret') || ''
++    if (!expectedSecret || suppliedSecret !== expectedSecret) throw new HttpError(401, 'Unauthorized')
++
++    const parsedBody = await req.json().catch(() => ({}))
++    const body = parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
++      ? parsedBody as Record<string, unknown>
++      : {}
++    const requestedBatch = Number(body.batchSize)
++    const batchSize = Number.isFinite(requestedBatch) ? Math.max(1, Math.min(500, Math.floor(requestedBatch))) : 100
++    const admin = getSupabaseAdmin()
++    const {data, error} = await admin.rpc('get_food_images_for_cleanup', {batch_size: batchSize})
++    if (error) throw error
++
++    let largeDeleted = 0
++    let orphanDeleted = 0
++    const failures: string[] = []
++    for (const candidate of (data || []) as CleanupCandidate[]) {
++      const paths = candidate.delete_all
++        ? [candidate.large_path, candidate.thumbnail_path]
++        : [candidate.large_path]
++      const {error: storageError} = await admin.storage.from(BUCKET).remove(paths)
++      if (storageError) {
++        failures.push(candidate.id)
++        continue
++      }
++
++      if (candidate.delete_all) {
++        const {error: deleteError} = await admin.from('food_images').delete().eq('id', candidate.id)
++        if (deleteError) failures.push(candidate.id)
++        else orphanDeleted += 1
++      } else {
++        const {error: updateError} = await admin.from('food_images')
++          .update({large_deleted_at: new Date().toISOString()})
++          .eq('id', candidate.id)
++          .is('large_deleted_at', null)
++        if (updateError) failures.push(candidate.id)
++        else largeDeleted += 1
++      }
++    }
++
++    return json({scanned: (data || []).length, largeDeleted, orphanDeleted, failures})
++  } catch (error) {
++    return handleError(error, 'food-image-cleanup')
++  }
++})
+diff --git a/scripts/checkFoodImageCompression.mjs b/scripts/checkFoodImageCompression.mjs
+new file mode 100644
+index 00000000..fcedeee5
+--- /dev/null
++++ b/scripts/checkFoodImageCompression.mjs
+@@ -0,0 +1,86 @@
++import {readFileSync} from 'node:fs'
++import {dirname, resolve} from 'node:path'
++import {fileURLToPath} from 'node:url'
++import ts from 'typescript'
++
++const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
++const helperSource = readFileSync(resolve(root, 'src/utils/foodImage.ts'), 'utf8')
++const compressionSource = readFileSync(resolve(root, 'src/utils/foodImageCompression.ts'), 'utf8')
++const uploadSource = readFileSync(resolve(root, 'supabase/functions/upload-food-image/index.ts'), 'utf8')
++const cleanupSource = readFileSync(resolve(root, 'supabase/functions/food-image-cleanup/index.ts'), 'utf8')
++const migrationSource = readFileSync(resolve(root, 'supabase/migrations/00006_food_image_lifecycle.sql'), 'utf8')
++const homeSource = readFileSync(resolve(root, 'src/pages/home/index.tsx'), 'utf8')
++const js = ts.transpileModule(helperSource, {
++  compilerOptions: {module: 99, target: 99},
++}).outputText
++const helpers = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message)
++}
++
++assert(
++  JSON.stringify(helpers.scaleImageDimensions(4000, 3000, 1280)) === JSON.stringify({width: 1280, height: 960}),
++  'large image dimensions should preserve aspect ratio at 1280px'
++)
++assert(
++  JSON.stringify(helpers.scaleImageDimensions(612, 612, 320)) === JSON.stringify({width: 320, height: 320}),
++  'thumbnail dimensions should cap the long edge at 320px'
++)
++assert(helpers.nextCompressionQuality(68, 80 * 1024, 50 * 1024, 32) < 68, 'oversized images should lower quality')
++assert(helpers.nextCompressionQuality(40, 100 * 1024, 50 * 1024, 32) >= 32, 'quality should never fall below the minimum')
++assert(helpers.canReuseSourceAsLarge(612, 612, 35689, 'jpeg'), 'small JPEG files should be reused without re-encoding')
++assert(!helpers.canReuseSourceAsLarge(2000, 1200, 35689, 'jpeg'), 'oversized dimensions should require compression')
++assert(!helpers.canReuseSourceAsLarge(612, 612, 35689, 'png'), 'non-JPEG files should be converted before upload')
++assert(helpers.isRemoteImageUrl('https://example.com/image.jpg'), 'HTTPS image URLs should be accepted')
++assert(!helpers.isRemoteImageUrl('wxfile://tmp/image.jpg'), 'temporary miniapp paths must not be persisted')
++
++const image = {
++  image_url: 'https://example.com/large.jpg',
++  thumbnail_url: 'https://example.com/thumb.jpg',
++  image_expires_at: '2026-07-25T00:00:00.000Z',
++}
++assert(
++  helpers.getFoodImageDisplay(image, Date.parse('2026-07-24T00:00:00.000Z')).previewUrl === image.image_url,
++  'unexpired images should preview the large variant'
++)
++const expired = helpers.getFoodImageDisplay(image, Date.parse('2026-07-26T00:00:00.000Z'))
++assert(expired.largeExpired && expired.previewUrl === image.thumbnail_url, 'expired large images should fall back to the thumbnail')
++
++assert(
++  compressionSource.includes('FOOD_IMAGE_LARGE_MAX_EDGE') &&
++    compressionSource.includes('FOOD_IMAGE_THUMB_MAX_EDGE') &&
++    compressionSource.includes('compressedWidth') &&
++    compressionSource.includes('compressedHeight') &&
++    compressionSource.includes('nextCompressionQuality'),
++  'Taro compression should enforce dimensions and retry quality based on byte size'
++)
++assert(
++  uploadSource.includes('getAuthUserId(req)') &&
++    uploadSource.includes('LARGE_MAX_BYTES = 300 * 1024') &&
++    uploadSource.includes('THUMBNAIL_MAX_BYTES = 50 * 1024') &&
++    uploadSource.includes('`${userId}/${imageId}/large.jpg`') &&
++    uploadSource.includes('`${userId}/${imageId}/thumb.jpg`'),
++  'image upload should authenticate users, enforce size limits, and isolate storage paths by user'
++)
++assert(
++  migrationSource.includes("interval '30 days'") &&
++    migrationSource.includes("interval '24 hours'") &&
++    migrationSource.includes('food_image_records') &&
++    migrationSource.includes('weighing_records_link_food_images'),
++  'image metadata should retain large images for 30 days and track thumbnails against weighing records'
++)
++assert(
++  cleanupSource.includes("Deno.env.get('FOOD_IMAGE_CLEANUP_SECRET')") &&
++    cleanupSource.includes("admin.storage.from(BUCKET).remove(paths)"),
++  'cleanup dispatch should be secret-protected and remove expired storage objects'
++)
++assert(
++  homeSource.includes('lazyLoad') &&
++    homeSource.includes('Taro.previewImage') &&
++    homeSource.includes('onError={() => setFailedHistoryImages') &&
++    homeSource.includes('getFoodImageDisplay(ing)'),
++  'weighing history should lazy-load thumbnails, support native preview, and handle image errors'
++)
++
++console.log('food image compression checks passed')
+diff --git a/src/utils/nutritionDates.ts b/src/utils/nutritionDates.ts
+new file mode 100644
+index 00000000..4180a5d2
+--- /dev/null
++++ b/src/utils/nutritionDates.ts
+@@ -0,0 +1,66 @@
++export type NutritionPeriod = 'day' | 'week' | 'month'
++
++const DAY_MS = 24 * 60 * 60 * 1000
++const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000
++
++function parseDateKey(dateKey: string): Date {
++  const [year, month, day] = dateKey.split('-').map(Number)
++  return new Date(Date.UTC(year, month - 1, day))
++}
++
++function formatUtcDate(date: Date): string {
++  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`
++}
++
++export function getShanghaiDateKey(value: Date | string = new Date()): string {
++  const date = value instanceof Date ? value : new Date(value)
++  return formatUtcDate(new Date(date.getTime() + SHANGHAI_OFFSET_MS))
++}
++
++export function addDaysToDateKey(dateKey: string, days: number): string {
++  const date = parseDateKey(dateKey)
++  date.setUTCDate(date.getUTCDate() + days)
++  return formatUtcDate(date)
++}
++
++export function differenceInCalendarDays(startDate: string, endDate: string): number {
++  return Math.round((parseDateKey(endDate).getTime() - parseDateKey(startDate).getTime()) / DAY_MS)
++}
++
++export function getNutritionPeriodRange(period: NutritionPeriod, now: Date = new Date()) {
++  const endDate = getShanghaiDateKey(now)
++  let startDate = endDate
++
++  if (period === 'week') {
++    const weekday = parseDateKey(endDate).getUTCDay()
++    const daysSinceMonday = (weekday + 6) % 7
++    startDate = addDaysToDateKey(endDate, -daysSinceMonday)
++  } else if (period === 'month') {
++    startDate = `${endDate.slice(0, 7)}-01`
++  }
++
++  return {
++    startDate,
++    endDate,
++    elapsedDays: differenceInCalendarDays(startDate, endDate) + 1,
++  }
++}
++
++export function getYearDateRange(year: number, today = getShanghaiDateKey()) {
++  const currentYear = Number(today.slice(0, 4))
++  return {
++    startDate: `${year}-01-01`,
++    endDate: year === currentYear ? today : `${year}-12-31`,
++  }
++}
++
++export function toShanghaiRangeIso(startDate: string, endDate: string) {
++  return {
++    startIso: new Date(`${startDate}T00:00:00+08:00`).toISOString(),
++    endExclusiveIso: new Date(`${addDaysToDateKey(endDate, 1)}T00:00:00+08:00`).toISOString(),
++  }
++}
++
++export function getDaysInMonth(year: number, month: number): number {
++  return new Date(Date.UTC(year, month, 0)).getUTCDate()
++}
+diff --git a/scripts/checkNutritionDates.mjs b/scripts/checkNutritionDates.mjs
+new file mode 100644
+index 00000000..9deb3efa
+--- /dev/null
++++ b/scripts/checkNutritionDates.mjs
+@@ -0,0 +1,44 @@
++import {readFileSync} from 'node:fs'
++import {resolve} from 'node:path'
++import ts from 'typescript'
++
++const source = readFileSync(resolve('src/utils/nutritionDates.ts'), 'utf8')
++const compiled = ts.transpileModule(source, {
++  compilerOptions: {module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022},
++}).outputText
++const helpers = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
++
++function assertEqual(actual, expected, message) {
++  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
++    throw new Error(`${message}\nExpected: ${JSON.stringify(expected)}\nActual: ${JSON.stringify(actual)}`)
++  }
++}
++
++assertEqual(
++  helpers.getShanghaiDateKey('2026-07-20T15:59:59.000Z'),
++  '2026-07-20',
++  'timestamps before Shanghai midnight remain on the previous date',
++)
++assertEqual(
++  helpers.getShanghaiDateKey('2026-07-20T16:00:00.000Z'),
++  '2026-07-21',
++  'timestamps at Shanghai midnight move to the next date',
++)
++assertEqual(
++  helpers.getNutritionPeriodRange('week', new Date('2026-07-21T04:00:00.000Z')),
++  {startDate: '2026-07-20', endDate: '2026-07-21', elapsedDays: 2},
++  'weekly periods start on Monday and average over elapsed natural days',
++)
++assertEqual(
++  helpers.getNutritionPeriodRange('month', new Date('2026-07-21T04:00:00.000Z')),
++  {startDate: '2026-07-01', endDate: '2026-07-21', elapsedDays: 21},
++  'monthly periods average over elapsed natural days',
++)
++assertEqual(
++  helpers.toShanghaiRangeIso('2026-07-21', '2026-07-22'),
++  {startIso: '2026-07-20T16:00:00.000Z', endExclusiveIso: '2026-07-22T16:00:00.000Z'},
++  'database ranges include the full Shanghai end date',
++)
++assertEqual(helpers.getDaysInMonth(2024, 2), 29, 'leap-year February contains 29 days')
++
++console.log('nutrition date checks passed')

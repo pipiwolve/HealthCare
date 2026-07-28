@@ -1,15 +1,18 @@
 // @title 饮食统计
 
-import {Canvas, Image} from '@tarojs/components'
+import {Canvas} from '@tarojs/components'
 import Taro, {useDidShow} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useState} from 'react'
+import {MacroDonutChart} from '@/components/MacroDonutChart'
+import {NutritionMemberSwitcher} from '@/components/NutritionMemberSwitcher'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
 import {getNutritionStats} from '@/db/api'
 import type {NutritionStats} from '@/db/types'
 import {useAppStore} from '@/store/appStore'
+import {getChartCanvasContext} from '@/utils/chartCanvas'
 import {NUTRITION_RECORDS_UPDATED} from '@/utils/nutrition'
-import {getMemberAvatar} from '@/utils/avatarUtils'
+import {addDaysToDateKey, getDaysInMonth, getNutritionPeriodRange} from '@/utils/nutritionDates'
 
 type Period = 'day' | 'week' | 'month'
 
@@ -26,7 +29,8 @@ function TrendLineChart({data, mode, xSubTitle}: {
   useEffect(() => {
     if (!data.length) return
     const timer = setTimeout(() => {
-      const ctx = Taro.createCanvasContext(canvasId)
+      const ctx = getChartCanvasContext(canvasId)
+      if (!ctx) return
       const sys = Taro.getSystemInfoSync()
       // 算出 canvas 实际可用宽度：屏幕宽 - 页面 px-4(32) - 卡片 p-4(32)
       const cssW = Math.max(sys.windowWidth - 64, 280)
@@ -195,29 +199,10 @@ function TrendLineChart({data, mode, xSubTitle}: {
 
 function StatsPage() {
   const {user} = useAuth()
-  const {activeMember, familyMembers, loadingMembers, setActiveMemberById} = useAppStore()
+  const {activeMember} = useAppStore()
   const [period, setPeriod] = useState<Period>('day')
   const [stats, setStats] = useState<NutritionStats[]>([])
   const [loading, setLoading] = useState(false)
-  const [showMemberPicker, setShowMemberPicker] = useState(false)
-  const [switchingMemberId, setSwitchingMemberId] = useState<string | null>(null)
-
-  const handleSelectMember = useCallback(async (memberId: string) => {
-    if (memberId === activeMember?.id) {
-      setShowMemberPicker(false)
-      return
-    }
-    setSwitchingMemberId(memberId)
-    try {
-      await setActiveMemberById(memberId)
-      setShowMemberPicker(false)
-    } catch (error) {
-      console.error('切换统计成员失败:', error)
-      Taro.showToast({title: '切换成员失败，请重试', icon: 'none'})
-    } finally {
-      setSwitchingMemberId(null)
-    }
-  }, [activeMember?.id, setActiveMemberById])
 
   const loadStats = useCallback(async () => {
     if (!user) return
@@ -243,6 +228,7 @@ function StatsPage() {
 
   // 聚合数据 — 直接使用真实数据
   const effectiveStats = stats
+  const periodRange = getNutritionPeriodRange(period)
 
   const summary = useMemo(() => {
     const total = effectiveStats.reduce((acc, s) => ({
@@ -251,7 +237,7 @@ function StatsPage() {
       fat: acc.fat + s.fat,
       carbs: acc.carbs + s.carbs
     }), {calories: 0, protein: 0, fat: 0, carbs: 0})
-    const days = effectiveStats.length || 1
+    const days = periodRange.elapsedDays
     return {
       total,
       avg: {
@@ -261,40 +247,30 @@ function StatsPage() {
         carbs: total.carbs / days
       }
     }
-  }, [effectiveStats])
+  }, [effectiveStats, periodRange.elapsedDays])
 
   // 目标对比（使用成员目标或默认值）
   const calorieGoal = activeMember?.daily_calorie_goal || (activeMember?.gender === 'male' ? 2000 : 1600) || 1800
   const caloriePct = Math.min((summary.avg.calories / calorieGoal) * 100, 120)
   const isOverGoal = summary.avg.calories > calorieGoal
 
-  // 三大营养素分布
-  const macroTotal = summary.avg.protein * 4 + summary.avg.fat * 9 + summary.avg.carbs * 4
-  const proteinPct = macroTotal > 0 ? Math.round((summary.avg.protein * 4 / macroTotal) * 100) : 0
-  const fatPct = macroTotal > 0 ? Math.round((summary.avg.fat * 9 / macroTotal) * 100) : 0
-  const carbsPct = macroTotal > 0 ? Math.round((summary.avg.carbs * 4 / macroTotal) * 100) : 0
-
-  // 图表数据 — week: 按天展开本周7天；month: 按自然周聚合
+  // 图表数据 — week: 周一至周日；month: 按每7个自然日聚合
   const {chartData, chartMode, chartXSubTitle} = useMemo(() => {
-    const now = new Date()
-
     if (period === 'week') {
-      // 生成本周7天（周日~周六）
-      const dayOfWeek = now.getDay() // 0=周日
-      const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - dayOfWeek)
       const days: ChartPoint[] = Array.from({length: 7}, (_, i) => {
-        const d = new Date(weekStart)
-        d.setDate(weekStart.getDate() + i)
-        const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+        const dateStr = addDaysToDateKey(periodRange.startDate, i)
+        const [, month, day] = dateStr.split('-').map(Number)
         const found = effectiveStats.find(s => s.date === dateStr)
         return {
-          label: `${d.getMonth() + 1}/${d.getDate()}`,
+          label: `${month}/${day}`,
           value: found?.total_calories || 0,
           hasData: !!found && (found.total_calories > 0),
         }
       })
       return {chartData: days, chartMode: 'week' as const, chartXSubTitle: ''}
-    } else {
+    }
+
+    if (period === 'month') {
       // 按周聚合：第1~5周，每7天为一组
       const weekMap: Record<number, number> = {}
       for (const s of effectiveStats) {
@@ -303,7 +279,8 @@ function StatsPage() {
         weekMap[wk] = (weekMap[wk] || 0) + s.total_calories
       }
       // 本月最多5周
-      const totalWeeks = Math.ceil(new Date(now.getFullYear(), now.getMonth()+1, 0).getDate() / 7)
+      const [year, month] = periodRange.startDate.split('-').map(Number)
+      const totalWeeks = Math.ceil(getDaysInMonth(year, month) / 7)
       const weeks: ChartPoint[] = Array.from({length: totalWeeks}, (_, i) => ({
         label: `第${i+1}周`,
         value: weekMap[i+1] || 0,
@@ -311,7 +288,9 @@ function StatsPage() {
       }))
       return {chartData: weeks, chartMode: 'month' as const, chartXSubTitle: ''}
     }
-  }, [period, effectiveStats])
+
+    return {chartData: [], chartMode: 'week' as const, chartXSubTitle: ''}
+  }, [period, periodRange.startDate, effectiveStats])
 
   const periodLabels: Record<Period, string> = {day: '今日', week: '本周', month: '本月'}
 
@@ -335,28 +314,7 @@ function StatsPage() {
       </div>
 
       <div className="px-4 py-4 pb-tabbar flex flex-col gap-4">
-        {/* 成员提示 */}
-        {activeMember && (
-          <button
-            type="button"
-            disabled={loadingMembers || switchingMemberId !== null}
-            className="w-full flex items-center justify-between gap-3 px-4 py-3 bg-primary/10 rounded-xl border border-primary/20 disabled:opacity-60"
-            onClick={() => setShowMemberPicker(true)}
-          >
-            <div className="flex items-center gap-2 min-w-0">
-              <Image
-                src={getMemberAvatar(activeMember)}
-                mode="aspectFill"
-                style={{width: '28px', height: '28px', borderRadius: '50%', flexShrink: 0}}
-              />
-              <span className="text-xl text-primary truncate">当前查看：{activeMember.nickname}</span>
-            </div>
-            <div className="flex items-center gap-1 text-primary flex-shrink-0">
-              <span className="text-xl font-medium">切换</span>
-              <div className="i-mdi-chevron-right text-2xl" />
-            </div>
-          </button>
-        )}
+        <NutritionMemberSwitcher />
 
         {loading ? (
           <div className="flex flex-col gap-4 py-8">
@@ -431,33 +389,17 @@ function StatsPage() {
               )}
             </div>
 
-            {/* 三大营养素环形图（用色块模拟） */}
+            {/* 三大营养素供能分布 */}
             <div className="bg-card rounded-2xl p-4 shadow-elegant">
               <div className="flex items-center gap-2 mb-4">
                 <div className="i-mdi-chart-donut text-2xl text-primary" />
                 <span className="text-xl font-semibold text-foreground">营养素分布</span>
               </div>
-              {/* 横向进度条展示 */}
-              <div className="flex flex-col gap-3">
-                {[
-                  {label: '碳水化合物', value: summary.avg.carbs, unit: 'g', pct: carbsPct, color: 'bg-chart-1'},
-                  {label: '蛋白质', value: summary.avg.protein, unit: 'g', pct: proteinPct, color: 'bg-chart-2'},
-                  {label: '脂肪', value: summary.avg.fat, unit: 'g', pct: fatPct, color: 'bg-chart-3'},
-                ].map(item => (
-                  <div key={item.label}>
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xl text-foreground">{item.label}</span>
-                      <span className="text-xl text-muted-foreground">{item.value.toFixed(1)}g ({item.pct}%)</span>
-                    </div>
-                    <div className="h-3 bg-secondary rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full ${item.color}`}
-                        style={{width: `${item.pct}%`, background: item.color === 'bg-chart-1' ? 'hsl(var(--chart-1))' : item.color === 'bg-chart-2' ? 'hsl(var(--chart-2))' : 'hsl(var(--chart-3))'}}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <MacroDonutChart
+                carbs={summary.avg.carbs}
+                protein={summary.avg.protein}
+                fat={summary.avg.fat}
+              />
             </div>
 
             {/* 热量趋势折线图 */}
@@ -506,81 +448,8 @@ function StatsPage() {
             </div>
           </>
         )}
-      </div>
 
-      {showMemberPicker && (
-        <div className="fixed inset-0 flex flex-col justify-end" style={{zIndex: 9999}}>
-          <div
-            className="absolute inset-0"
-            style={{backgroundColor: 'rgba(0,0,0,0.42)'}}
-            onClick={() => switchingMemberId === null && setShowMemberPicker(false)}
-          />
-          <div
-            className="relative bg-white flex flex-col"
-            style={{maxHeight: '70vh', borderRadius: '16px 16px 0 0', paddingBottom: 'env(safe-area-inset-bottom, 0px)'}}
-          >
-            <div className="flex justify-center pt-3 pb-1 flex-shrink-0">
-              <div className="rounded-full" style={{width: '40px', height: '4px', backgroundColor: '#D8D8D8'}} />
-            </div>
-            <div className="flex items-center justify-between px-5 py-3 border-b border-border flex-shrink-0">
-              <div>
-                <p className="text-2xl font-semibold text-foreground">切换查看成员</p>
-                <p className="text-xl text-muted-foreground mt-1">统计数据和营养目标将同步切换</p>
-              </div>
-              <button
-                type="button"
-                className="flex items-center justify-center"
-                style={{width: '40px', height: '40px'}}
-                onClick={() => switchingMemberId === null && setShowMemberPicker(false)}
-              >
-                <div className="i-mdi-close text-2xl text-muted-foreground" />
-              </button>
-            </div>
-            <div className="overflow-y-auto px-5">
-              {familyMembers.map(member => {
-                const selected = member.id === activeMember?.id
-                const switching = member.id === switchingMemberId
-                return (
-                  <button
-                    key={member.id}
-                    type="button"
-                    disabled={switchingMemberId !== null}
-                    className="w-full flex items-center justify-between gap-3 py-4 border-b border-border disabled:opacity-60"
-                    onClick={() => void handleSelectMember(member.id)}
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <Image
-                        src={getMemberAvatar(member)}
-                        mode="aspectFill"
-                        style={{width: '42px', height: '42px', borderRadius: '50%', flexShrink: 0}}
-                      />
-                      <div className="text-left min-w-0">
-                        <p className="text-xl font-medium text-foreground truncate">{member.nickname}</p>
-                        {member.is_primary && <p className="text-xl text-muted-foreground mt-1">主成员</p>}
-                      </div>
-                    </div>
-                    {switching
-                      ? <div className="i-mdi-loading text-2xl text-primary" style={{animation: 'spin 1s linear infinite'}} />
-                      : selected && <div className="i-mdi-check text-2xl text-primary" />}
-                  </button>
-                )
-              })}
-            </div>
-            <button
-              type="button"
-              className="flex items-center justify-center gap-2 mx-5 mt-3 text-xl font-medium text-primary"
-              style={{height: '48px'}}
-              onClick={() => {
-                setShowMemberPicker(false)
-                Taro.navigateTo({url: '/pages/family/index'})
-              }}
-            >
-              <div className="i-mdi-account-multiple-plus text-2xl" />
-              <span>管理家庭成员</span>
-            </button>
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   )
 }

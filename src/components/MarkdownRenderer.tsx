@@ -10,7 +10,7 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
   const elements: JSX.Element[] = []
   let key = 0
 
-  const normalizedContent = normalizeMarkdownContent(content)
+  const normalizedContent = stripOutputPanelColons(normalizeMarkdownContent(content))
 
   const rawLines = normalizedContent.split('\n')
   const merged: string[] = []
@@ -142,7 +142,7 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
       const label = line.trim().replace(/[：:]\s*$/, '')
       elements.push(
         <p key={key++} className="text-xl font-bold text-foreground mt-2 mb-0.5 leading-snug">
-          {renderInline(label, key)}：
+          {renderInline(label, key)}
         </p>
       )
     } else {
@@ -150,7 +150,7 @@ export function MarkdownRenderer({content, className = ''}: MarkdownProps) {
       if (keyValueMatch) {
         elements.push(
           <p key={key++} className="text-xl text-foreground leading-snug py-px">
-            <span className="font-semibold text-foreground">{renderInline(keyValueMatch[1].trim(), key)}：</span>
+            <span className="font-semibold text-foreground">{renderInline(keyValueMatch[1].trim(), key)} </span>
             {renderInline(keyValueMatch[2].trim(), key)}
           </p>
         )
@@ -241,7 +241,7 @@ function isLooseTableSeparatorLine(line: string): boolean {
 }
 
 function isNutritionValueLine(line: string): boolean {
-  return /^(热量|蛋白质|脂肪|碳水化合物|碳水)(?:\s|[：:]|$)/.test(stripEdgePipes(line))
+  return /^(热量|蛋白质|脂肪|碳水化合物|碳水|糖分)(?:\s|[：:]|$)/.test(stripEdgePipes(line))
 }
 
 function parseNutritionOverviewHeader(line: string): string[] {
@@ -252,7 +252,7 @@ function parseNutritionOverviewHeader(line: string): string[] {
 
 function parseNutritionValueRow(line: string): string[] | null {
   const normalized = stripEdgePipes(line).replace(/\|/g, ' ').replace(/\s+/g, ' ').trim()
-  const labelMatch = normalized.match(/^(热量|蛋白质|脂肪|碳水化合物|碳水)\s+(.+)$/)
+  const labelMatch = normalized.match(/^(热量|蛋白质|脂肪|碳水化合物|碳水|糖分)\s+(.+)$/)
   if (!labelMatch) return null
 
   const label = labelMatch[1] === '碳水化合物' ? '碳水' : labelMatch[1]
@@ -272,6 +272,22 @@ function parseNutritionValueRow(line: string): string[] | null {
 
 function stripEdgePipes(line: string): string {
   return line.trim().replace(/^\|/, '').replace(/\|$/, '').trim()
+}
+
+function stripOutputPanelColons(content: string): string {
+  let inCodeBlock = false
+  return content.split('\n').map(line => {
+    if (line.trim().startsWith('```')) {
+      inCodeBlock = !inCodeBlock
+      return line
+    }
+    if (inCodeBlock) return line
+
+    return line
+      .replace(/：/g, ' ')
+      .replace(/:(?!\/\/|\d)/g, ' ')
+      .replace(/[ \t]+$/g, '')
+  }).join('\n')
 }
 
 function isTableRowLine(line: string): boolean {

@@ -1,0 +1,1229 @@
+diff --git a/scripts/checkDeviceTestFixes.mjs b/scripts/checkDeviceTestFixes.mjs
+index 458fcbb3..729674bb 100644
+--- a/scripts/checkDeviceTestFixes.mjs
++++ b/scripts/checkDeviceTestFixes.mjs
+@@ -30,8 +30,12 @@ assert(chat.includes('adjustPosition={false}') && chat.includes('onKeyboardHeigh
+ const voiceFooter = chat.slice(chat.indexOf('{voiceMode ? ('), chat.indexOf(') : (', chat.indexOf('{voiceMode ? (')))
+ assert((voiceFooter.match(/<button\b/g) || []).length === 1, 'Voice input footer must only render the keyboard switch button beside the hold-to-talk area')
+ assert(!voiceFooter.includes('i-mdi-robot'), 'Voice input footer must not render a robot action')
++assert(!voiceFooter.includes('i-mdi-microphone'), 'Voice mode hold-to-talk area must not render the microphone icon regression')
+ assert(!chat.includes('VOICE_LONG_PRESS_MS') && chat.includes('voiceStopRequestedRef') && chat.includes('voiceRecordingAttemptRef'), 'Voice recording must start immediately and retain release requests while the recorder is starting')
+-assert(chat.includes('onTouchCancel={handleVoiceTouchCancel}') && chat.includes("isVoiceStopping ? '正在发送...'"), 'Voice release and cancellation must expose immediate, distinct feedback')
++assert(chat.includes('VOICE_STOP_TIMEOUT_MS') && chat.includes('voiceStopFallbackTimerRef') && chat.includes('录音停止超时，请重试'), 'Voice recording must recover when RecorderManager onStop is delayed or missing')
++assert(chat.includes('onTouchCancel={handleVoiceTouchCancel}') && chat.includes('if (voiceStopRequestedRef.current) return'), 'Voice release and cancellation must be idempotent across duplicate native touch-end events')
++assert(chat.includes('resetVoiceCaptureVisualState()') && !chat.includes('isVoiceStopping') && !chat.includes('正在发送...'), 'Voice capture controls must return to idle immediately while recognition continues in the message list')
++assert(chat.includes('onClick={handleEnterVoiceMode}') && chat.includes('void ensureRecordPermission()') && chat.includes('recordPermissionRequestRef'), 'Entering voice mode must preflight microphone permission and deduplicate concurrent permission requests')
+ 
+ assert(familyEdit.includes("openType: 'chooseAvatar'") && familyEdit.includes('uploadWechatAvatar'), 'Family editor must upload custom avatars')
+ assert(family.includes('getMemberAvatar(member)') && memberSwitcher.includes('getMemberAvatar(member)'), 'Custom member avatars must render in management and switching views')
+diff --git a/src/contexts/AuthContext.tsx b/src/contexts/AuthContext.tsx
+index 84f57359..59dea0f7 100644
+--- a/src/contexts/AuthContext.tsx
++++ b/src/contexts/AuthContext.tsx
+@@ -2,6 +2,7 @@ import {createContext, useCallback, useContext, useEffect, useState, type ReactN
+ import {supabase} from '@/client/supabase'
+ import type {User} from '@supabase/supabase-js'
+ import type {Profile} from '@/db/types'
++import {normalizeEmail, normalizeRegistrationEmail, validateEmailOtp, validateNewPassword} from '@/utils/authValidation'
+ import {
+   bindWechatAccount,
+   startWechatLogin,
+@@ -22,8 +23,9 @@ interface AuthContextType {
+   user: User | null
+   profile: Profile | null
+   loading: boolean
+-  signInWithUsername: (username: string, password: string) => Promise<{error: Error | null}>
+-  signUpWithUsername: (username: string, password: string) => Promise<{error: Error | null}>
++  signInWithAccount: (account: string, password: string) => Promise<{error: Error | null}>
++  startEmailSignUp: (email: string, password: string) => Promise<{error: Error | null}>
++  verifyEmailSignUp: (email: string, code: string) => Promise<{error: Error | null}>
+   signUpWithPhone: (phone: string, password: string) => Promise<{error: Error | null}>
+   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
+   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
+@@ -88,10 +90,11 @@ export function AuthProvider({children}: {children: ReactNode}) {
+     return () => subscription.unsubscribe()
+   }, [])
+ 
+-  const signInWithUsername = async (username: string, password: string) => {
++  const signInWithAccount = async (account: string, password: string) => {
+     try {
+-      const normalizedUsername = normalizeUsername(username)
+-      const email = `${normalizedUsername}@miaoda.com`
++      const email = account.includes('@')
++        ? normalizeEmail(account)
++        : `${normalizeUsername(account)}@miaoda.com`
+       const {error} = await supabase.auth.signInWithPassword({
+         email,
+         password
+@@ -104,14 +107,12 @@ export function AuthProvider({children}: {children: ReactNode}) {
+     }
+   }
+ 
+-  const signUpWithUsername = async (username: string, password: string) => {
++  const signUpWithPhone = async (phone: string, password: string) => {
+     try {
+-      const normalizedUsername = normalizeUsername(username)
+-      const email = `${normalizedUsername}@miaoda.com`
++      validateNewPassword(password)
+       const {error} = await supabase.auth.signUp({
+-        email,
+-        password,
+-        options: {data: {username: normalizedUsername}}
++        phone,
++        password
+       })
+ 
+       if (error) throw error
+@@ -121,14 +122,36 @@ export function AuthProvider({children}: {children: ReactNode}) {
+     }
+   }
+ 
+-  const signUpWithPhone = async (phone: string, password: string) => {
++  const startEmailSignUp = async (email: string, password: string) => {
+     try {
+-      const {error} = await supabase.auth.signUp({
+-        phone,
++      const normalizedEmail = normalizeRegistrationEmail(email)
++      validateNewPassword(password)
++      const {data, error} = await supabase.auth.signUp({
++        email: normalizedEmail,
+         password
+       })
+-
+       if (error) throw error
++      if (data.session) {
++        await supabase.auth.signOut()
++        throw new Error('邮箱确认尚未启用，请联系管理员完成认证配置')
++      }
++      return {error: null}
++    } catch (error) {
++      return {error: error as Error}
++    }
++  }
++
++  const verifyEmailSignUp = async (email: string, code: string) => {
++    try {
++      const normalizedEmail = normalizeRegistrationEmail(email)
++      validateEmailOtp(code)
++
++      const {error: verifyError} = await supabase.auth.verifyOtp({
++        email: normalizedEmail,
++        token: code,
++        type: 'signup'
++      })
++      if (verifyError) throw verifyError
+       return {error: null}
+     } catch (error) {
+       return {error: error as Error}
+@@ -189,8 +212,9 @@ export function AuthProvider({children}: {children: ReactNode}) {
+         user,
+         profile,
+         loading,
+-        signInWithUsername,
+-        signUpWithUsername,
++        signInWithAccount,
++        startEmailSignUp,
++        verifyEmailSignUp,
+         signUpWithPhone,
+         signInWithPhone,
+         verifyPhoneOtp,
+diff --git a/src/pages/chat/index.tsx b/src/pages/chat/index.tsx
+index 78388c9a..70083fac 100644
+--- a/src/pages/chat/index.tsx
++++ b/src/pages/chat/index.tsx
+@@ -19,6 +19,7 @@ import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wecha
+ 
+ const VOICE_MESSAGE_PREFIX = '🎙 '
+ const MIN_VOICE_RECORD_MS = 500
++const VOICE_STOP_TIMEOUT_MS = 3000
+ 
+ let sharedRtcAudioContext: any = null
+ let sharedRtcAudioUnlockLogged = false
+@@ -137,7 +138,6 @@ function ChatPage() {
+   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
+   const [isRecording, setIsRecording] = useState(false)
+   const [isVoicePressing, setIsVoicePressing] = useState(false)
+-  const [isVoiceStopping, setIsVoiceStopping] = useState(false)
+   const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
+   const [useProfile, setUseProfile] = useState(true)
+   const [useIngredients, setUseIngredients] = useState(false)
+@@ -154,9 +154,17 @@ function ChatPage() {
+   const voiceRecordStartingRef = useRef(false)
+   const voiceRecordStartedAtRef = useRef(0)
+   const voiceRecordingAttemptRef = useRef(0)
++  const voiceStopFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
++  const recordPermissionRequestRef = useRef<Promise<boolean> | null>(null)
+   const [voiceMode, setVoiceMode] = useState(false)
+   const voiceSessionRef = useRef<ChatSession | null>(null)
+ 
++  const resetVoiceCaptureVisualState = useCallback(() => {
++    setIsRecording(false)
++    setIsVoicePressing(false)
++    setIsRecordingCanceling(false)
++  }, [])
++
+   const loadRtcHistory = useCallback(async () => {
+     if (!user) return
+     setRtcHistoryLoading(true)
+@@ -193,6 +201,8 @@ function ChatPage() {
+   useEffect(() => {
+     return () => {
+       voiceRecordingAttemptRef.current += 1
++      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++      voiceStopFallbackTimerRef.current = null
+       recorderManager.current?.stop()
+       audioContextRef.current?.destroy()
+       audioContextRef.current = null
+@@ -593,6 +603,8 @@ function ChatPage() {
+   }, [activeSession, activeMember, user])
+ 
+   const ensureRecordPermission = useCallback((): Promise<boolean> => {
++    if (recordPermissionRequestRef.current) return recordPermissionRequestRef.current
++
+     const showSettingGuide = () => {
+       Taro.showModal({
+         title: '需要麦克风权限',
+@@ -603,7 +615,7 @@ function ChatPage() {
+       })
+     }
+ 
+-    return new Promise((resolve) => {
++    const request = new Promise<boolean>((resolve) => {
+       Taro.getSetting({
+         success: (settingRes: any) => {
+           const status = settingRes?.authSetting?.['scope.record']
+@@ -635,20 +647,39 @@ function ChatPage() {
+         }
+       })
+     })
++    recordPermissionRequestRef.current = request
++    const clearRequest = () => {
++      if (recordPermissionRequestRef.current === request) recordPermissionRequestRef.current = null
++    }
++    void request.then(clearRequest, clearRequest)
++    return request
+   }, [])
+ 
++  const handleEnterVoiceMode = useCallback(() => {
++    setVoiceMode(true)
++    void ensureRecordPermission()
++  }, [ensureRecordPermission])
++
+   const startVoiceRecording = useCallback(async () => {
+-    if (isRecording || voiceRecordStartingRef.current) return
++    if (isRecording || voiceRecordStartingRef.current || voiceStopRequestedRef.current) return
+     voiceRecordStartingRef.current = true
+     voiceStopRequestedRef.current = false
+     if (!await ensureRecordPermission()) {
+       voiceRecordStartingRef.current = false
+-      setIsVoiceStopping(false)
++      voicePressingRef.current = false
++      voiceStopRequestedRef.current = false
++      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++      voiceStopFallbackTimerRef.current = null
++      resetVoiceCaptureVisualState()
+       return
+     }
+     if (!voicePressingRef.current || voiceStopRequestedRef.current) {
+       voiceRecordStartingRef.current = false
+-      setIsVoiceStopping(false)
++      voicePressingRef.current = false
++      voiceStopRequestedRef.current = false
++      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++      voiceStopFallbackTimerRef.current = null
++      resetVoiceCaptureVisualState()
+       return
+     }
+ 
+@@ -663,18 +694,20 @@ function ChatPage() {
+         if (voiceRecordingAttemptRef.current !== attemptId) return
+         voiceRecordStartingRef.current = false
+         voiceRecordStartedAtRef.current = Date.now()
++        if (!voicePressingRef.current || voiceStopRequestedRef.current) {
++          rm.stop()
++          return
++        }
+         setIsRecording(true)
+-        if (!voicePressingRef.current || voiceStopRequestedRef.current) rm.stop()
+       })
+       rm.onStop(async (res) => {
+         if (voiceRecordingAttemptRef.current !== attemptId) return
++        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++        voiceStopFallbackTimerRef.current = null
+         voiceRecordStartingRef.current = false
+         voiceStopRequestedRef.current = false
+         recorderManager.current = null
+-        setIsRecording(false)
+-        setIsVoicePressing(false)
+-        setIsVoiceStopping(false)
+-        setIsRecordingCanceling(false)
++        resetVoiceCaptureVisualState()
+         if (voiceCancelRef.current) {
+           voiceCancelRef.current = false
+           voiceRecordStartedAtRef.current = 0
+@@ -738,24 +771,23 @@ function ChatPage() {
+       })
+       rm.onError(() => {
+         if (voiceRecordingAttemptRef.current !== attemptId) return
++        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++        voiceStopFallbackTimerRef.current = null
+         voiceRecordStartingRef.current = false
+         voiceStopRequestedRef.current = false
+         voiceRecordStartedAtRef.current = 0
+         recorderManager.current = null
+-        setIsRecording(false)
+-        setIsVoicePressing(false)
+-        setIsVoiceStopping(false)
+-        setIsRecordingCanceling(false)
++        resetVoiceCaptureVisualState()
+         Taro.showToast({title: '录音失败，请重试', icon: 'none'})
+       })
+       rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
+     }
+ 
+     doStartRecord()
+-  }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
++  }, [ensureRecordPermission, ensureSession, isRecording, resetVoiceCaptureVisualState, sendMessage, user])
+ 
+   const handleVoiceTouchStart = useCallback((event: any) => {
+-    if (voicePressingRef.current || voiceRecordStartingRef.current || isRecording) return
++    if (voicePressingRef.current || voiceRecordStartingRef.current || voiceStopRequestedRef.current || isRecording) return
+     unlockRtcAudioPlayback('voice-touch')
+     if (isLoading) interruptActiveChatResponse('voice-touch')
+     voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
+@@ -763,7 +795,6 @@ function ChatPage() {
+     voiceStopRequestedRef.current = false
+     voicePressingRef.current = true
+     setIsVoicePressing(true)
+-    setIsVoiceStopping(false)
+     setIsRecordingCanceling(false)
+     void startVoiceRecording()
+   }, [interruptActiveChatResponse, isLoading, isRecording, startVoiceRecording])
+@@ -777,13 +808,31 @@ function ChatPage() {
+   }, [])
+ 
+   const handleVoiceTouchEnd = useCallback(() => {
+-    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !isRecording) return
++    if (voiceStopRequestedRef.current) return
++    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
+     voicePressingRef.current = false
+     voiceStopRequestedRef.current = true
+-    setIsVoicePressing(false)
+-    setIsVoiceStopping(true)
+-    recorderManager.current?.stop()
+-  }, [isRecording])
++    resetVoiceCaptureVisualState()
++    try {
++      recorderManager.current?.stop()
++    } catch (error) {
++      console.warn('停止录音失败，等待超时兜底:', error)
++    }
++    if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
++    voiceStopFallbackTimerRef.current = setTimeout(() => {
++      voiceStopFallbackTimerRef.current = null
++      if (!voiceStopRequestedRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
++      try { recorderManager.current?.stop() } catch {}
++      voiceRecordingAttemptRef.current += 1
++      voiceRecordStartingRef.current = false
++      voicePressingRef.current = false
++      voiceStopRequestedRef.current = false
++      voiceRecordStartedAtRef.current = 0
++      recorderManager.current = null
++      resetVoiceCaptureVisualState()
++      Taro.showToast({title: '录音停止超时，请重试', icon: 'none'})
++    }, VOICE_STOP_TIMEOUT_MS)
++  }, [resetVoiceCaptureVisualState])
+ 
+   const handleVoiceTouchCancel = useCallback(() => {
+     voiceCancelRef.current = true
+@@ -825,7 +874,7 @@ function ChatPage() {
+   }
+   const rtcHistoryDateGroups = useMemo(() => groupRtcHistoryByDate(rtcHistoryGroups), [rtcHistoryGroups])
+   const hasAnyHistory = rtcHistoryGroups.length > 0
+-  const isVoiceButtonActive = isRecording || isVoicePressing || isVoiceStopping
++  const isVoiceButtonActive = isRecording || isVoicePressing
+ 
+   return (
+     <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
+@@ -1095,9 +1144,8 @@ function ChatPage() {
+                   </>
+                 )}
+                 <div className="flex items-center gap-2">
+-                    <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
+                     <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
+-                      {isRecordingCanceling ? '松手取消' : (isVoiceStopping ? '正在发送...' : (isRecording ? '录音中...' : '准备录音...'))}
++                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
+                     </span>
+                     <div className="flex items-end gap-0.5" style={{height: '16px'}}>
+                       {[0,1,2,3,4].map(i => (
+@@ -1109,7 +1157,6 @@ function ChatPage() {
+                 </>
+               ) : (
+                 <div className="flex items-center gap-2">
+-                  <div className="i-mdi-microphone text-xl text-muted-foreground" />
+                   <span className="text-xl text-muted-foreground">按住说话</span>
+                 </div>
+               )}
+@@ -1120,7 +1167,7 @@ function ChatPage() {
+               <button type="button" className="flex-shrink-0 flex items-center justify-center"
+                 style={{width: '44px', height: '44px'}}
+                 onTouchStart={() => unlockRtcAudioPlayback('voice-mode-touch')}
+-                onClick={() => setVoiceMode(true)}>
++                onClick={handleEnterVoiceMode}>
+                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
+               </button>
+               <div className="flex items-center bg-white"
+diff --git a/src/pages/family-edit/index.tsx b/src/pages/family-edit/index.tsx
+index da2c3f0f..7e758373 100644
+--- a/src/pages/family-edit/index.tsx
++++ b/src/pages/family-edit/index.tsx
+@@ -12,6 +12,7 @@ import type {FamilyMember, GenderType} from '@/db/types'
+ 
+ const CHRONIC_DISEASES = ['高血压', '糖尿病', '高血脂', '痛风', '肾病']
+ const ALLERGEN_OPTIONS = ['花生', '海鲜', '坚果', '乳制品', '蛋类', '麸质']
++const MEDICATION_OPTIONS = ['二甲双胍', '胰岛素', '阿卡波糖', '氨氯地平', '阿托伐他汀', '华法林']
+ 
+ function FamilyEditPage() {
+   const {user} = useAuth()
+@@ -23,6 +24,7 @@ function FamilyEditPage() {
+     nickname: '', gender: 'unknown', chronic_diseases: [], allergens: []
+   })
+   const [saving, setSaving] = useState(false)
++  const [customMedication, setCustomMedication] = useState('')
+   const [avatarPreviewPath, setAvatarPreviewPath] = useState('')
+   const [uploadingAvatar, setUploadingAvatar] = useState(false)
+ 
+@@ -100,6 +102,19 @@ function FamilyEditPage() {
+     setForm({...form, allergens: list.includes(a) ? list.filter(x => x !== a) : [...list, a]})
+   }
+ 
++  const getMedications = () => (form.medications || '')
++    .split(/[,，\n、]/)
++    .map(item => item.trim())
++    .filter(Boolean)
++
++  const toggleMedication = (medication: string) => {
++    const medications = getMedications()
++    const next = medications.includes(medication)
++      ? medications.filter(item => item !== medication)
++      : [...medications, medication]
++    setForm({...form, medications: next.join('、')})
++  }
++
+   return (
+     <div className="min-h-screen bg-background pb-10">
+       <div className="px-4 py-4 flex flex-col gap-4">
+@@ -131,7 +146,7 @@ function FamilyEditPage() {
+           {/* 昵称 */}
+           <div>
+             <p className="text-xl text-muted-foreground mb-2">昵称</p>
+-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-background">
++            <div className="border-2 border-input rounded-xl px-4 py-3 bg-background" style={{height: '48px', boxSizing: 'border-box'}}>
+               <input
+                 className="w-full text-xl text-foreground bg-transparent outline-none"
+                 placeholder="请输入成员昵称"
+@@ -166,7 +181,7 @@ function FamilyEditPage() {
+             ].map(field => (
+               <div key={field.key} className="flex-1">
+                 <p className="text-xl text-muted-foreground mb-2">{field.label}</p>
+-                <div className="border-2 border-input rounded-xl px-3 py-3 bg-background">
++                <div className="border-2 border-input rounded-xl px-3 py-3 bg-background" style={{height: '48px', boxSizing: 'border-box'}}>
+                   <input
+                     className="w-full text-xl text-foreground bg-transparent outline-none"
+                     placeholder={field.unit}
+@@ -238,6 +253,47 @@ function FamilyEditPage() {
+           </div>
+         </div>
+ 
++        {/* 正在服用的药物 */}
++        <div className="bg-card rounded-2xl p-4 shadow-elegant">
++          <div className="flex items-center gap-2 mb-1">
++            <div className="i-mdi-pill text-2xl text-primary" />
++            <span className="text-xl font-semibold text-foreground">正在服用的药物</span>
++          </div>
++          <p className="text-xl text-muted-foreground mb-3">填写后AI将提示可能的食药互作，不用于诊断</p>
++          <div className="flex flex-wrap gap-2 mb-3">
++            {MEDICATION_OPTIONS.map(medication => (
++              <button
++                key={medication}
++                type="button"
++                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${getMedications().includes(medication) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
++                style={{height: '36px', ...(getMedications().includes(medication) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
++                onClick={() => toggleMedication(medication)}
++              >{medication}</button>
++            ))}
++          </div>
++          <div className="flex items-center gap-2">
++            <div className="flex-1 border border-input rounded-xl px-3 py-2 bg-background">
++              <input
++                className="w-full text-xl text-foreground bg-transparent outline-none"
++                placeholder="其他药物"
++                value={customMedication}
++                onInput={(e) => { const ev = e as any; setCustomMedication(ev.detail?.value ?? ev.target?.value ?? '') }}
++              />
++            </div>
++            <button
++              type="button"
++              className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
++              style={{height: '40px'}}
++              onClick={() => {
++                if (customMedication.trim()) {
++                  toggleMedication(customMedication.trim())
++                  setCustomMedication('')
++                }
++              }}
++            >添加</button>
++          </div>
++        </div>
++
+         {/* 保存 */}
+         <button
+           type="button"
+diff --git a/src/pages/login/index.tsx b/src/pages/login/index.tsx
+index 5973fad6..05befd72 100644
+--- a/src/pages/login/index.tsx
++++ b/src/pages/login/index.tsx
+@@ -2,21 +2,23 @@
+ 
+ import {Image} from '@tarojs/components'
+ import Taro from '@tarojs/taro'
+-import {useState} from 'react'
++import {useEffect, useState} from 'react'
+ import {supabase} from '@/client/supabase'
+ import {HealthBrandMark} from '@/components/HealthMarks'
+ import {useAuth} from '@/contexts/AuthContext'
+ import {getFamilyMembers, updateFamilyMember, updateProfile} from '@/db/api'
+-import {uploadWechatAvatar} from '@/services/wechatAuth'
++import {prepareWechatBinding, uploadWechatAvatar} from '@/services/wechatAuth'
+ import {useAppStore} from '@/store/appStore'
+ import {completeLoginRedirect} from '@/utils/authRedirect'
++import {EMAIL_OTP_LENGTH, getNewPasswordError} from '@/utils/authValidation'
+ 
+ type WechatStep = 'idle' | 'choice' | 'bind'
+ 
+ export default function LoginPage() {
+   const {
+-    signInWithUsername,
+-    signUpWithUsername,
++    signInWithAccount,
++    startEmailSignUp,
++    verifyEmailSignUp,
+     startWechatSignIn,
+     bindWechatSignIn,
+     signOut,
+@@ -27,27 +29,74 @@ export default function LoginPage() {
+   const [username, setUsername] = useState('')
+   const [password, setPassword] = useState('')
+   const [passwordConfirm, setPasswordConfirm] = useState('')
++  const [emailCode, setEmailCode] = useState('')
++  const [emailOtpSent, setEmailOtpSent] = useState(false)
++  const [emailCooldown, setEmailCooldown] = useState(0)
+   const [agreed, setAgreed] = useState(false)
+   const [loading, setLoading] = useState(false)
+   const [wechatStep, setWechatStep] = useState<WechatStep>('idle')
+   const [wechatTicket, setWechatTicket] = useState('')
+   const [wechatNickname, setWechatNickname] = useState('')
+   const [wechatAvatarPath, setWechatAvatarPath] = useState('')
++  const [wechatSessionReady, setWechatSessionReady] = useState(false)
+ 
+   const isWeApp = Taro.getEnv() === Taro.ENV_TYPE.WEAPP
+ 
++  useEffect(() => {
++    if (emailCooldown <= 0) return
++    const timer = setTimeout(() => setEmailCooldown(value => value - 1), 1000)
++    return () => clearTimeout(timer)
++  }, [emailCooldown])
++
++  const resetEmailVerification = () => {
++    setEmailCode('')
++    setEmailOtpSent(false)
++    setEmailCooldown(0)
++  }
++
++  const sendEmailCode = async () => {
++    const {error} = await startEmailSignUp(username, password)
++    if (error) throw error
++    setEmailOtpSent(true)
++    setEmailCooldown(60)
++    Taro.showToast({title: '验证码已发送，请查收邮箱', icon: 'none', duration: 2500})
++  }
++
++  const handleResendEmailCode = async () => {
++    if (loading || emailCooldown > 0) return
++    setLoading(true)
++    try {
++      await sendEmailCode()
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '验证码发送失败', icon: 'none'})
++    } finally {
++      setLoading(false)
++    }
++  }
++
+   const handleSubmit = async () => {
+     if (!username.trim()) {
+-      Taro.showToast({title: '请输入用户名', icon: 'none'})
++      Taro.showToast({title: '请输入邮箱', icon: 'none'})
+       return
+     }
+     if (password.length < 6) {
+       Taro.showToast({title: '密码至少6位', icon: 'none'})
+       return
+     }
+-    if (tab === 'register' && password !== passwordConfirm) {
+-      Taro.showToast({title: '两次输入的密码不一致', icon: 'none'})
+-      return
++    if (tab === 'register') {
++      const passwordError = getNewPasswordError(password)
++      if (passwordError) {
++        Taro.showToast({title: passwordError, icon: 'none'})
++        return
++      }
++      if (password !== passwordConfirm) {
++        Taro.showToast({title: '两次输入的密码不一致', icon: 'none'})
++        return
++      }
++      if (emailOtpSent && emailCode.length !== EMAIL_OTP_LENGTH) {
++        Taro.showToast({title: `请输入${EMAIL_OTP_LENGTH}位邮箱验证码`, icon: 'none'})
++        return
++      }
+     }
+     if (!agreed) {
+       Taro.showToast({title: '请先阅读并同意用户协议', icon: 'none'})
+@@ -55,14 +104,27 @@ export default function LoginPage() {
+     }
+     setLoading(true)
+     try {
+-      const fn = tab === 'login' ? signInWithUsername : signUpWithUsername
+-      const {error} = await fn(username.trim(), password)
++      if (tab === 'register' && !emailOtpSent) {
++        await sendEmailCode()
++        return
++      }
++
++      const {error} = tab === 'login'
++        ? await signInWithAccount(username.trim(), password)
++        : await verifyEmailSignUp(username.trim(), emailCode)
+       if (error) {
+         Taro.showToast({title: error.message || '操作失败', icon: 'none'})
+         return
+       }
+       if (wechatTicket) {
+-        const {error: bindError} = await bindWechatSignIn(wechatTicket)
++        let bindError: Error | null = null
++        try {
++          const freshWechatTicket = await prepareWechatBinding()
++          const result = await bindWechatSignIn(freshWechatTicket)
++          bindError = result.error
++        } catch (error) {
++          bindError = error as Error
++        }
+         if (bindError) {
+           await signOut()
+           Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
+@@ -90,7 +152,13 @@ export default function LoginPage() {
+       if (error) {
+         Taro.showToast({title: error.message || '微信登录失败', icon: 'none'})
+       } else if (data?.status === 'authenticated') {
+-        completeLoginRedirect()
++        if (data.needsProfile) {
++          setWechatSessionReady(true)
++          setWechatTicket(data.registrationTicket || '')
++          setWechatStep('choice')
++        } else {
++          completeLoginRedirect()
++        }
+       } else {
+         setWechatTicket(data?.status === 'unbound' ? data.registrationTicket : '')
+         setWechatStep('choice')
+@@ -118,17 +186,24 @@ export default function LoginPage() {
+ 
+   const handleBindExisting = async () => {
+     if (!username.trim() || password.length < 6) {
+-      Taro.showToast({title: '请输入已有账号和密码', icon: 'none'})
++      Taro.showToast({title: '请输入已有邮箱和密码', icon: 'none'})
+       return
+     }
+     setLoading(true)
+     try {
+-      const {error: loginError} = await signInWithUsername(username.trim(), password)
++      const {error: loginError} = await signInWithAccount(username.trim(), password)
+       if (loginError) {
+-        Taro.showToast({title: loginError.message || '已有账号登录失败', icon: 'none'})
++        Taro.showToast({title: loginError.message || '已有邮箱登录失败', icon: 'none'})
+         return
+       }
+-      const {error: bindError} = await bindWechatSignIn(wechatTicket)
++      let bindError: Error | null = null
++      try {
++        const freshWechatTicket = await prepareWechatBinding()
++        const result = await bindWechatSignIn(freshWechatTicket)
++        bindError = result.error
++      } catch (error) {
++        bindError = error as Error
++      }
+       if (bindError) {
+         await signOut()
+         Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
+@@ -137,25 +212,27 @@ export default function LoginPage() {
+       await saveWechatProfile()
+       setWechatTicket('')
+       completeLoginRedirect()
++    } catch (error) {
++      await signOut()
++      Taro.showToast({title: error instanceof Error ? error.message : '微信绑定失败', icon: 'none'})
+     } finally {
+       setLoading(false)
+     }
+   }
+ 
+-  const handleRegisterBeforeBinding = () => {
+-    setWechatStep('idle')
+-    setTab('register')
+-    setUsername('')
+-    setPassword('')
+-    setPasswordConfirm('')
++  const changeTab = (nextTab: 'login' | 'register') => {
++    setTab(nextTab)
++    resetEmailVerification()
+   }
+ 
+   const closeWechatFlow = () => {
+     if (loading) return
++    if (wechatSessionReady) void signOut()
+     setWechatStep('idle')
+     setWechatTicket('')
+     setWechatNickname('')
+     setWechatAvatarPath('')
++    setWechatSessionReady(false)
+   }
+ 
+   return (
+@@ -170,7 +247,7 @@ export default function LoginPage() {
+       </div>
+ 
+       {/* 登录卡片 */}
+-      <div className="flex-1 px-6 pt-8">
++      <div className="flex-1 px-6 pt-8" style={{width: '100%', maxWidth: '560px', margin: '0 auto'}}>
+         {/* Tab切换 */}
+         <div className="flex bg-secondary rounded-xl p-1 mb-6">
+           {(['login', 'register'] as const).map(t => (
+@@ -179,7 +256,7 @@ export default function LoginPage() {
+               type="button"
+               className={`flex-1 flex items-center justify-center leading-none text-xl font-semibold rounded-lg transition ${tab === t ? 'bg-white text-primary shadow-elegant' : 'text-muted-foreground'}`}
+               style={{height: '44px'}}
+-              onClick={() => setTab(t)}
++              onClick={() => changeTab(t)}
+             >
+               {t === 'login' ? '登录' : '注册'}
+             </button>
+@@ -189,11 +266,20 @@ export default function LoginPage() {
+         {/* 表单 */}
+         <div className="flex flex-col gap-4 mb-6">
+           <div>
+-            <p className="text-xl text-muted-foreground mb-2">用户名</p>
+-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
++            <div className="flex items-center justify-between mb-2">
++              <p className="text-xl text-muted-foreground">
++                邮箱
++              </p>
++              {tab === 'register' && emailOtpSent && (
++                <button type="button" className="text-xl text-primary" onClick={resetEmailVerification}>修改注册信息</button>
++              )}
++            </div>
++            <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent && tab === 'register' ? 'bg-secondary' : 'bg-card'}`}>
+               <input
+                 className="w-full text-xl text-foreground bg-transparent outline-none"
+-                placeholder="请输入用户名（字母/数字/下划线）"
++                type="email"
++                disabled={tab === 'register' && emailOtpSent}
++                placeholder={tab === 'login' ? '请输入邮箱' : '请输入常用邮箱'}
+                 value={username}
+                 onInput={(e) => { const ev = e as any; setUsername(ev.detail?.value ?? ev.target?.value ?? '') }}
+               />
+@@ -201,11 +287,13 @@ export default function LoginPage() {
+           </div>
+           <div>
+             <p className="text-xl text-muted-foreground mb-2">密码</p>
+-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
++            <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent && tab === 'register' ? 'bg-secondary' : 'bg-card'}`}>
+               <input
+                 type="password"
++                maxLength={72}
++                disabled={tab === 'register' && emailOtpSent}
+                 className="w-full text-xl text-foreground bg-transparent outline-none"
+-                placeholder="请输入密码（至少6位）"
++                placeholder={tab === 'register' ? '请输入6-72位密码' : '请输入密码'}
+                 value={password}
+                 onInput={(e) => { const ev = e as any; setPassword(ev.detail?.value ?? ev.target?.value ?? '') }}
+               />
+@@ -214,9 +302,11 @@ export default function LoginPage() {
+           {tab === 'register' && (
+             <div>
+               <p className="text-xl text-muted-foreground mb-2">确认密码</p>
+-              <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
++              <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent ? 'bg-secondary' : 'bg-card'}`}>
+                 <input
+                   type="password"
++                  maxLength={72}
++                  disabled={emailOtpSent}
+                   className="w-full text-xl text-foreground bg-transparent outline-none"
+                   placeholder="请再次输入密码"
+                   value={passwordConfirm}
+@@ -225,6 +315,46 @@ export default function LoginPage() {
+               </div>
+             </div>
+           )}
++          {tab === 'register' && emailOtpSent && (
++            <div>
++              <p className="text-xl text-muted-foreground mb-2">邮箱验证码</p>
++              <div className="border-2 border-input rounded-xl px-4 bg-card flex items-center" style={{height: '52px'}}>
++                <input
++                  type="text"
++                  inputMode="numeric"
++                  maxLength={EMAIL_OTP_LENGTH}
++                  className="flex-1 min-w-0 text-xl text-foreground bg-transparent outline-none"
++                  placeholder={`请输入${EMAIL_OTP_LENGTH}位验证码`}
++                  value={emailCode}
++                  onInput={(e) => {
++                    const ev = e as any
++                    setEmailCode(String(ev.detail?.value ?? ev.target?.value ?? '').replace(/\D/g, '').slice(0, EMAIL_OTP_LENGTH))
++                  }}
++                />
++                <button
++                  type="button"
++                  disabled={loading || emailCooldown > 0}
++                  className="flex items-center justify-center flex-shrink-0 disabled:opacity-100"
++                  style={{
++                    width: '116px',
++                    height: '36px',
++                    marginLeft: '12px',
++                    padding: '0 8px',
++                    borderRadius: '8px',
++                    border: `1px solid ${loading || emailCooldown > 0 ? '#B7C7BC' : '#2F8552'}`,
++                    backgroundColor: loading || emailCooldown > 0 ? '#E9F0EB' : '#FFFFFF',
++                    color: loading || emailCooldown > 0 ? '#60766A' : '#2F8552',
++                    fontSize: '15px',
++                    fontWeight: 600,
++                    lineHeight: 1,
++                    opacity: 1,
++                    whiteSpace: 'nowrap'
++                  }}
++                  onClick={handleResendEmailCode}
++                >{loading ? '发送中...' : emailCooldown > 0 ? `${emailCooldown}秒后重发` : '重新发送'}</button>
++              </div>
++            </div>
++          )}
+         </div>
+ 
+         {/* 协议勾选 — checkbox 与文字链接完全解耦 */}
+@@ -260,7 +390,15 @@ export default function LoginPage() {
+           style={{height: '56px'}}
+           onClick={handleSubmit}
+         >
+-          {loading ? '处理中...' : tab === 'login' ? '登录' : wechatTicket ? '注册并绑定微信' : '注册'}
++          {loading
++            ? '处理中...'
++            : tab === 'login'
++              ? '登录'
++              : !emailOtpSent
++                ? '获取邮箱验证码'
++                : wechatTicket
++                  ? '注册并绑定微信'
++                  : '验证并注册'}
+         </button>
+ 
+         {/* 微信登录 */}
+@@ -299,10 +437,10 @@ export default function LoginPage() {
+             <div className="flex items-center justify-between mb-5">
+               <div>
+                 <p className="text-2xl font-semibold text-foreground">
+-                  {wechatStep === 'choice' ? '微信尚未绑定' : '绑定已有账号'}
++                  {wechatStep === 'choice' ? '微信快捷登录' : '绑定已有邮箱账户'}
+                 </p>
+                 <p className="text-xl text-muted-foreground mt-1">
+-                  {wechatStep === 'choice' ? '请先注册或登录账号，再完成微信绑定' : '登录后将微信身份绑定到当前账号'}
++                  {wechatStep === 'choice' ? '头像和昵称可选，确认后即可进入系统' : '登录后将微信身份绑定到该邮箱账户'}
+                 </p>
+               </div>
+               <button
+@@ -350,14 +488,28 @@ export default function LoginPage() {
+                   disabled={loading}
+                   className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50 mb-3"
+                   style={{height: '50px'}}
+-                  onClick={() => setWechatStep('bind')}
+-                >绑定已有账号</button>
++                  onClick={async () => {
++                    if (loading) return
++                    setLoading(true)
++                    try {
++                      await saveWechatProfile()
++                      setWechatStep('idle')
++                      setWechatTicket('')
++                      setWechatSessionReady(false)
++                      completeLoginRedirect()
++                    } catch (error) {
++                      Taro.showToast({title: error instanceof Error ? error.message : '微信资料保存失败', icon: 'none'})
++                    } finally {
++                      setLoading(false)
++                    }
++                  }}
++                >{loading ? '进入中...' : '进入系统'}</button>
+                 <button
+                   type="button"
+                   className="w-full flex items-center justify-center text-xl font-medium border border-primary text-primary rounded-xl disabled:opacity-50 mb-2"
+                   style={{height: '48px'}}
+-                  onClick={handleRegisterBeforeBinding}
+-                >还没有账号，先注册</button>
++                  onClick={() => setWechatStep('bind')}
++                >绑定已有邮箱账户</button>
+               </>
+             ) : (
+               <>
+@@ -365,7 +517,7 @@ export default function LoginPage() {
+                   <div className="border border-input rounded-xl px-4 bg-card flex items-center" style={{height: '50px'}}>
+                     <input
+                       className="w-full text-xl text-foreground bg-transparent outline-none"
+-                      placeholder="已有用户名"
++                      placeholder="已有邮箱"
+                       value={username}
+                       onInput={(e) => { const ev = e as any; setUsername(ev.detail?.value ?? ev.target?.value ?? '') }}
+                     />
+@@ -374,7 +526,7 @@ export default function LoginPage() {
+                     <input
+                       type="password"
+                       className="w-full text-xl text-foreground bg-transparent outline-none"
+-                      placeholder="已有账号密码"
++                      placeholder="邮箱账户密码"
+                       value={password}
+                       onInput={(e) => { const ev = e as any; setPassword(ev.detail?.value ?? ev.target?.value ?? '') }}
+                     />
+diff --git a/src/pages/personal-info/index.tsx b/src/pages/personal-info/index.tsx
+index 1f7a2694..db907e27 100644
+--- a/src/pages/personal-info/index.tsx
++++ b/src/pages/personal-info/index.tsx
+@@ -4,16 +4,17 @@ import Taro, {useDidShow} from '@tarojs/taro'
+ import {Picker} from '@tarojs/components'
+ import {useAuth} from '@/contexts/AuthContext'
+ import {withRouteGuard} from '@/components/RouteGuard'
+-import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
++import {getFamilyMembers, updateFamilyMember, createFamilyMember, updateProfile, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
+ import {useAppStore} from '@/store/appStore'
+ import type {FamilyMember, GenderType, BloodType} from '@/db/types'
+ 
+ const CHRONIC_DISEASES = ['高血压', '糖尿病', '高血脂', '痛风', '肾病']
+ const ALLERGEN_OPTIONS = ['花生', '海鲜', '坚果', '乳制品', '蛋类', '麸质']
++const MEDICATION_OPTIONS = ['二甲双胍', '胰岛素', '阿卡波糖', '氨氯地平', '阿托伐他汀', '华法林']
+ const BLOOD_TYPES: BloodType[] = ['A', 'B', 'AB', 'O', 'other']
+ 
+ function PersonalInfoPage() {
+-  const {user} = useAuth()
++  const {user, refreshProfile} = useAuth()
+   const {activeMember, refreshMembers} = useAppStore()
+   const [member, setMember] = useState<Partial<FamilyMember>>({
+     gender: 'unknown', chronic_diseases: [], allergens: []
+@@ -21,6 +22,7 @@ function PersonalInfoPage() {
+   const [calorieGoalText, setCalorieGoalText] = useState('')
+   const [customDisease, setCustomDisease] = useState('')
+   const [customAllergen, setCustomAllergen] = useState('')
++  const [customMedication, setCustomMedication] = useState('')
+   const [saving, setSaving] = useState(false)
+   const [clearingChat, setClearingChat] = useState(false)
+ 
+@@ -49,18 +51,31 @@ function PersonalInfoPage() {
+ 
+   const handleSave = async () => {
+     if (!user) return
++    const nickname = member.nickname?.trim() || ''
++    if (!nickname) {
++      Taro.showToast({title: '请输入昵称', icon: 'none'})
++      return
++    }
++    if (nickname.length > 20) {
++      Taro.showToast({title: '昵称不能超过20个字符', icon: 'none'})
++      return
++    }
++
+     setSaving(true)
+     try {
+       const updates = {
+         ...member,
++        nickname,
+         daily_calorie_goal: calorieGoalText ? parseInt(calorieGoalText) : null
+       }
++      const isPrimaryMember = member.id ? Boolean(member.is_primary) : true
+       if (member.id) {
+-        await updateFamilyMember(member.id, updates)
++        const saved = await updateFamilyMember(member.id, updates)
++        if (!saved) throw new Error('健康档案保存失败')
+       } else {
+-        await createFamilyMember({
++        const created = await createFamilyMember({
+           user_id: user.id,
+-          nickname: user.id.slice(0, 8),
++          nickname,
+           avatar_url: null,
+           gender: member.gender || 'unknown',
+           age: member.age || null,
+@@ -77,9 +92,19 @@ function PersonalInfoPage() {
+           daily_carb_goal: member.daily_carb_goal || null,
+           is_primary: true
+         })
++        if (!created) throw new Error('健康档案保存失败')
++      }
++      if (isPrimaryMember) {
++        const profileSaved = await updateProfile(user.id, {nickname})
++        if (!profileSaved) throw new Error('用户昵称同步失败')
+       }
+-      await refreshMembers(user.id)
++      await Promise.all([
++        refreshMembers(user.id),
++        isPrimaryMember ? refreshProfile() : Promise.resolve()
++      ])
+       Taro.showToast({title: '保存成功', icon: 'success'})
++    } catch (error) {
++      Taro.showToast({title: error instanceof Error ? error.message : '保存失败', icon: 'none'})
+     } finally {
+       setSaving(false)
+     }
+@@ -95,12 +120,25 @@ function PersonalInfoPage() {
+     setMember({...member, allergens: list.includes(a) ? list.filter(x => x !== a) : [...list, a]})
+   }
+ 
++  const getMedications = () => (member.medications || '')
++    .split(/[,，\n、]/)
++    .map(item => item.trim())
++    .filter(Boolean)
++
++  const toggleMedication = (medication: string) => {
++    const medications = getMedications()
++    const next = medications.includes(medication)
++      ? medications.filter(item => item !== medication)
++      : [...medications, medication]
++    setMember({...member, medications: next.join('、')})
++  }
++
+   const handleClearData = async () => {
+     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
+       Taro.showModal({
+         title: '清空当前成员健康档案',
+         content: '仅清空当前成员的基础健康信息、慢性病、过敏原、用药和营养目标；不会删除称重历史、食材图片、其他成员或账号。',
+-        confirmColor: '#D9534F',
++        confirmColor: '#2F8552',
+         success: (res) => resolve({confirm: res.confirm})
+       })
+     })
+@@ -121,9 +159,9 @@ function PersonalInfoPage() {
+   const handleClearChat = async () => {
+     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
+       Taro.showModal({
+-        title: '清除 AI 记忆与旧版对话',
+-        content: '将清除百度 AI 对话上下文和小程序旧版对话数据。百度对话日志可能仍按云服务策略保留，此操作不可撤销。',
+-        confirmColor: '#D9534F',
++        title: '清除 AI 对话',
++        content: '将清除当前账号的 AI 对话上下文和本地对话记录。云服务日志可能仍按服务策略保留，此操作不可撤销。',
++        confirmColor: '#2F8552',
+         success: (res) => resolve({confirm: res.confirm})
+       })
+     })
+@@ -133,10 +171,10 @@ function PersonalInfoPage() {
+     try {
+       await deleteRtcContexts()
+       const localDeleted = await deleteAllChatMessages(user.id)
+-      if (!localDeleted) throw new Error('旧版对话删除失败')
+-      Taro.showToast({title: 'AI 记忆与旧版对话已清除', icon: 'success'})
++      if (!localDeleted) throw new Error('AI 对话删除失败')
++      Taro.showToast({title: 'AI 对话已清除', icon: 'success'})
+     } catch (error) {
+-      console.error('清除 AI 记忆与旧版对话失败:', error)
++      console.error('清除 AI 对话失败:', error)
+       Taro.showToast({title: '清除失败，请稍后重试', icon: 'none'})
+     } finally {
+       setClearingChat(false)
+@@ -160,6 +198,24 @@ function PersonalInfoPage() {
+             <span className="text-xl font-semibold text-foreground">基础健康信息</span>
+           </div>
+ 
++          {/* 昵称 */}
++          <div className="flex items-center justify-between gap-4 py-3 border-b border-border">
++            <span className="text-xl text-foreground flex-shrink-0">昵称</span>
++            <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '160px', height: '48px', boxSizing: 'border-box'}}>
++              <input
++                type="text"
++                maxLength={20}
++                className="w-full text-xl text-foreground bg-transparent outline-none text-right"
++                placeholder="请输入昵称"
++                value={member.nickname || ''}
++                onInput={(e) => {
++                  const ev = e as any
++                  setMember({...member, nickname: ev.detail?.value ?? ev.target?.value ?? ''})
++                }}
++              />
++            </div>
++          </div>
++
+           {/* 性别 */}
+           <div className="flex items-center justify-between py-3 border-b border-border">
+             <span className="text-xl text-foreground">性别</span>
+@@ -184,11 +240,11 @@ function PersonalInfoPage() {
+           ].map(field => (
+             <div key={field.key} className="flex items-center justify-between py-3 border-b border-border">
+               <span className="text-xl text-foreground">{field.label}</span>
+-              <div className="flex items-center gap-2">
+-                <div className="border border-input rounded-xl px-3 py-2 bg-background">
++              <div className="flex items-center justify-between" style={{width: '148px'}}>
++                <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '108px', height: '48px', boxSizing: 'border-box'}}>
+                   <input
+                     className="text-xl text-foreground bg-transparent outline-none text-right"
+-                    style={{width: '80px'}}
++                    style={{width: '100%', height: '100%'}}
+                     placeholder="未设置"
+                     value={(member as any)[field.key]?.toString() || ''}
+                     onInput={(e) => {
+@@ -198,7 +254,7 @@ function PersonalInfoPage() {
+                     }}
+                   />
+                 </div>
+-                <span className="text-xl text-muted-foreground">{field.unit}</span>
++                <span className="text-xl text-muted-foreground text-left" style={{width: '32px'}}>{field.unit}</span>
+               </div>
+             </div>
+           ))}
+@@ -324,14 +380,37 @@ function PersonalInfoPage() {
+             <span className="text-xl font-semibold text-foreground">正在服用的药物</span>
+           </div>
+           <p className="text-xl text-muted-foreground mb-3">填写后AI将提示可能的食药互作，不用于诊断</p>
+-          <div className="border border-input rounded-xl px-4 py-3 bg-background">
+-            <textarea
+-              className="w-full text-xl text-foreground bg-transparent outline-none"
+-              placeholder="例如：二甲双胍、降压药等（换行分隔）"
+-              value={member.medications || ''}
+-              style={{minHeight: '80px', resize: 'none'}}
+-              onInput={(e) => { const ev = e as any; setMember({...member, medications: ev.detail?.value ?? ev.target?.value ?? ''}) }}
+-            />
++          <div className="flex flex-wrap gap-2 mb-3">
++            {MEDICATION_OPTIONS.map(medication => (
++              <button
++                key={medication}
++                type="button"
++                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${getMedications().includes(medication) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
++                style={{height: '36px', ...(getMedications().includes(medication) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
++                onClick={() => toggleMedication(medication)}
++              >{medication}</button>
++            ))}
++          </div>
++          <div className="flex items-center gap-2">
++            <div className="flex-1 border border-input rounded-xl px-3 py-2 bg-background">
++              <input
++                className="w-full text-xl text-foreground bg-transparent outline-none"
++                placeholder="其他药物"
++                value={customMedication}
++                onInput={(e) => { const ev = e as any; setCustomMedication(ev.detail?.value ?? ev.target?.value ?? '') }}
++              />
++            </div>
++            <button
++              type="button"
++              className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
++              style={{height: '40px'}}
++              onClick={() => {
++                if (customMedication.trim()) {
++                  toggleMedication(customMedication.trim())
++                  setCustomMedication('')
++                }
++              }}
++            >添加</button>
+           </div>
+         </div>
+ 
+@@ -352,10 +431,10 @@ function PersonalInfoPage() {
+           <div className="flex items-center justify-between py-3 border-b border-border">
+             <span className="text-xl text-foreground">每日热量目标</span>
+             <div className="flex items-center gap-2">
+-              <div className="border border-input rounded-xl px-3 py-2 bg-background">
++              <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '120px', height: '48px', boxSizing: 'border-box'}}>
+                 <input
+                   className="text-xl text-foreground bg-transparent outline-none text-right"
+-                  style={{width: '80px'}}
++                  style={{width: '100%', height: '100%'}}
+                   placeholder={String(bmiCalorie || 1800)}
+                   value={calorieGoalText}
+                   onInput={(e) => { const ev = e as any; setCalorieGoalText(ev.detail?.value ?? ev.target?.value ?? '') }}
+@@ -377,22 +456,22 @@ function PersonalInfoPage() {
+         {/* 数据清除 */}
+         <div className="bg-card rounded-2xl p-4 shadow-elegant flex flex-col gap-3">
+           <div className="flex items-center gap-2">
+-            <div className="i-mdi-delete-outline text-2xl text-destructive" />
++            <div className="i-mdi-delete-outline text-2xl text-primary" />
+             <span className="text-xl font-semibold text-foreground">数据管理</span>
+           </div>
+           <button
+             type="button"
+-            className="w-full flex items-center justify-center leading-none text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-xl"
++            className="w-full flex items-center justify-center leading-none text-xl font-medium text-primary border-2 border-primary bg-white rounded-xl"
+             style={{height: '48px'}}
+             onClick={handleClearData}
+           >清空当前成员健康档案</button>
+           <button
+             type="button"
+-            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
++            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary bg-white rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
+             style={{height: '48px'}}
+             onClick={handleClearChat}
+             disabled={clearingChat}
+-          >{clearingChat ? '清除中...' : '清除 AI 记忆与旧版对话'}</button>
++          >{clearingChat ? '清除中...' : '清除 AI 对话'}</button>
+         </div>
+       </div>
+     </div>
+diff --git a/src/pages/profile/index.tsx b/src/pages/profile/index.tsx
+index 9da8426d..68d71e1b 100644
+--- a/src/pages/profile/index.tsx
++++ b/src/pages/profile/index.tsx
+@@ -129,7 +129,7 @@ function ProfilePage() {
+         {/* 退出登录 */}
+         <button
+           type="button"
+-          className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-2xl mt-2"
++          className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium text-primary border-2 border-primary bg-white rounded-2xl mt-2"
+           style={{height: '52px'}}
+           onClick={handleSignOut}
+         >
+diff --git a/src/utils/authValidation.ts b/src/utils/authValidation.ts
+new file mode 100644
+index 00000000..1fab158c
+--- /dev/null
++++ b/src/utils/authValidation.ts
+@@ -0,0 +1,33 @@
++const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
++const PASSWORD_MAX_LENGTH = 72
++export const EMAIL_OTP_LENGTH = 8
++
++export function normalizeEmail(email: string): string {
++  const normalized = email.trim().toLowerCase()
++  if (!EMAIL_PATTERN.test(normalized)) throw new Error('请输入有效的邮箱地址')
++  return normalized
++}
++
++export function normalizeRegistrationEmail(email: string): string {
++  const normalized = normalizeEmail(email)
++  if (normalized.endsWith('@miaoda.com') || normalized.endsWith('@wechat.login')) {
++    throw new Error('该邮箱域名不可用于注册')
++  }
++  return normalized
++}
++
++export function getNewPasswordError(password: string): string | null {
++  if (password.length < 6 || password.length > PASSWORD_MAX_LENGTH) return '密码需为6-72位'
++  return null
++}
++
++export function validateNewPassword(password: string): void {
++  const message = getNewPasswordError(password)
++  if (message) throw new Error(message)
++}
++
++export function validateEmailOtp(code: string): void {
++  if (!new RegExp(`^\\d{${EMAIL_OTP_LENGTH}}$`).test(code)) {
++    throw new Error(`请输入${EMAIL_OTP_LENGTH}位邮箱验证码`)
++  }
++}

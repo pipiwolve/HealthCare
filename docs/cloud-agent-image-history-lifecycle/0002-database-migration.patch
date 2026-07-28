@@ -1,0 +1,125 @@
+diff --git a/supabase/migrations/00006_food_image_lifecycle.sql b/supabase/migrations/00006_food_image_lifecycle.sql
+new file mode 100644
+index 00000000..ca4455a1
+--- /dev/null
++++ b/supabase/migrations/00006_food_image_lifecycle.sql
+@@ -0,0 +1,119 @@
++-- 食材图片采用 30 天大图 + 随称重记录保留的缩略图双层存储。
++
++-- 新上传统一经鉴权 Edge Function，关闭旧的匿名直传入口。
++drop policy if exists chat_images_anon_insert on storage.objects;
++
++create table if not exists public.food_images (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references public.profiles(id) on delete cascade,
++  large_path text not null unique,
++  thumbnail_path text not null unique,
++  large_bytes integer not null check (large_bytes > 0 and large_bytes <= 307200),
++  thumbnail_bytes integer not null check (thumbnail_bytes > 0 and thumbnail_bytes <= 51200),
++  large_width integer,
++  large_height integer,
++  thumbnail_width integer,
++  thumbnail_height integer,
++  large_expires_at timestamptz not null default (now() + interval '30 days'),
++  large_deleted_at timestamptz,
++  attached_at timestamptz,
++  created_at timestamptz not null default now()
++);
++
++create table if not exists public.food_image_records (
++  image_id uuid not null references public.food_images(id) on delete cascade,
++  weighing_record_id uuid not null references public.weighing_records(id) on delete cascade,
++  created_at timestamptz not null default now(),
++  primary key (image_id, weighing_record_id)
++);
++
++create index if not exists food_images_user_created_idx on public.food_images(user_id, created_at desc);
++create index if not exists food_images_large_expiry_idx
++  on public.food_images(large_expires_at)
++  where large_deleted_at is null;
++create index if not exists food_image_records_record_idx on public.food_image_records(weighing_record_id);
++
++alter table public.food_images enable row level security;
++alter table public.food_image_records enable row level security;
++
++-- 图片元数据仅由校验登录身份的 Edge Function 通过 service_role 操作。
++grant select, insert, update, delete on public.food_images to service_role;
++grant select, insert, update, delete on public.food_image_records to service_role;
++
++create or replace function public.link_food_images_to_weighing_record()
++returns trigger
++language plpgsql
++security definer
++set search_path = public
++as $$
++begin
++  insert into public.food_image_records (image_id, weighing_record_id)
++  select image.id, new.id
++  from public.food_images image
++  where image.user_id = new.user_id
++    and image.id in (
++      select distinct (ingredient->>'image_id')::uuid
++      from jsonb_array_elements(
++        case when jsonb_typeof(new.ingredients) = 'array' then new.ingredients else '[]'::jsonb end
++      ) ingredient
++      where coalesce(ingredient->>'image_id', '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
++    )
++  on conflict do nothing;
++
++  update public.food_images image
++  set attached_at = coalesce(image.attached_at, now())
++  where image.user_id = new.user_id
++    and exists (
++      select 1
++      from public.food_image_records link
++      where link.image_id = image.id
++        and link.weighing_record_id = new.id
++    );
++  return new;
++end;
++$$;
++
++drop trigger if exists weighing_records_link_food_images on public.weighing_records;
++create trigger weighing_records_link_food_images
++  after insert on public.weighing_records
++  for each row execute function public.link_food_images_to_weighing_record();
++
++revoke all on function public.link_food_images_to_weighing_record() from public, anon, authenticated;
++grant execute on function public.link_food_images_to_weighing_record() to service_role;
++
++create or replace function public.get_food_images_for_cleanup(batch_size integer default 100)
++returns table (
++  id uuid,
++  large_path text,
++  thumbnail_path text,
++  delete_all boolean
++)
++language sql
++security definer
++set search_path = public
++as $$
++  select
++    image.id,
++    image.large_path,
++    image.thumbnail_path,
++    image.created_at < now() - interval '24 hours'
++      and not exists (
++        select 1 from public.food_image_records link where link.image_id = image.id
++      ) as delete_all
++  from public.food_images image
++  where (
++      image.large_deleted_at is null
++      and image.large_expires_at <= now()
++    )
++    or (
++      image.created_at < now() - interval '24 hours'
++      and not exists (
++        select 1 from public.food_image_records link where link.image_id = image.id
++      )
++    )
++  order by image.created_at asc
++  limit greatest(1, least(batch_size, 500));
++$$;
++
++revoke all on function public.get_food_images_for_cleanup(integer) from public, anon, authenticated;
++grant execute on function public.get_food_images_for_cleanup(integer) to service_role;

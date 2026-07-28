@@ -2,9 +2,9 @@ import {createContext, useCallback, useContext, useEffect, useState, type ReactN
 import {supabase} from '@/client/supabase'
 import type {User} from '@supabase/supabase-js'
 import type {Profile} from '@/db/types'
+import {normalizeEmail, normalizeRegistrationEmail, validateEmailOtp, validateNewPassword} from '@/utils/authValidation'
 import {
   bindWechatAccount,
-  registerWechatAccount,
   startWechatLogin,
   type WechatStartResult
 } from '@/services/wechatAuth'
@@ -23,19 +23,25 @@ interface AuthContextType {
   user: User | null
   profile: Profile | null
   loading: boolean
-  signInWithUsername: (username: string, password: string) => Promise<{error: Error | null}>
-  signUpWithUsername: (username: string, password: string) => Promise<{error: Error | null}>
+  signInWithAccount: (account: string, password: string) => Promise<{error: Error | null}>
+  startEmailSignUp: (email: string, password: string) => Promise<{error: Error | null}>
+  verifyEmailSignUp: (email: string, code: string) => Promise<{error: Error | null}>
   signUpWithPhone: (phone: string, password: string) => Promise<{error: Error | null}>
   signInWithPhone: (phone: string) => Promise<{error: Error | null}>
   verifyPhoneOtp: (phone: string, code: string) => Promise<{error: Error | null}>
   startWechatSignIn: () => Promise<{data: WechatStartResult | null; error: Error | null}>
-  registerWechatSignIn: (ticket: string, phoneCode?: string) => Promise<{error: Error | null}>
   bindWechatSignIn: (ticket: string) => Promise<{error: Error | null}>
   signOut: () => Promise<void>
   refreshProfile: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
+
+function normalizeUsername(username: string): string {
+  const normalized = username.trim().toLowerCase()
+  if (!/^[A-Za-z0-9_]{3,32}$/.test(normalized)) throw new Error('用户名需为3-32位字母、数字或下划线')
+  return normalized
+}
 
 export function AuthProvider({children}: {children: ReactNode}) {
   const [user, setUser] = useState<User | null>(null)
@@ -84,9 +90,11 @@ export function AuthProvider({children}: {children: ReactNode}) {
     return () => subscription.unsubscribe()
   }, [])
 
-  const signInWithUsername = async (username: string, password: string) => {
+  const signInWithAccount = async (account: string, password: string) => {
     try {
-      const email = `${username}@miaoda.com`
+      const email = account.includes('@')
+        ? normalizeEmail(account)
+        : `${normalizeUsername(account)}@miaoda.com`
       const {error} = await supabase.auth.signInWithPassword({
         email,
         password
@@ -99,13 +107,12 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
   }
 
-  const signUpWithUsername = async (username: string, password: string) => {
+  const signUpWithPhone = async (phone: string, password: string) => {
     try {
-      const email = `${username}@miaoda.com`
+      validateNewPassword(password)
       const {error} = await supabase.auth.signUp({
-        email,
-        password,
-        options: {data: {username}}
+        phone,
+        password
       })
 
       if (error) throw error
@@ -115,14 +122,36 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
   }
 
-  const signUpWithPhone = async (phone: string, password: string) => {
+  const startEmailSignUp = async (email: string, password: string) => {
     try {
-      const {error} = await supabase.auth.signUp({
-        phone,
+      const normalizedEmail = normalizeRegistrationEmail(email)
+      validateNewPassword(password)
+      const {data, error} = await supabase.auth.signUp({
+        email: normalizedEmail,
         password
       })
-
       if (error) throw error
+      if (data.session) {
+        await supabase.auth.signOut()
+        throw new Error('邮箱确认尚未启用，请联系管理员完成认证配置')
+      }
+      return {error: null}
+    } catch (error) {
+      return {error: error as Error}
+    }
+  }
+
+  const verifyEmailSignUp = async (email: string, code: string) => {
+    try {
+      const normalizedEmail = normalizeRegistrationEmail(email)
+      validateEmailOtp(code)
+
+      const {error: verifyError} = await supabase.auth.verifyOtp({
+        email: normalizedEmail,
+        token: code,
+        type: 'signup'
+      })
+      if (verifyError) throw verifyError
       return {error: null}
     } catch (error) {
       return {error: error as Error}
@@ -162,15 +191,6 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
   }
 
-  const registerWechatSignIn = async (ticket: string, phoneCode?: string) => {
-    try {
-      await registerWechatAccount(ticket, phoneCode)
-      return {error: null}
-    } catch (error) {
-      return {error: error as Error}
-    }
-  }
-
   const bindWechatSignIn = async (ticket: string) => {
     try {
       await bindWechatAccount(ticket)
@@ -192,13 +212,13 @@ export function AuthProvider({children}: {children: ReactNode}) {
         user,
         profile,
         loading,
-        signInWithUsername,
-        signUpWithUsername,
+        signInWithAccount,
+        startEmailSignUp,
+        verifyEmailSignUp,
         signUpWithPhone,
         signInWithPhone,
         verifyPhoneOtp,
         startWechatSignIn,
-        registerWechatSignIn,
         bindWechatSignIn,
         signOut,
         refreshProfile

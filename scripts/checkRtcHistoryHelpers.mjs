@@ -39,6 +39,27 @@ assert(groups[0].messages[0].content === '早餐怎么吃比较健康？', 'RTC 
 assert(groups[0].messages[1].role === 'assistant', 'ANSWER rows map to assistant messages')
 assert(groups[1].id === 'rtc-3600-3600', 'group id should be stable from start and end timestamps')
 
+const dateGroups = helpers.groupRtcHistoryByDate([
+  {
+    id: 'late-night',
+    title: '跨午夜会话',
+    startTime: Date.parse('2026-07-26T15:55:00Z') / 1000,
+    endTime: Date.parse('2026-07-26T16:05:00Z') / 1000,
+    messages: [],
+  },
+  {
+    id: 'next-day',
+    title: '第二天会话',
+    startTime: Date.parse('2026-07-27T02:00:00Z') / 1000,
+    endTime: Date.parse('2026-07-27T02:05:00Z') / 1000,
+    messages: [],
+  },
+], Date.parse('2026-07-27T04:00:00Z') / 1000)
+assert(dateGroups.length === 2, 'RTC groups should be organized into Shanghai calendar dates')
+assert(dateGroups[0].label === '今天', 'the latest Shanghai date should be labeled today')
+assert(dateGroups[1].label === '昨天', 'the previous Shanghai date should be labeled yesterday')
+assert(dateGroups[1].groups[0].id === 'late-night', 'cross-midnight sessions should use their first message date')
+
 const halfWidthMarker = helpers.groupRtcDialogueRows([
   {type: 'QUESTION', timestamp: 1, text: '你是专业健康饮食顾问。\\n\\n用户问题: 今天适合吃什么水果？'}
 ])
@@ -92,10 +113,25 @@ assert(
 )
 
 assert(
+  edgeSource.includes("body.action === 'delete-contexts'") &&
+    edgeSource.includes("const path = '/api/v1/contexts'") &&
+    edgeSource.includes("method: 'DELETE'") &&
+    edgeSource.includes('JSON.stringify(deleteBody)') &&
+    edgeSource.includes('deleteBody: Record<string, string> = {appId: APPID, userId}'),
+  'brtc-history should delete contexts with the trusted server-side appId and authenticated userId'
+)
+
+assert(
+  apiSource.includes('export async function deleteRtcContexts') &&
+    apiSource.includes("body: {action: 'delete-contexts'}"),
+  'miniapp API should expose the authenticated BRTC context deletion action'
+)
+
+assert(
   edgeSource.includes('DEFAULT_RANGE_SECONDS = 30 * 24 * 60 * 60') &&
     edgeSource.includes('DEFAULT_PAGE_SIZE = 100') &&
     edgeSource.includes('GROUP_GAP_SECONDS = 30 * 60') &&
-    edgeSource.includes('MAX_HISTORY_GROUPS = 10') &&
+    edgeSource.includes('MAX_HISTORY_GROUPS = DEFAULT_PAGE_SIZE') &&
     edgeSource.includes('normalizeQuestionText') &&
     edgeSource.includes('skipAnswerForHiddenQuestion') &&
     edgeSource.includes('请分析以下食材的营养成分') &&

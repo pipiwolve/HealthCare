@@ -1,6 +1,8 @@
 // 免责声明弹窗 — 全屏蒙层，阻断底层所有交互
-import {useState} from 'react'
+
 import Taro from '@tarojs/taro'
+import {useState} from 'react'
+import {HealthBrandMark} from '@/components/HealthMarks'
 
 interface DisclaimerModalProps {
   visible: boolean
@@ -33,7 +35,7 @@ export function DisclaimerModal({visible, onAgree}: DisclaimerModalProps) {
       >
         <div className="flex flex-col items-center mb-6">
           <div className="w-16 h-16 bg-gradient-primary rounded-2xl flex items-center justify-center mb-4">
-            <div className="i-mdi-heart-pulse text-4xl text-white" />
+            <HealthBrandMark size={40} className="text-white" />
           </div>
           <h2 className="text-2xl font-bold text-foreground">智能健康助手</h2>
           <p className="text-xl text-muted-foreground mt-1">健康管理工具</p>
