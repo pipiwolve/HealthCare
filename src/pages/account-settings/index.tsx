@@ -78,18 +78,20 @@ function AccountSettingsPage() {
         <div className="flex items-center gap-3">
           <div className="i-mdi-account-key text-3xl text-primary" />
           <div className="flex-1 min-w-0">
-            <p className="text-xl font-semibold text-foreground">用户名登录</p>
+            <p className="text-xl font-semibold text-foreground">
+              {status?.loginType === 'username' ? '历史账号' : '邮箱账户'}
+            </p>
             <p className="text-xl text-muted-foreground break-all">
-              {status?.hasUsernameLogin ? status.username : status ? '未设置' : '加载中...'}
+              {status?.hasPasswordLogin ? status.loginIdentifier : status ? '未设置' : '加载中...'}
             </p>
           </div>
-          <div className={`text-xl font-medium ${status?.hasUsernameLogin ? 'text-primary' : 'text-muted-foreground'}`}>
-            {status?.hasUsernameLogin ? '可用' : status ? '未设置' : '--'}
+          <div className={`text-xl font-medium ${status?.hasPasswordLogin ? 'text-primary' : 'text-muted-foreground'}`}>
+            {status?.hasPasswordLogin ? '已配置' : status ? '未配置' : '--'}
           </div>
         </div>
-        {status && !status.hasUsernameLogin && (
+        {status && !status.hasPasswordLogin && (
           <p className="text-xl text-muted-foreground pt-3 mt-3 border-t border-border">
-            当前为旧版微信独立账号，不能直接绑定另一个已有账号，请先完成账号迁移。
+            当前账号仅支持微信登录，尚未配置邮箱账户。
           </p>
         )}
       </div>
@@ -124,19 +126,19 @@ function AccountSettingsPage() {
           <>
             <button
               type="button"
-              disabled={loading || !status.hasUsernameLogin}
+              disabled={loading || !status.hasPasswordLogin}
               className="w-full flex items-center justify-center text-xl font-medium border border-destructive text-destructive rounded-xl mt-4 disabled:opacity-40"
               style={{height: '48px'}}
               onClick={() => setDialog('unbind')}
             >解绑微信</button>
-            {!status.hasUsernameLogin && (
-              <p className="text-xl text-muted-foreground mt-2">旧版微信独立账号完成迁移前不能解绑。</p>
+            {!status.hasPasswordLogin && (
+              <p className="text-xl text-muted-foreground mt-2">配置邮箱账户前不能解绑微信。</p>
             )}
           </>
         )}
       </div>
 
-      <p className="text-xl text-muted-foreground mt-3 px-1">微信仅绑定已注册账号，不会自动合并两个账号的数据。</p>
+      <p className="text-xl text-muted-foreground mt-3 px-1">绑定后，邮箱和微信将登录同一账户；两个已独立存在的账户不会自动合并数据。</p>
 
       {dialog !== 'none' && (
         <div className="fixed inset-0 flex flex-col justify-end" style={{zIndex: 1000}}>
@@ -151,7 +153,7 @@ function AccountSettingsPage() {
             <div className="flex items-center justify-between mb-5">
               <div>
                 <p className="text-2xl font-semibold text-foreground">确认解绑微信</p>
-                <p className="text-xl text-muted-foreground mt-1">解绑后请使用用户名 {status?.username || ''} 登录</p>
+                <p className="text-xl text-muted-foreground mt-1">解绑后请使用 {status?.loginIdentifier || ''} 登录</p>
               </div>
               <button type="button" className="flex items-center justify-center" style={{width: '40px', height: '40px'}} onClick={closeDialog}>
                 <div className="i-mdi-close text-2xl text-muted-foreground" />

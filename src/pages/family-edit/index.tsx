@@ -12,6 +12,7 @@ import type {FamilyMember, GenderType} from '@/db/types'
 
 const CHRONIC_DISEASES = ['高血压', '糖尿病', '高血脂', '痛风', '肾病']
 const ALLERGEN_OPTIONS = ['花生', '海鲜', '坚果', '乳制品', '蛋类', '麸质']
+const MEDICATION_OPTIONS = ['二甲双胍', '胰岛素', '阿卡波糖', '氨氯地平', '阿托伐他汀', '华法林']
 
 function FamilyEditPage() {
   const {user} = useAuth()
@@ -23,6 +24,7 @@ function FamilyEditPage() {
     nickname: '', gender: 'unknown', chronic_diseases: [], allergens: []
   })
   const [saving, setSaving] = useState(false)
+  const [customMedication, setCustomMedication] = useState('')
   const [avatarPreviewPath, setAvatarPreviewPath] = useState('')
   const [uploadingAvatar, setUploadingAvatar] = useState(false)
 
@@ -100,6 +102,19 @@ function FamilyEditPage() {
     setForm({...form, allergens: list.includes(a) ? list.filter(x => x !== a) : [...list, a]})
   }
 
+  const getMedications = () => (form.medications || '')
+    .split(/[,，\n、]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+
+  const toggleMedication = (medication: string) => {
+    const medications = getMedications()
+    const next = medications.includes(medication)
+      ? medications.filter(item => item !== medication)
+      : [...medications, medication]
+    setForm({...form, medications: next.join('、')})
+  }
+
   return (
     <div className="min-h-screen bg-background pb-10">
       <div className="px-4 py-4 flex flex-col gap-4">
@@ -131,7 +146,7 @@ function FamilyEditPage() {
           {/* 昵称 */}
           <div>
             <p className="text-xl text-muted-foreground mb-2">昵称</p>
-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-background">
+            <div className="border-2 border-input rounded-xl px-4 py-3 bg-background" style={{height: '48px', boxSizing: 'border-box'}}>
               <input
                 className="w-full text-xl text-foreground bg-transparent outline-none"
                 placeholder="请输入成员昵称"
@@ -166,7 +181,7 @@ function FamilyEditPage() {
             ].map(field => (
               <div key={field.key} className="flex-1">
                 <p className="text-xl text-muted-foreground mb-2">{field.label}</p>
-                <div className="border-2 border-input rounded-xl px-3 py-3 bg-background">
+                <div className="border-2 border-input rounded-xl px-3 py-3 bg-background" style={{height: '48px', boxSizing: 'border-box'}}>
                   <input
                     className="w-full text-xl text-foreground bg-transparent outline-none"
                     placeholder={field.unit}
@@ -235,6 +250,47 @@ function FamilyEditPage() {
                 onClick={() => toggleAllergen(a)}
               >{a}</button>
             ))}
+          </div>
+        </div>
+
+        {/* 正在服用的药物 */}
+        <div className="bg-card rounded-2xl p-4 shadow-elegant">
+          <div className="flex items-center gap-2 mb-1">
+            <div className="i-mdi-pill text-2xl text-primary" />
+            <span className="text-xl font-semibold text-foreground">正在服用的药物</span>
+          </div>
+          <p className="text-xl text-muted-foreground mb-3">填写后AI将提示可能的食药互作，不用于诊断</p>
+          <div className="flex flex-wrap gap-2 mb-3">
+            {MEDICATION_OPTIONS.map(medication => (
+              <button
+                key={medication}
+                type="button"
+                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${getMedications().includes(medication) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+                style={{height: '36px', ...(getMedications().includes(medication) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                onClick={() => toggleMedication(medication)}
+              >{medication}</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex-1 border border-input rounded-xl px-3 py-2 bg-background">
+              <input
+                className="w-full text-xl text-foreground bg-transparent outline-none"
+                placeholder="其他药物"
+                value={customMedication}
+                onInput={(e) => { const ev = e as any; setCustomMedication(ev.detail?.value ?? ev.target?.value ?? '') }}
+              />
+            </div>
+            <button
+              type="button"
+              className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
+              style={{height: '40px'}}
+              onClick={() => {
+                if (customMedication.trim()) {
+                  toggleMedication(customMedication.trim())
+                  setCustomMedication('')
+                }
+              }}
+            >添加</button>
           </div>
         </div>
 

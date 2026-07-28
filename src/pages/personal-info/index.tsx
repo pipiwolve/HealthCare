@@ -4,16 +4,17 @@ import Taro, {useDidShow} from '@tarojs/taro'
 import {Picker} from '@tarojs/components'
 import {useAuth} from '@/contexts/AuthContext'
 import {withRouteGuard} from '@/components/RouteGuard'
-import {getFamilyMembers, updateFamilyMember, createFamilyMember, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
+import {getFamilyMembers, updateFamilyMember, createFamilyMember, updateProfile, deleteAllChatMessages, deleteRtcContexts} from '@/db/api'
 import {useAppStore} from '@/store/appStore'
 import type {FamilyMember, GenderType, BloodType} from '@/db/types'
 
 const CHRONIC_DISEASES = ['高血压', '糖尿病', '高血脂', '痛风', '肾病']
 const ALLERGEN_OPTIONS = ['花生', '海鲜', '坚果', '乳制品', '蛋类', '麸质']
+const MEDICATION_OPTIONS = ['二甲双胍', '胰岛素', '阿卡波糖', '氨氯地平', '阿托伐他汀', '华法林']
 const BLOOD_TYPES: BloodType[] = ['A', 'B', 'AB', 'O', 'other']
 
 function PersonalInfoPage() {
-  const {user} = useAuth()
+  const {user, refreshProfile} = useAuth()
   const {activeMember, refreshMembers} = useAppStore()
   const [member, setMember] = useState<Partial<FamilyMember>>({
     gender: 'unknown', chronic_diseases: [], allergens: []
@@ -21,6 +22,7 @@ function PersonalInfoPage() {
   const [calorieGoalText, setCalorieGoalText] = useState('')
   const [customDisease, setCustomDisease] = useState('')
   const [customAllergen, setCustomAllergen] = useState('')
+  const [customMedication, setCustomMedication] = useState('')
   const [saving, setSaving] = useState(false)
   const [clearingChat, setClearingChat] = useState(false)
 
@@ -49,18 +51,31 @@ function PersonalInfoPage() {
 
   const handleSave = async () => {
     if (!user) return
+    const nickname = member.nickname?.trim() || ''
+    if (!nickname) {
+      Taro.showToast({title: '请输入昵称', icon: 'none'})
+      return
+    }
+    if (nickname.length > 20) {
+      Taro.showToast({title: '昵称不能超过20个字符', icon: 'none'})
+      return
+    }
+
     setSaving(true)
     try {
       const updates = {
         ...member,
+        nickname,
         daily_calorie_goal: calorieGoalText ? parseInt(calorieGoalText) : null
       }
+      const isPrimaryMember = member.id ? Boolean(member.is_primary) : true
       if (member.id) {
-        await updateFamilyMember(member.id, updates)
+        const saved = await updateFamilyMember(member.id, updates)
+        if (!saved) throw new Error('健康档案保存失败')
       } else {
-        await createFamilyMember({
+        const created = await createFamilyMember({
           user_id: user.id,
-          nickname: user.id.slice(0, 8),
+          nickname,
           avatar_url: null,
           gender: member.gender || 'unknown',
           age: member.age || null,
@@ -77,9 +92,19 @@ function PersonalInfoPage() {
           daily_carb_goal: member.daily_carb_goal || null,
           is_primary: true
         })
+        if (!created) throw new Error('健康档案保存失败')
       }
-      await refreshMembers(user.id)
+      if (isPrimaryMember) {
+        const profileSaved = await updateProfile(user.id, {nickname})
+        if (!profileSaved) throw new Error('用户昵称同步失败')
+      }
+      await Promise.all([
+        refreshMembers(user.id),
+        isPrimaryMember ? refreshProfile() : Promise.resolve()
+      ])
       Taro.showToast({title: '保存成功', icon: 'success'})
+    } catch (error) {
+      Taro.showToast({title: error instanceof Error ? error.message : '保存失败', icon: 'none'})
     } finally {
       setSaving(false)
     }
@@ -95,12 +120,25 @@ function PersonalInfoPage() {
     setMember({...member, allergens: list.includes(a) ? list.filter(x => x !== a) : [...list, a]})
   }
 
+  const getMedications = () => (member.medications || '')
+    .split(/[,，\n、]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+
+  const toggleMedication = (medication: string) => {
+    const medications = getMedications()
+    const next = medications.includes(medication)
+      ? medications.filter(item => item !== medication)
+      : [...medications, medication]
+    setMember({...member, medications: next.join('、')})
+  }
+
   const handleClearData = async () => {
     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
       Taro.showModal({
         title: '清空当前成员健康档案',
         content: '仅清空当前成员的基础健康信息、慢性病、过敏原、用药和营养目标；不会删除称重历史、食材图片、其他成员或账号。',
-        confirmColor: '#D9534F',
+        confirmColor: '#2F8552',
         success: (res) => resolve({confirm: res.confirm})
       })
     })
@@ -121,9 +159,9 @@ function PersonalInfoPage() {
   const handleClearChat = async () => {
     const {confirm} = await new Promise<{confirm: boolean}>(resolve => {
       Taro.showModal({
-        title: '清除 AI 记忆与旧版对话',
-        content: '将清除百度 AI 对话上下文和小程序旧版对话数据。百度对话日志可能仍按云服务策略保留，此操作不可撤销。',
-        confirmColor: '#D9534F',
+        title: '清除 AI 对话',
+        content: '将清除当前账号的 AI 对话上下文和本地对话记录。云服务日志可能仍按服务策略保留，此操作不可撤销。',
+        confirmColor: '#2F8552',
         success: (res) => resolve({confirm: res.confirm})
       })
     })
@@ -133,10 +171,10 @@ function PersonalInfoPage() {
     try {
       await deleteRtcContexts()
       const localDeleted = await deleteAllChatMessages(user.id)
-      if (!localDeleted) throw new Error('旧版对话删除失败')
-      Taro.showToast({title: 'AI 记忆与旧版对话已清除', icon: 'success'})
+      if (!localDeleted) throw new Error('AI 对话删除失败')
+      Taro.showToast({title: 'AI 对话已清除', icon: 'success'})
     } catch (error) {
-      console.error('清除 AI 记忆与旧版对话失败:', error)
+      console.error('清除 AI 对话失败:', error)
       Taro.showToast({title: '清除失败，请稍后重试', icon: 'none'})
     } finally {
       setClearingChat(false)
@@ -158,6 +196,24 @@ function PersonalInfoPage() {
           <div className="flex items-center gap-2 mb-4">
             <div className="i-mdi-account-circle text-2xl text-primary" />
             <span className="text-xl font-semibold text-foreground">基础健康信息</span>
+          </div>
+
+          {/* 昵称 */}
+          <div className="flex items-center justify-between gap-4 py-3 border-b border-border">
+            <span className="text-xl text-foreground flex-shrink-0">昵称</span>
+            <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '160px', height: '48px', boxSizing: 'border-box'}}>
+              <input
+                type="text"
+                maxLength={20}
+                className="w-full text-xl text-foreground bg-transparent outline-none text-right"
+                placeholder="请输入昵称"
+                value={member.nickname || ''}
+                onInput={(e) => {
+                  const ev = e as any
+                  setMember({...member, nickname: ev.detail?.value ?? ev.target?.value ?? ''})
+                }}
+              />
+            </div>
           </div>
 
           {/* 性别 */}
@@ -184,11 +240,11 @@ function PersonalInfoPage() {
           ].map(field => (
             <div key={field.key} className="flex items-center justify-between py-3 border-b border-border">
               <span className="text-xl text-foreground">{field.label}</span>
-              <div className="flex items-center gap-2">
-                <div className="border border-input rounded-xl px-3 py-2 bg-background">
+              <div className="flex items-center justify-between" style={{width: '148px'}}>
+                <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '108px', height: '48px', boxSizing: 'border-box'}}>
                   <input
                     className="text-xl text-foreground bg-transparent outline-none text-right"
-                    style={{width: '80px'}}
+                    style={{width: '100%', height: '100%'}}
                     placeholder="未设置"
                     value={(member as any)[field.key]?.toString() || ''}
                     onInput={(e) => {
@@ -198,7 +254,7 @@ function PersonalInfoPage() {
                     }}
                   />
                 </div>
-                <span className="text-xl text-muted-foreground">{field.unit}</span>
+                <span className="text-xl text-muted-foreground text-left" style={{width: '32px'}}>{field.unit}</span>
               </div>
             </div>
           ))}
@@ -324,14 +380,37 @@ function PersonalInfoPage() {
             <span className="text-xl font-semibold text-foreground">正在服用的药物</span>
           </div>
           <p className="text-xl text-muted-foreground mb-3">填写后AI将提示可能的食药互作，不用于诊断</p>
-          <div className="border border-input rounded-xl px-4 py-3 bg-background">
-            <textarea
-              className="w-full text-xl text-foreground bg-transparent outline-none"
-              placeholder="例如：二甲双胍、降压药等（换行分隔）"
-              value={member.medications || ''}
-              style={{minHeight: '80px', resize: 'none'}}
-              onInput={(e) => { const ev = e as any; setMember({...member, medications: ev.detail?.value ?? ev.target?.value ?? ''}) }}
-            />
+          <div className="flex flex-wrap gap-2 mb-3">
+            {MEDICATION_OPTIONS.map(medication => (
+              <button
+                key={medication}
+                type="button"
+                className={`flex items-center justify-center leading-none text-xl px-4 rounded-xl border-2 transition active:opacity-60 active:scale-95 ${getMedications().includes(medication) ? 'border-primary' : 'border-border bg-secondary text-muted-foreground'}`}
+                style={{height: '36px', ...(getMedications().includes(medication) ? {backgroundColor: '#4A7C59', color: '#333333'} : {})}}
+                onClick={() => toggleMedication(medication)}
+              >{medication}</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex-1 border border-input rounded-xl px-3 py-2 bg-background">
+              <input
+                className="w-full text-xl text-foreground bg-transparent outline-none"
+                placeholder="其他药物"
+                value={customMedication}
+                onInput={(e) => { const ev = e as any; setCustomMedication(ev.detail?.value ?? ev.target?.value ?? '') }}
+              />
+            </div>
+            <button
+              type="button"
+              className="flex items-center justify-center leading-none text-xl text-primary border border-primary rounded-xl px-3"
+              style={{height: '40px'}}
+              onClick={() => {
+                if (customMedication.trim()) {
+                  toggleMedication(customMedication.trim())
+                  setCustomMedication('')
+                }
+              }}
+            >添加</button>
           </div>
         </div>
 
@@ -352,10 +431,10 @@ function PersonalInfoPage() {
           <div className="flex items-center justify-between py-3 border-b border-border">
             <span className="text-xl text-foreground">每日热量目标</span>
             <div className="flex items-center gap-2">
-              <div className="border border-input rounded-xl px-3 py-2 bg-background">
+              <div className="border border-input rounded-xl px-3 py-2 bg-background" style={{width: '120px', height: '48px', boxSizing: 'border-box'}}>
                 <input
                   className="text-xl text-foreground bg-transparent outline-none text-right"
-                  style={{width: '80px'}}
+                  style={{width: '100%', height: '100%'}}
                   placeholder={String(bmiCalorie || 1800)}
                   value={calorieGoalText}
                   onInput={(e) => { const ev = e as any; setCalorieGoalText(ev.detail?.value ?? ev.target?.value ?? '') }}
@@ -377,22 +456,22 @@ function PersonalInfoPage() {
         {/* 数据清除 */}
         <div className="bg-card rounded-2xl p-4 shadow-elegant flex flex-col gap-3">
           <div className="flex items-center gap-2">
-            <div className="i-mdi-delete-outline text-2xl text-destructive" />
+            <div className="i-mdi-delete-outline text-2xl text-primary" />
             <span className="text-xl font-semibold text-foreground">数据管理</span>
           </div>
           <button
             type="button"
-            className="w-full flex items-center justify-center leading-none text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-xl"
+            className="w-full flex items-center justify-center leading-none text-xl font-medium text-primary border-2 border-primary bg-white rounded-xl"
             style={{height: '48px'}}
             onClick={handleClearData}
           >清空当前成员健康档案</button>
           <button
             type="button"
-            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
+            className={`w-full flex items-center justify-center leading-none text-xl font-medium border-2 border-primary text-primary bg-white rounded-xl ${clearingChat ? 'opacity-50' : ''}`}
             style={{height: '48px'}}
             onClick={handleClearChat}
             disabled={clearingChat}
-          >{clearingChat ? '清除中...' : '清除 AI 记忆与旧版对话'}</button>
+          >{clearingChat ? '清除中...' : '清除 AI 对话'}</button>
         </div>
       </div>
     </div>

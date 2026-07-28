@@ -129,7 +129,7 @@ function ProfilePage() {
         {/* 退出登录 */}
         <button
           type="button"
-          className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium text-destructive border-2 border-destructive/30 bg-destructive/5 rounded-2xl mt-2"
+          className="w-full flex items-center justify-center leading-none gap-2 text-xl font-medium text-primary border-2 border-primary bg-white rounded-2xl mt-2"
           style={{height: '52px'}}
           onClick={handleSignOut}
         >

@@ -5,6 +5,7 @@ import Taro, {useDidShow} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
 import {DisclaimerModal} from '@/components/DisclaimerModal'
+import {HealthWarningModal} from '@/components/HealthWarningModal'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
@@ -25,6 +26,7 @@ import {compressFoodImages} from '@/utils/foodImageCompression'
 import {getFoodImageDisplay, type FoodImageFields} from '@/utils/foodImage'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+const DIABETES_SUGAR_REFERENCE_GRAMS = 25
 
 interface PendingIngredientImage extends FoodImageFields {
   preview_url: string
@@ -46,6 +48,7 @@ function buildAnalysisFallbackMarkdown(params: {
     protein: nutrition.protein == null ? null : nutrition.protein / personCount,
     fat: nutrition.fat == null ? null : nutrition.fat / personCount,
     carbs: nutrition.carbs == null ? null : nutrition.carbs / personCount,
+    sugar: nutrition.sugar == null ? null : nutrition.sugar / personCount,
   }
   const names = memberNames.length > 0 ? memberNames : ['本餐成员']
   return [
@@ -56,9 +59,10 @@ function buildAnalysisFallbackMarkdown(params: {
     `| 蛋白质 | 约 ${formatNumber(nutrition.protein)} 克 | 约 ${formatNumber(perPerson.protein)} 克 |`,
     `| 脂肪 | 约 ${formatNumber(nutrition.fat)} 克 | 约 ${formatNumber(perPerson.fat)} 克 |`,
     `| 碳水 | 约 ${formatNumber(nutrition.carbs)} 克 | 约 ${formatNumber(perPerson.carbs)} 克 |`,
+    `| 糖分 | 约 ${formatNumber(nutrition.sugar)} 克 | 约 ${formatNumber(perPerson.sugar)} 克 |`,
     '',
     '## 综合建议',
-    ...names.map(name => `- **${name}**：本次 AI 仅返回了营养数据，建议结合个人健康档案控制总量，并继续关注过敏源、慢性病和用药相关饮食禁忌。`),
+    ...names.map(name => `- **${name}** 本次 AI 仅返回了营养数据，建议结合个人健康档案控制总量，并继续关注过敏源、慢性病和用药相关饮食禁忌。`),
   ].join('\n')
 }
 
@@ -82,8 +86,11 @@ function HomePage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [history, setHistory] = useState<WeighingRecord[]>([])
   const [showHistory, setShowHistory] = useState(false)
-  const [showAllergenBanner, setShowAllergenBanner] = useState(true)
+  const [showAllergenBanner, setShowAllergenBanner] = useState(false)
   const [allergenWarning, setAllergenWarning] = useState('')
+  const [sugarWarning, setSugarWarning] = useState('')
+  const [showSugarWarning, setShowSugarWarning] = useState(false)
+  const previousAllergenWarningRef = useRef('')
   const [recognizing, setRecognizing] = useState(false)
   const [historyRefreshing, setHistoryRefreshing] = useState(false)
   const [connectedDeviceName, setConnectedDeviceName] = useState('')
@@ -208,11 +215,14 @@ function HomePage() {
       const enriched = enrichIngredientsWithAllergens(ingredients, member)
       return enriched
         .filter(i => i.hasAllergen)
-        .map(i => i.allergenName ? `${member.nickname}：${i.allergenName}` : '')
+        .map(i => i.allergenName ? `${member.nickname} ${i.allergenName}` : '')
         .filter(Boolean)
     })
-    setAllergenWarning(Array.from(new Set(warned)).join('、'))
-    setShowAllergenBanner(true)
+    const warning = Array.from(new Set(warned)).join('、')
+    setAllergenWarning(warning)
+    if (warning && warning !== previousAllergenWarningRef.current) setShowAllergenBanner(true)
+    if (!warning) setShowAllergenBanner(false)
+    previousAllergenWarningRef.current = warning
   }, [ingredients, activeMember, selectedMealMembers])
 
   const handleAddIngredient = () => {
@@ -403,7 +413,8 @@ function HomePage() {
     const mealMemberText = analysisMembers.length > 0
       ? `用餐成员：${analysisMembers.map(member => member.nickname).join('、')}`
       : `用餐人数：${analysisPersonCount}人`
-    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${analysisPersonCount}人食用，${mealMemberText}）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n请先估算整餐总营养，再按${analysisPersonCount}人平摊。综合建议需要结合每位已选成员的健康档案，分别提示过敏源、慢性病、用药或营养目标相关注意事项。\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":整餐总热量数值,"protein":整餐总蛋白质数值,"fat":整餐总脂肪数值,"carbs":整餐总碳水数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs单位为g。\n\nJSON代码块后必须输出 Markdown 正文，不要输出纯文本。请严格使用以下简单 Markdown 结构：\n## 营养总览\n| 项目 | 整餐总量 | 人均（${analysisPersonCount}人平摊） |\n| --- | --- | --- |\n| 热量 | 约 xx 千卡 | 约 xx 千卡 |\n| 蛋白质 | 约 xx 克 | 约 xx 克 |\n| 脂肪 | 约 xx 克 | 约 xx 克 |\n| 碳水 | 约 xx 克 | 约 xx 克 |\n\n## 综合建议\n- **成员名**：结合健康档案给出建议。\n- **注意事项**：提示过敏源、慢性病、用药或营养目标相关注意事项。`
+    const diabetesGuidance = `对于糖尿病成员，将添加糖或游离糖约 ${DIABETES_SUGAR_REFERENCE_GRAMS} 克/天作为通用参考上限，并提醒用户结合医生或营养师建议，不要将其视为固定医嘱。`
+    const prompt = `${healthCtx ? healthCtx + '\n\n' : ''}请分析以下食材的营养成分（供${analysisPersonCount}人食用，${mealMemberText}）：\n${list.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}\n\n请先估算整餐总营养，再按${analysisPersonCount}人平摊。综合建议需要结合每位已选成员的健康档案，分别提示过敏源、慢性病、用药或营养目标相关注意事项。${diabetesGuidance}糖分请优先估算添加糖或游离糖；如果只能得到食材总糖，请明确说明是总糖估算。\n\n\u3010输出要求\u3011请先在回复开头输出一个JSON代码块，包含以下字段：\n\`\`\`json\n{"calories":整餐总热量数值,"protein":整餐总蛋白质数值,"fat":整餐总脂肪数值,"carbs":整餐总碳水数值,"sugar":整餐糖分数值}\n\`\`\`\n其中calories单位为kcal，protein/fat/carbs/sugar单位为g。不要在 JSON 或 Markdown 输出中使用冒号作为单独一行或单独的视觉元素。\n\nJSON代码块后必须输出 Markdown 正文，不要输出纯文本。请严格使用以下简单 Markdown 结构：\n## 营养总览\n| 项目 | 整餐总量 | 人均（${analysisPersonCount}人平摊） |\n| --- | --- | --- |\n| 热量 | 约 xx 千卡 | 约 xx 千卡 |\n| 蛋白质 | 约 xx 克 | 约 xx 克 |\n| 脂肪 | 约 xx 克 | 约 xx 克 |\n| 碳水 | 约 xx 克 | 约 xx 克 |\n| 糖分 | 约 xx 克 | 约 xx 克 |\n\n## 综合建议\n- **成员名** 结合健康档案给出建议。\n- **注意事项** 提示过敏源、慢性病、用药或营养目标相关注意事项。`
 
     try {
       const ws = getAiWebSocket()
@@ -432,6 +443,19 @@ function HomePage() {
         protein: nutrition.protein == null ? null : nutrition.protein / analysisPersonCount,
         fat: nutrition.fat == null ? null : nutrition.fat / analysisPersonCount,
         carbs: nutrition.carbs == null ? null : nutrition.carbs / analysisPersonCount,
+      }
+
+      const diabeticMembers = analysisMembers.filter(member =>
+        (member.chronic_diseases || []).some(disease => /糖尿病|diabetes/i.test(disease))
+      )
+      const perPersonSugar = nutrition.sugar == null ? null : nutrition.sugar / analysisPersonCount
+      if (diabeticMembers.length > 0 && perPersonSugar != null && perPersonSugar > DIABETES_SUGAR_REFERENCE_GRAMS) {
+        const memberNames = diabeticMembers.map(member => member.nickname).join('、')
+        setSugarWarning(`${memberNames}本次人均估算糖分约 ${formatNumber(perPersonSugar)} 克，已超过糖尿病饮食的通用参考值 ${DIABETES_SUGAR_REFERENCE_GRAMS} 克/天。糖分与总碳水并不完全相同，请结合医生或营养师建议调整。`)
+        setShowSugarWarning(true)
+      } else {
+        setSugarWarning('')
+        setShowSugarWarning(false)
       }
 
       const recordMembers = analysisMembers.length > 0 ? analysisMembers : [null]
@@ -514,6 +538,13 @@ function HomePage() {
       {/* 过敏预警 */}
       {allergenWarning && showAllergenBanner && (
         <AllergenBanner allergenNames={allergenWarning} onClose={() => setShowAllergenBanner(false)} />
+      )}
+      {sugarWarning && showSugarWarning && (
+        <HealthWarningModal
+          title="糖分摄入提醒"
+          message={sugarWarning}
+          onClose={() => setShowSugarWarning(false)}
+        />
       )}
 
       <div className="px-4 py-4 pb-tabbar flex flex-col gap-4">
@@ -855,12 +886,6 @@ function HomePage() {
               <>
                 {isAnalyzing && (
                   <p className="text-xl text-muted-foreground mb-3">AI分析中，正在生成...</p>
-                )}
-                {allergenWarning && (
-                  <div className="flex items-start gap-2 p-3 bg-red-50 rounded-xl mb-3 border border-red-400">
-                    <div className="i-mdi-alert-circle text-2xl flex-shrink-0 mt-0.5" style={{color: '#ef4444'}} />
-                    <p className="text-xl" style={{color: '#ef4444'}}>含您的过敏原：{allergenWarning}，请谨慎食用</p>
-                  </div>
                 )}
                 <MarkdownRenderer content={analysisResult} />
                 <div className="flex gap-3 mt-4">

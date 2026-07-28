@@ -58,3 +58,14 @@ pnpm install # Install dependencies
 ```bash
 pnpm run lint  # Lint source (Important: After modifying the code, please execute this command to perform necessary checks.)
 ```
+
+## 邮箱验证码注册配置
+
+新用户只允许通过 Supabase Auth 的邮箱验证码注册。部署前需要在 Supabase 控制台完成以下配置：
+
+1. 在 `Authentication > Providers > Email` 启用 Email Provider，并开启 `Confirm email`。关闭该选项会导致账户绕过验证码直接确认，客户端将拒绝继续注册。
+2. 在 `Authentication > Email Templates > Confirm signup` 中使用 `{{ .Token }}` 输出验证码。当前客户端按 8 位数字验证码校验，小程序不能依赖邮件中的网页跳转链接。
+3. 在 SMTP 设置中接入自有邮件服务，并设置产品的 Sender name 和 Sender email；否则收件人会看到 `Supabase Auth` 和 Supabase 默认发件地址。
+4. 保持 OTP 有效期和发送频率限制开启；客户端默认 60 秒后才允许重新发送。
+
+用户名注册入口已停用；历史用户名账号仍可登录。新的邮箱和手机号注册密码只要求 6-72 位，不限制字符类型；已有账号的登录密码不受新规则影响。

@@ -3,7 +3,7 @@
 import Taro, {useShareAppMessage} from '@tarojs/taro'
 import {useCallback, useEffect, useMemo, useState } from 'react'
 import {Canvas} from '@tarojs/components'
-import {DisclaimerFooter} from '@/components/AllergenBanner'
+import {AllergenBanner, DisclaimerFooter} from '@/components/AllergenBanner'
 import {MarkdownRenderer} from '@/components/MarkdownRenderer'
 import {withRouteGuard} from '@/components/RouteGuard'
 import {useAuth} from '@/contexts/AuthContext'
@@ -24,6 +24,7 @@ function RecipePage() {
   const [recipeTitle, setRecipeTitle] = useState('')
   const [loading, setLoading] = useState(false)
   const [allergenWarning, setAllergenWarning] = useState('')
+  const [showAllergenBanner, setShowAllergenBanner] = useState(false)
   const [sharePath, setSharePath] = useState('')
   const [shareAssets, setShareAssets] = useState<RecipePosterAssets | null>(null)
   const [sharePreparing, setSharePreparing] = useState(false)
@@ -98,7 +99,9 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
       // 检查过敏源
       const enriched = enrichIngredientsWithAllergens(ingredients, activeMember)
       const warned = enriched.filter(i => i.hasAllergen).map(i => i.allergenName || '').filter(Boolean)
-      setAllergenWarning(warned.join('、'))
+      const warning = warned.join('、')
+      setAllergenWarning(warning)
+      setShowAllergenBanner(Boolean(warning))
     } catch (err: any) {
       console.error('菜谱生成失败:', err?.message || err)
       Taro.showToast({title: '菜谱生成失败，请重试', icon: 'none'})
@@ -168,14 +171,6 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
       </div>
 
       <div className="px-4 py-4 flex flex-col gap-4">
-        {/* 过敏预警 */}
-        {allergenWarning && (
-          <div className="flex items-start gap-2 p-3 rounded-xl border" style={{background: '#fff1f2', borderColor: '#ef4444'}}>
-            <div className="i-mdi-alert-circle text-2xl flex-shrink-0 mt-0.5" style={{color: '#ef4444'}} />
-            <p className="text-xl" style={{color: '#ef4444'}}>含您的过敏原：{allergenWarning}，请谨慎参考</p>
-          </div>
-        )}
-
         {/* 菜谱内容 */}
         <div className="bg-card rounded-2xl p-4 shadow-elegant">
           {loading && !recipeContent ? (
@@ -258,6 +253,9 @@ ${ingredients.map(i => `${i.name} ${i.weight}${i.unit}`).join('\n')}
           </div>
         )}
       </div>
+      {allergenWarning && showAllergenBanner && (
+        <AllergenBanner allergenNames={allergenWarning} onClose={() => setShowAllergenBanner(false)} />
+      )}
 
       <DisclaimerFooter />
       <Canvas

@@ -14,6 +14,10 @@ function isUsernameLoginEmail(email: string | null | undefined): boolean {
   return !!email?.toLowerCase().endsWith(USERNAME_EMAIL_DOMAIN)
 }
 
+function isPasswordLoginEmail(email: string | null | undefined): boolean {
+  return !!email && !email.toLowerCase().endsWith('@wechat.login')
+}
+
 async function findIdentity(openid: string) {
   const admin = getSupabaseAdmin()
   const {data, error} = await admin
@@ -56,7 +60,13 @@ async function handleStart(loginCode: unknown) {
   const session = await codeToSession(loginCode)
   const identity = await findIdentity(session.openid)
   if (identity) return json({status: 'authenticated', token: await generateLoginToken(identity.user_id)})
-  return json({status: 'unbound', registrationTicket: await createLoginTicket(session)})
+  // 微信快捷登录本身就是一种完整登录方式。首次使用时直接创建微信账号，
+  // 不要求用户先准备邮箱账号；邮箱绑定仍可在账号设置中作为可选操作完成。
+  const registrationTicket = await createLoginTicket(session)
+  const result = await handleLegacyRegister(registrationTicket)
+  const payload = await result.json()
+  if (payload.status !== 'authenticated' || !payload.token) throw new HttpError(500, '微信账号创建失败')
+  return json({status: 'authenticated', token: payload.token, needsProfile: true, registrationTicket})
 }
 
 async function handleLegacy(code: unknown) {
@@ -164,7 +174,7 @@ async function handleUnbind(req: Request, passwordValue: unknown) {
   const {data: userData, error: userError} = await admin.auth.admin.getUserById(userId)
   const email = userData.user?.email
   if (userError || !email) throw new HttpError(401, '登录状态已失效')
-  if (!isUsernameLoginEmail(email)) throw new HttpError(409, '请先设置用户名和密码，再解绑微信')
+  if (!isPasswordLoginEmail(email)) throw new HttpError(409, '请先设置用户名或邮箱密码，再解绑微信')
   await verifyPassword(userId, email, passwordValue)
 
   const {error: profileError} = await admin.from('profiles').update({openid: null}).eq('id', userId)
@@ -190,11 +200,23 @@ async function handleStatus(req: Request) {
   if (error) throw error
   const {data: userData, error: userError} = await admin.auth.admin.getUserById(userId)
   if (userError || !userData.user) throw new HttpError(401, '登录状态已失效')
-  const hasUsernameLogin = isUsernameLoginEmail(userData.user.email)
-  const username = hasUsernameLogin
-    ? userData.user.email?.slice(0, -USERNAME_EMAIL_DOMAIN.length) || null
-    : null
-  return json({bound: !!data, phoneMasked: maskPhone(data?.phone_number), hasUsernameLogin, username})
+  const email = userData.user.email
+  const hasUsernameLogin = isUsernameLoginEmail(email)
+  const hasPasswordLogin = isPasswordLoginEmail(email)
+  const loginType = hasUsernameLogin ? 'username' : hasPasswordLogin ? 'email' : null
+  const loginIdentifier = hasUsernameLogin
+    ? email?.slice(0, -USERNAME_EMAIL_DOMAIN.length) || null
+    : hasPasswordLogin ? email || null : null
+  return json({
+    bound: !!data,
+    phoneMasked: maskPhone(data?.phone_number),
+    hasPasswordLogin,
+    loginType,
+    loginIdentifier,
+    // Keep these aliases for clients deployed before email registration was added.
+    hasUsernameLogin: hasPasswordLogin,
+    username: loginIdentifier
+  })
 }
 
 Deno.serve(async (req: Request) => {

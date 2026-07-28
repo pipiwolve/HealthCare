@@ -19,6 +19,7 @@ import {isPrivacyScopeError, showPrivacyScopeDeclarationTip} from '@/utils/wecha
 
 const VOICE_MESSAGE_PREFIX = '🎙 '
 const MIN_VOICE_RECORD_MS = 500
+const VOICE_STOP_TIMEOUT_MS = 3000
 
 let sharedRtcAudioContext: any = null
 let sharedRtcAudioUnlockLogged = false
@@ -137,7 +138,6 @@ function ChatPage() {
   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
   const [isRecording, setIsRecording] = useState(false)
   const [isVoicePressing, setIsVoicePressing] = useState(false)
-  const [isVoiceStopping, setIsVoiceStopping] = useState(false)
   const [isRecordingCanceling, setIsRecordingCanceling] = useState(false)
   const [useProfile, setUseProfile] = useState(true)
   const [useIngredients, setUseIngredients] = useState(false)
@@ -154,8 +154,16 @@ function ChatPage() {
   const voiceRecordStartingRef = useRef(false)
   const voiceRecordStartedAtRef = useRef(0)
   const voiceRecordingAttemptRef = useRef(0)
+  const voiceStopFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const recordPermissionRequestRef = useRef<Promise<boolean> | null>(null)
   const [voiceMode, setVoiceMode] = useState(false)
   const voiceSessionRef = useRef<ChatSession | null>(null)
+
+  const resetVoiceCaptureVisualState = useCallback(() => {
+    setIsRecording(false)
+    setIsVoicePressing(false)
+    setIsRecordingCanceling(false)
+  }, [])
 
   const loadRtcHistory = useCallback(async () => {
     if (!user) return
@@ -193,6 +201,8 @@ function ChatPage() {
   useEffect(() => {
     return () => {
       voiceRecordingAttemptRef.current += 1
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
       recorderManager.current?.stop()
       audioContextRef.current?.destroy()
       audioContextRef.current = null
@@ -593,6 +603,8 @@ function ChatPage() {
   }, [activeSession, activeMember, user])
 
   const ensureRecordPermission = useCallback((): Promise<boolean> => {
+    if (recordPermissionRequestRef.current) return recordPermissionRequestRef.current
+
     const showSettingGuide = () => {
       Taro.showModal({
         title: '需要麦克风权限',
@@ -603,7 +615,7 @@ function ChatPage() {
       })
     }
 
-    return new Promise((resolve) => {
+    const request = new Promise<boolean>((resolve) => {
       Taro.getSetting({
         success: (settingRes: any) => {
           const status = settingRes?.authSetting?.['scope.record']
@@ -635,20 +647,39 @@ function ChatPage() {
         }
       })
     })
+    recordPermissionRequestRef.current = request
+    const clearRequest = () => {
+      if (recordPermissionRequestRef.current === request) recordPermissionRequestRef.current = null
+    }
+    void request.then(clearRequest, clearRequest)
+    return request
   }, [])
 
+  const handleEnterVoiceMode = useCallback(() => {
+    setVoiceMode(true)
+    void ensureRecordPermission()
+  }, [ensureRecordPermission])
+
   const startVoiceRecording = useCallback(async () => {
-    if (isRecording || voiceRecordStartingRef.current) return
+    if (isRecording || voiceRecordStartingRef.current || voiceStopRequestedRef.current) return
     voiceRecordStartingRef.current = true
     voiceStopRequestedRef.current = false
     if (!await ensureRecordPermission()) {
       voiceRecordStartingRef.current = false
-      setIsVoiceStopping(false)
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
+      resetVoiceCaptureVisualState()
       return
     }
     if (!voicePressingRef.current || voiceStopRequestedRef.current) {
       voiceRecordStartingRef.current = false
-      setIsVoiceStopping(false)
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+      voiceStopFallbackTimerRef.current = null
+      resetVoiceCaptureVisualState()
       return
     }
 
@@ -663,18 +694,20 @@ function ChatPage() {
         if (voiceRecordingAttemptRef.current !== attemptId) return
         voiceRecordStartingRef.current = false
         voiceRecordStartedAtRef.current = Date.now()
+        if (!voicePressingRef.current || voiceStopRequestedRef.current) {
+          rm.stop()
+          return
+        }
         setIsRecording(true)
-        if (!voicePressingRef.current || voiceStopRequestedRef.current) rm.stop()
       })
       rm.onStop(async (res) => {
         if (voiceRecordingAttemptRef.current !== attemptId) return
+        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+        voiceStopFallbackTimerRef.current = null
         voiceRecordStartingRef.current = false
         voiceStopRequestedRef.current = false
         recorderManager.current = null
-        setIsRecording(false)
-        setIsVoicePressing(false)
-        setIsVoiceStopping(false)
-        setIsRecordingCanceling(false)
+        resetVoiceCaptureVisualState()
         if (voiceCancelRef.current) {
           voiceCancelRef.current = false
           voiceRecordStartedAtRef.current = 0
@@ -738,24 +771,23 @@ function ChatPage() {
       })
       rm.onError(() => {
         if (voiceRecordingAttemptRef.current !== attemptId) return
+        if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+        voiceStopFallbackTimerRef.current = null
         voiceRecordStartingRef.current = false
         voiceStopRequestedRef.current = false
         voiceRecordStartedAtRef.current = 0
         recorderManager.current = null
-        setIsRecording(false)
-        setIsVoicePressing(false)
-        setIsVoiceStopping(false)
-        setIsRecordingCanceling(false)
+        resetVoiceCaptureVisualState()
         Taro.showToast({title: '录音失败，请重试', icon: 'none'})
       })
       rm.start({duration: 10000, format: 'PCM' as any, sampleRate: 16000, numberOfChannels: 1, frameSize: 640})
     }
 
     doStartRecord()
-  }, [ensureRecordPermission, ensureSession, isRecording, sendMessage, user])
+  }, [ensureRecordPermission, ensureSession, isRecording, resetVoiceCaptureVisualState, sendMessage, user])
 
   const handleVoiceTouchStart = useCallback((event: any) => {
-    if (voicePressingRef.current || voiceRecordStartingRef.current || isRecording) return
+    if (voicePressingRef.current || voiceRecordStartingRef.current || voiceStopRequestedRef.current || isRecording) return
     unlockRtcAudioPlayback('voice-touch')
     if (isLoading) interruptActiveChatResponse('voice-touch')
     voiceTouchStartYRef.current = event?.touches?.[0]?.clientY || 0
@@ -763,7 +795,6 @@ function ChatPage() {
     voiceStopRequestedRef.current = false
     voicePressingRef.current = true
     setIsVoicePressing(true)
-    setIsVoiceStopping(false)
     setIsRecordingCanceling(false)
     void startVoiceRecording()
   }, [interruptActiveChatResponse, isLoading, isRecording, startVoiceRecording])
@@ -777,13 +808,31 @@ function ChatPage() {
   }, [])
 
   const handleVoiceTouchEnd = useCallback(() => {
-    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !isRecording) return
+    if (voiceStopRequestedRef.current) return
+    if (!voicePressingRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
     voicePressingRef.current = false
     voiceStopRequestedRef.current = true
-    setIsVoicePressing(false)
-    setIsVoiceStopping(true)
-    recorderManager.current?.stop()
-  }, [isRecording])
+    resetVoiceCaptureVisualState()
+    try {
+      recorderManager.current?.stop()
+    } catch (error) {
+      console.warn('停止录音失败，等待超时兜底:', error)
+    }
+    if (voiceStopFallbackTimerRef.current) clearTimeout(voiceStopFallbackTimerRef.current)
+    voiceStopFallbackTimerRef.current = setTimeout(() => {
+      voiceStopFallbackTimerRef.current = null
+      if (!voiceStopRequestedRef.current && !voiceRecordStartingRef.current && !recorderManager.current) return
+      try { recorderManager.current?.stop() } catch {}
+      voiceRecordingAttemptRef.current += 1
+      voiceRecordStartingRef.current = false
+      voicePressingRef.current = false
+      voiceStopRequestedRef.current = false
+      voiceRecordStartedAtRef.current = 0
+      recorderManager.current = null
+      resetVoiceCaptureVisualState()
+      Taro.showToast({title: '录音停止超时，请重试', icon: 'none'})
+    }, VOICE_STOP_TIMEOUT_MS)
+  }, [resetVoiceCaptureVisualState])
 
   const handleVoiceTouchCancel = useCallback(() => {
     voiceCancelRef.current = true
@@ -825,7 +874,7 @@ function ChatPage() {
   }
   const rtcHistoryDateGroups = useMemo(() => groupRtcHistoryByDate(rtcHistoryGroups), [rtcHistoryGroups])
   const hasAnyHistory = rtcHistoryGroups.length > 0
-  const isVoiceButtonActive = isRecording || isVoicePressing || isVoiceStopping
+  const isVoiceButtonActive = isRecording || isVoicePressing
 
   return (
     <div className="w-full h-screen flex flex-col bg-background overflow-x-hidden" onTouchStart={() => unlockRtcAudioPlayback('chat-page-touch')}>
@@ -1095,9 +1144,8 @@ function ChatPage() {
                   </>
                 )}
                 <div className="flex items-center gap-2">
-                    <div className={`i-mdi-microphone text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`} />
                     <span className={`text-xl ${isRecordingCanceling ? 'text-orange-500' : 'text-white'}`}>
-                      {isRecordingCanceling ? '松手取消' : (isVoiceStopping ? '正在发送...' : (isRecording ? '录音中...' : '准备录音...'))}
+                      {isRecordingCanceling ? '松手取消' : (isRecording ? '录音中...' : '准备录音...')}
                     </span>
                     <div className="flex items-end gap-0.5" style={{height: '16px'}}>
                       {[0,1,2,3,4].map(i => (
@@ -1109,7 +1157,6 @@ function ChatPage() {
                 </>
               ) : (
                 <div className="flex items-center gap-2">
-                  <div className="i-mdi-microphone text-xl text-muted-foreground" />
                   <span className="text-xl text-muted-foreground">按住说话</span>
                 </div>
               )}
@@ -1120,7 +1167,7 @@ function ChatPage() {
               <button type="button" className="flex-shrink-0 flex items-center justify-center"
                 style={{width: '44px', height: '44px'}}
                 onTouchStart={() => unlockRtcAudioPlayback('voice-mode-touch')}
-                onClick={() => setVoiceMode(true)}>
+                onClick={handleEnterVoiceMode}>
                 <div className="i-mdi-microphone text-2xl text-muted-foreground" />
               </button>
               <div className="flex items-center bg-white"

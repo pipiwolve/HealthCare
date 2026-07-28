@@ -4,6 +4,8 @@ deploy_versions/
 .rn_temp/
 node_modules/
 .swc
+__pycache__/
+*.py[cod]
 
 # Logs
 logs

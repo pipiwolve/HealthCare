@@ -2,14 +2,29 @@ import Taro from '@tarojs/taro'
 import {supabase} from '@/client/supabase'
 
 export type WechatStartResult =
-  | {status: 'authenticated'}
+  | {status: 'authenticated'; needsProfile?: boolean; registrationTicket?: string}
   | {status: 'unbound'; registrationTicket: string}
 
 export interface WechatAccountStatus {
   bound: boolean
   phoneMasked: string | null
-  hasUsernameLogin: boolean
-  username: string | null
+  hasPasswordLogin: boolean
+  loginType: 'username' | 'email' | null
+  loginIdentifier: string | null
+}
+
+function getSessionLoginStatus(emailValue: string | undefined): Pick<WechatAccountStatus, 'hasPasswordLogin' | 'loginType' | 'loginIdentifier'> | null {
+  const email = emailValue?.trim() || ''
+  const normalizedEmail = email.toLowerCase()
+  if (!email || normalizedEmail.endsWith('@wechat.login')) return null
+  if (normalizedEmail.endsWith('@miaoda.com')) {
+    return {
+      hasPasswordLogin: true,
+      loginType: 'username',
+      loginIdentifier: email.slice(0, -'@miaoda.com'.length)
+    }
+  }
+  return {hasPasswordLogin: true, loginType: 'email', loginIdentifier: email}
 }
 
 async function getFunctionError(error: any, fallback: string): Promise<Error> {
@@ -43,7 +58,11 @@ export async function startWechatLogin(): Promise<WechatStartResult> {
   const data = await invokeWechat({action: 'start', loginCode: code, code})
   if (data.token && (!data.status || data.status === 'authenticated')) {
     await verifyMagicLink(data.token)
-    return {status: 'authenticated'}
+    return {
+      status: 'authenticated',
+      needsProfile: !!data.needsProfile,
+      registrationTicket: typeof data.registrationTicket === 'string' ? data.registrationTicket : undefined,
+    }
   }
   if (data.status === 'unbound' && data.registrationTicket) {
     return {status: 'unbound', registrationTicket: data.registrationTicket}
@@ -66,13 +85,21 @@ export async function prepareWechatBinding(): Promise<string> {
 }
 
 export async function getWechatAccountStatus(): Promise<WechatAccountStatus> {
-  const data = await invokeWechat({action: 'status'})
-  return {
+  const [data, {data: {session}}] = await Promise.all([
+    invokeWechat({action: 'status'}),
+    supabase.auth.getSession()
+  ])
+  const remoteStatus: WechatAccountStatus = {
     bound: !!data.bound,
     phoneMasked: data.phoneMasked || null,
-    hasUsernameLogin: !!data.hasUsernameLogin,
-    username: data.username || null
+    hasPasswordLogin: !!(data.hasPasswordLogin ?? data.hasUsernameLogin),
+    loginType: data.loginType === 'email' ? 'email' : data.loginType === 'username' ? 'username' : null,
+    loginIdentifier: data.loginIdentifier || data.username || null
   }
+  const sessionLoginStatus = getSessionLoginStatus(session?.user.email)
+  return remoteStatus.hasPasswordLogin || !sessionLoginStatus
+    ? remoteStatus
+    : {...remoteStatus, ...sessionLoginStatus}
 }
 
 export async function unbindWechatAccount(password: string): Promise<void> {

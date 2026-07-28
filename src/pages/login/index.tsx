@@ -2,21 +2,23 @@
 
 import {Image} from '@tarojs/components'
 import Taro from '@tarojs/taro'
-import {useState} from 'react'
+import {useEffect, useState} from 'react'
 import {supabase} from '@/client/supabase'
 import {HealthBrandMark} from '@/components/HealthMarks'
 import {useAuth} from '@/contexts/AuthContext'
 import {getFamilyMembers, updateFamilyMember, updateProfile} from '@/db/api'
-import {uploadWechatAvatar} from '@/services/wechatAuth'
+import {prepareWechatBinding, uploadWechatAvatar} from '@/services/wechatAuth'
 import {useAppStore} from '@/store/appStore'
 import {completeLoginRedirect} from '@/utils/authRedirect'
+import {EMAIL_OTP_LENGTH, getNewPasswordError} from '@/utils/authValidation'
 
 type WechatStep = 'idle' | 'choice' | 'bind'
 
 export default function LoginPage() {
   const {
-    signInWithUsername,
-    signUpWithUsername,
+    signInWithAccount,
+    startEmailSignUp,
+    verifyEmailSignUp,
     startWechatSignIn,
     bindWechatSignIn,
     signOut,
@@ -27,27 +29,74 @@ export default function LoginPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [passwordConfirm, setPasswordConfirm] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [emailOtpSent, setEmailOtpSent] = useState(false)
+  const [emailCooldown, setEmailCooldown] = useState(0)
   const [agreed, setAgreed] = useState(false)
   const [loading, setLoading] = useState(false)
   const [wechatStep, setWechatStep] = useState<WechatStep>('idle')
   const [wechatTicket, setWechatTicket] = useState('')
   const [wechatNickname, setWechatNickname] = useState('')
   const [wechatAvatarPath, setWechatAvatarPath] = useState('')
+  const [wechatSessionReady, setWechatSessionReady] = useState(false)
 
   const isWeApp = Taro.getEnv() === Taro.ENV_TYPE.WEAPP
 
+  useEffect(() => {
+    if (emailCooldown <= 0) return
+    const timer = setTimeout(() => setEmailCooldown(value => value - 1), 1000)
+    return () => clearTimeout(timer)
+  }, [emailCooldown])
+
+  const resetEmailVerification = () => {
+    setEmailCode('')
+    setEmailOtpSent(false)
+    setEmailCooldown(0)
+  }
+
+  const sendEmailCode = async () => {
+    const {error} = await startEmailSignUp(username, password)
+    if (error) throw error
+    setEmailOtpSent(true)
+    setEmailCooldown(60)
+    Taro.showToast({title: '验证码已发送，请查收邮箱', icon: 'none', duration: 2500})
+  }
+
+  const handleResendEmailCode = async () => {
+    if (loading || emailCooldown > 0) return
+    setLoading(true)
+    try {
+      await sendEmailCode()
+    } catch (error) {
+      Taro.showToast({title: error instanceof Error ? error.message : '验证码发送失败', icon: 'none'})
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleSubmit = async () => {
     if (!username.trim()) {
-      Taro.showToast({title: '请输入用户名', icon: 'none'})
+      Taro.showToast({title: '请输入邮箱', icon: 'none'})
       return
     }
     if (password.length < 6) {
       Taro.showToast({title: '密码至少6位', icon: 'none'})
       return
     }
-    if (tab === 'register' && password !== passwordConfirm) {
-      Taro.showToast({title: '两次输入的密码不一致', icon: 'none'})
-      return
+    if (tab === 'register') {
+      const passwordError = getNewPasswordError(password)
+      if (passwordError) {
+        Taro.showToast({title: passwordError, icon: 'none'})
+        return
+      }
+      if (password !== passwordConfirm) {
+        Taro.showToast({title: '两次输入的密码不一致', icon: 'none'})
+        return
+      }
+      if (emailOtpSent && emailCode.length !== EMAIL_OTP_LENGTH) {
+        Taro.showToast({title: `请输入${EMAIL_OTP_LENGTH}位邮箱验证码`, icon: 'none'})
+        return
+      }
     }
     if (!agreed) {
       Taro.showToast({title: '请先阅读并同意用户协议', icon: 'none'})
@@ -55,14 +104,27 @@ export default function LoginPage() {
     }
     setLoading(true)
     try {
-      const fn = tab === 'login' ? signInWithUsername : signUpWithUsername
-      const {error} = await fn(username.trim(), password)
+      if (tab === 'register' && !emailOtpSent) {
+        await sendEmailCode()
+        return
+      }
+
+      const {error} = tab === 'login'
+        ? await signInWithAccount(username.trim(), password)
+        : await verifyEmailSignUp(username.trim(), emailCode)
       if (error) {
         Taro.showToast({title: error.message || '操作失败', icon: 'none'})
         return
       }
       if (wechatTicket) {
-        const {error: bindError} = await bindWechatSignIn(wechatTicket)
+        let bindError: Error | null = null
+        try {
+          const freshWechatTicket = await prepareWechatBinding()
+          const result = await bindWechatSignIn(freshWechatTicket)
+          bindError = result.error
+        } catch (error) {
+          bindError = error as Error
+        }
         if (bindError) {
           await signOut()
           Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
@@ -90,7 +152,13 @@ export default function LoginPage() {
       if (error) {
         Taro.showToast({title: error.message || '微信登录失败', icon: 'none'})
       } else if (data?.status === 'authenticated') {
-        completeLoginRedirect()
+        if (data.needsProfile) {
+          setWechatSessionReady(true)
+          setWechatTicket(data.registrationTicket || '')
+          setWechatStep('choice')
+        } else {
+          completeLoginRedirect()
+        }
       } else {
         setWechatTicket(data?.status === 'unbound' ? data.registrationTicket : '')
         setWechatStep('choice')
@@ -118,17 +186,24 @@ export default function LoginPage() {
 
   const handleBindExisting = async () => {
     if (!username.trim() || password.length < 6) {
-      Taro.showToast({title: '请输入已有账号和密码', icon: 'none'})
+      Taro.showToast({title: '请输入已有邮箱和密码', icon: 'none'})
       return
     }
     setLoading(true)
     try {
-      const {error: loginError} = await signInWithUsername(username.trim(), password)
+      const {error: loginError} = await signInWithAccount(username.trim(), password)
       if (loginError) {
-        Taro.showToast({title: loginError.message || '已有账号登录失败', icon: 'none'})
+        Taro.showToast({title: loginError.message || '已有邮箱登录失败', icon: 'none'})
         return
       }
-      const {error: bindError} = await bindWechatSignIn(wechatTicket)
+      let bindError: Error | null = null
+      try {
+        const freshWechatTicket = await prepareWechatBinding()
+        const result = await bindWechatSignIn(freshWechatTicket)
+        bindError = result.error
+      } catch (error) {
+        bindError = error as Error
+      }
       if (bindError) {
         await signOut()
         Taro.showToast({title: bindError.message || '微信绑定失败', icon: 'none'})
@@ -137,25 +212,27 @@ export default function LoginPage() {
       await saveWechatProfile()
       setWechatTicket('')
       completeLoginRedirect()
+    } catch (error) {
+      await signOut()
+      Taro.showToast({title: error instanceof Error ? error.message : '微信绑定失败', icon: 'none'})
     } finally {
       setLoading(false)
     }
   }
 
-  const handleRegisterBeforeBinding = () => {
-    setWechatStep('idle')
-    setTab('register')
-    setUsername('')
-    setPassword('')
-    setPasswordConfirm('')
+  const changeTab = (nextTab: 'login' | 'register') => {
+    setTab(nextTab)
+    resetEmailVerification()
   }
 
   const closeWechatFlow = () => {
     if (loading) return
+    if (wechatSessionReady) void signOut()
     setWechatStep('idle')
     setWechatTicket('')
     setWechatNickname('')
     setWechatAvatarPath('')
+    setWechatSessionReady(false)
   }
 
   return (
@@ -170,7 +247,7 @@ export default function LoginPage() {
       </div>
 
       {/* 登录卡片 */}
-      <div className="flex-1 px-6 pt-8">
+      <div className="flex-1 px-6 pt-8" style={{width: '100%', maxWidth: '560px', margin: '0 auto'}}>
         {/* Tab切换 */}
         <div className="flex bg-secondary rounded-xl p-1 mb-6">
           {(['login', 'register'] as const).map(t => (
@@ -179,7 +256,7 @@ export default function LoginPage() {
               type="button"
               className={`flex-1 flex items-center justify-center leading-none text-xl font-semibold rounded-lg transition ${tab === t ? 'bg-white text-primary shadow-elegant' : 'text-muted-foreground'}`}
               style={{height: '44px'}}
-              onClick={() => setTab(t)}
+              onClick={() => changeTab(t)}
             >
               {t === 'login' ? '登录' : '注册'}
             </button>
@@ -189,11 +266,20 @@ export default function LoginPage() {
         {/* 表单 */}
         <div className="flex flex-col gap-4 mb-6">
           <div>
-            <p className="text-xl text-muted-foreground mb-2">用户名</p>
-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xl text-muted-foreground">
+                邮箱
+              </p>
+              {tab === 'register' && emailOtpSent && (
+                <button type="button" className="text-xl text-primary" onClick={resetEmailVerification}>修改注册信息</button>
+              )}
+            </div>
+            <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent && tab === 'register' ? 'bg-secondary' : 'bg-card'}`}>
               <input
                 className="w-full text-xl text-foreground bg-transparent outline-none"
-                placeholder="请输入用户名（字母/数字/下划线）"
+                type="email"
+                disabled={tab === 'register' && emailOtpSent}
+                placeholder={tab === 'login' ? '请输入邮箱' : '请输入常用邮箱'}
                 value={username}
                 onInput={(e) => { const ev = e as any; setUsername(ev.detail?.value ?? ev.target?.value ?? '') }}
               />
@@ -201,11 +287,13 @@ export default function LoginPage() {
           </div>
           <div>
             <p className="text-xl text-muted-foreground mb-2">密码</p>
-            <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
+            <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent && tab === 'register' ? 'bg-secondary' : 'bg-card'}`}>
               <input
                 type="password"
+                maxLength={72}
+                disabled={tab === 'register' && emailOtpSent}
                 className="w-full text-xl text-foreground bg-transparent outline-none"
-                placeholder="请输入密码（至少6位）"
+                placeholder={tab === 'register' ? '请输入6-72位密码' : '请输入密码'}
                 value={password}
                 onInput={(e) => { const ev = e as any; setPassword(ev.detail?.value ?? ev.target?.value ?? '') }}
               />
@@ -214,14 +302,56 @@ export default function LoginPage() {
           {tab === 'register' && (
             <div>
               <p className="text-xl text-muted-foreground mb-2">确认密码</p>
-              <div className="border-2 border-input rounded-xl px-4 py-3 bg-card">
+              <div className={`border-2 border-input rounded-xl px-4 py-3 ${emailOtpSent ? 'bg-secondary' : 'bg-card'}`}>
                 <input
                   type="password"
+                  maxLength={72}
+                  disabled={emailOtpSent}
                   className="w-full text-xl text-foreground bg-transparent outline-none"
                   placeholder="请再次输入密码"
                   value={passwordConfirm}
                   onInput={(e) => { const ev = e as any; setPasswordConfirm(ev.detail?.value ?? ev.target?.value ?? '') }}
                 />
+              </div>
+            </div>
+          )}
+          {tab === 'register' && emailOtpSent && (
+            <div>
+              <p className="text-xl text-muted-foreground mb-2">邮箱验证码</p>
+              <div className="border-2 border-input rounded-xl px-4 bg-card flex items-center" style={{height: '52px'}}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={EMAIL_OTP_LENGTH}
+                  className="flex-1 min-w-0 text-xl text-foreground bg-transparent outline-none"
+                  placeholder={`请输入${EMAIL_OTP_LENGTH}位验证码`}
+                  value={emailCode}
+                  onInput={(e) => {
+                    const ev = e as any
+                    setEmailCode(String(ev.detail?.value ?? ev.target?.value ?? '').replace(/\D/g, '').slice(0, EMAIL_OTP_LENGTH))
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={loading || emailCooldown > 0}
+                  className="flex items-center justify-center flex-shrink-0 disabled:opacity-100"
+                  style={{
+                    width: '116px',
+                    height: '36px',
+                    marginLeft: '12px',
+                    padding: '0 8px',
+                    borderRadius: '8px',
+                    border: `1px solid ${loading || emailCooldown > 0 ? '#B7C7BC' : '#2F8552'}`,
+                    backgroundColor: loading || emailCooldown > 0 ? '#E9F0EB' : '#FFFFFF',
+                    color: loading || emailCooldown > 0 ? '#60766A' : '#2F8552',
+                    fontSize: '15px',
+                    fontWeight: 600,
+                    lineHeight: 1,
+                    opacity: 1,
+                    whiteSpace: 'nowrap'
+                  }}
+                  onClick={handleResendEmailCode}
+                >{loading ? '发送中...' : emailCooldown > 0 ? `${emailCooldown}秒后重发` : '重新发送'}</button>
               </div>
             </div>
           )}
@@ -260,7 +390,15 @@ export default function LoginPage() {
           style={{height: '56px'}}
           onClick={handleSubmit}
         >
-          {loading ? '处理中...' : tab === 'login' ? '登录' : wechatTicket ? '注册并绑定微信' : '注册'}
+          {loading
+            ? '处理中...'
+            : tab === 'login'
+              ? '登录'
+              : !emailOtpSent
+                ? '获取邮箱验证码'
+                : wechatTicket
+                  ? '注册并绑定微信'
+                  : '验证并注册'}
         </button>
 
         {/* 微信登录 */}
@@ -299,10 +437,10 @@ export default function LoginPage() {
             <div className="flex items-center justify-between mb-5">
               <div>
                 <p className="text-2xl font-semibold text-foreground">
-                  {wechatStep === 'choice' ? '微信尚未绑定' : '绑定已有账号'}
+                  {wechatStep === 'choice' ? '微信快捷登录' : '绑定已有邮箱账户'}
                 </p>
                 <p className="text-xl text-muted-foreground mt-1">
-                  {wechatStep === 'choice' ? '请先注册或登录账号，再完成微信绑定' : '登录后将微信身份绑定到当前账号'}
+                  {wechatStep === 'choice' ? '头像和昵称可选，确认后即可进入系统' : '登录后将微信身份绑定到该邮箱账户'}
                 </p>
               </div>
               <button
@@ -350,14 +488,28 @@ export default function LoginPage() {
                   disabled={loading}
                   className="w-full flex items-center justify-center text-xl font-semibold bg-primary text-white rounded-xl disabled:opacity-50 mb-3"
                   style={{height: '50px'}}
-                  onClick={() => setWechatStep('bind')}
-                >绑定已有账号</button>
+                  onClick={async () => {
+                    if (loading) return
+                    setLoading(true)
+                    try {
+                      await saveWechatProfile()
+                      setWechatStep('idle')
+                      setWechatTicket('')
+                      setWechatSessionReady(false)
+                      completeLoginRedirect()
+                    } catch (error) {
+                      Taro.showToast({title: error instanceof Error ? error.message : '微信资料保存失败', icon: 'none'})
+                    } finally {
+                      setLoading(false)
+                    }
+                  }}
+                >{loading ? '进入中...' : '进入系统'}</button>
                 <button
                   type="button"
                   className="w-full flex items-center justify-center text-xl font-medium border border-primary text-primary rounded-xl disabled:opacity-50 mb-2"
                   style={{height: '48px'}}
-                  onClick={handleRegisterBeforeBinding}
-                >还没有账号，先注册</button>
+                  onClick={() => setWechatStep('bind')}
+                >绑定已有邮箱账户</button>
               </>
             ) : (
               <>
@@ -365,7 +517,7 @@ export default function LoginPage() {
                   <div className="border border-input rounded-xl px-4 bg-card flex items-center" style={{height: '50px'}}>
                     <input
                       className="w-full text-xl text-foreground bg-transparent outline-none"
-                      placeholder="已有用户名"
+                      placeholder="已有邮箱"
                       value={username}
                       onInput={(e) => { const ev = e as any; setUsername(ev.detail?.value ?? ev.target?.value ?? '') }}
                     />
@@ -374,7 +526,7 @@ export default function LoginPage() {
                     <input
                       type="password"
                       className="w-full text-xl text-foreground bg-transparent outline-none"
-                      placeholder="已有账号密码"
+                      placeholder="邮箱账户密码"
                       value={password}
                       onInput={(e) => { const ev = e as any; setPassword(ev.detail?.value ?? ev.target?.value ?? '') }}
                     />

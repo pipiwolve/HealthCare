@@ -1,0 +1,1 @@
+请应用 docs/cloud-agent-latest-ui-voice/0001-latest-ui-voice.patch，严格执行 docs/cloud-agent-latest-ui-voice/CLOUD_AGENT_INSTRUCTIONS.md，确保首次点击麦克风切换按钮时预先申请录音权限、真正长按时不再被授权弹窗中断，同时修复语音松手后“正在发送”卡住问题，并完成全部自动化及真机语音验收后反馈逐项结果。
